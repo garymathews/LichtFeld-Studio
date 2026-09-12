@@ -54,17 +54,28 @@ namespace lfs::training {
         if (state.joint_bounds.capacity() > prepared.joint_bounds.shape()[0])
             prepared.joint_bounds.reserve(state.joint_bounds.capacity());
         const auto slots = type == ParamType::ShN ? core::sh_float4_slots_for_rest(splat_data_.max_sh_coeffs_rest()) : 0;
-        size_t pending_blocks = 0;
-        for (const auto block : touched.nonzero().reshape({-1}).cpu().to_vector_int64()) {
-            const size_t start = size_t(block) * 256, count = std::min(size_t(256), n - start);
+        // Cap each contiguous batch; drain sparse batches after at least 4096 queued rows.
+        constexpr size_t max_batch_rows = 131072;
+        constexpr size_t sync_interval_rows = 4096;
+        size_t pending_rows = 0;
+        const auto touched_blocks = touched.nonzero().reshape({-1}).cpu().to_vector_int64();
+        for (size_t i = 0; i < touched_blocks.size();) {
+            const size_t start = size_t(touched_blocks[i++]) * 256;
+            size_t end = start + 256;
+            // Batch adjacent blocks without changing untouched quantization bounds.
+            while (i < touched_blocks.size() && size_t(touched_blocks[i]) * 256 == end && end - start < max_batch_rows) {
+                end += 256;
+                ++i;
+            }
+            const size_t count = std::min(end, n) - start;
             auto rows = read_moment_rows(type, n, start, count);
             const auto mask = selected_rows.slice(0, start, start + count).unsqueeze(1).broadcast_to(rows.first.shape());
             rows.first.masked_fill_(mask, 0.f);
             rows.second.masked_fill_(mask, 0.f);
             write_moment_range(prepared, slots, rows, start);
-            if (++pending_blocks == 16) {
+            if ((pending_rows += count) >= sync_interval_rows) {
                 core::with_idle_vulkan_device([](const auto&) {});
-                pending_blocks = 0;
+                pending_rows = 0;
             }
         }
         core::with_idle_vulkan_device([](const auto&) {});
@@ -147,8 +158,11 @@ namespace lfs::training {
             if (!slots)
                 return rows.contiguous().reshape({-1});
             const size_t n = rows.shape()[0], blocks = (n + 31) / 32;
-            auto padded = Tensor::zeros(TensorShape{blocks * 32, slots * 4}, rows.device(), rows.dtype());
-            padded.slice(0, 0, n).copy_from(rows);
+            Tensor padded = rows;
+            if (n % 32) {
+                padded = Tensor::zeros(TensorShape{blocks * 32, slots * 4}, rows.device(), rows.dtype());
+                padded.slice(0, 0, n).copy_from(rows);
+            }
             return padded.reshape(TensorShape{blocks, 32, slots, 4}).permute({0, 2, 1, 3}).contiguous().reshape({-1});
         }
         Tensor row_cell_indices(const Tensor& rows, size_t attributes, size_t slots) {
@@ -187,8 +201,10 @@ namespace lfs::training {
         const size_t bpc = joint_adam::bytes_per_cell(state.joint_bits);
         auto packed = state.exp_avg.reshape({-1}).slice(0, offset * attributes * bpc, offset * attributes * bpc + first.numel() * bpc);
         auto bounds = state.joint_bounds.slice(0, offset / 256, (offset + count + 255) / 256);
-        auto valid = layout_from_rows(Tensor::full(rows.first.shape(), 1.0f, Device::GPU, DataType::Bool), slots);
-        joint_adam::encode_tensor({first, second}, packed, bounds, state.joint_bits, 256 * attributes, &valid);
+        Tensor valid;
+        if (slots && count % 32)
+            valid = layout_from_rows(Tensor::full(rows.first.shape(), 1.0f, Device::GPU, DataType::Bool), slots);
+        joint_adam::encode_tensor({first, second}, packed, bounds, state.joint_bits, 256 * attributes, valid.is_valid() ? &valid : nullptr);
     }
 
     void AdamOptimizer::remap_moment_rows(ParamType type, size_t old_n, size_t n, const Tensor& mapping, bool append) {
@@ -303,9 +319,14 @@ namespace lfs::training {
         if (state.size != expected_size)
             throw std::runtime_error("Optimizer state desync: " + name);
         const int64_t next_step = state.step_count + 1;
-        // Quantization bounds are shared by 256 primitives. Chunk on that
-        // boundary so scratch is bounded while the codec remains identical.
-        constexpr size_t chunk_rows = 4096;
+        const float bc1 = static_cast<float>(1.0 / (1.0 - std::pow(config_.beta1, next_step)));
+        const float bc2 = static_cast<float>(1.0 / std::sqrt(1.0 - std::pow(config_.beta2, next_step)));
+        const float beta1 = static_cast<float>(config_.beta1), beta2 = static_cast<float>(config_.beta2);
+        const float learning_rate = static_cast<float>(get_param_lr(type)) * bc1;
+        const size_t active_slots = core::sh_float4_slots_for_rest(splat_data_.active_sh_coeffs_rest());
+        // Amortize dispatch and synchronization costs while bounding scratch.
+        // Keep chunks aligned to the codec's 256-primitive quantization blocks.
+        constexpr size_t chunk_rows = 131072;
         for (size_t offset = 0; offset < n; offset += chunk_rows) {
             const size_t count = std::min(chunk_rows, n - offset);
             const auto old = read_moment_rows(type, n, offset, count);
@@ -313,43 +334,47 @@ namespace lfs::training {
             const size_t attributes = old.first.shape()[1];
             const size_t cells = (slots ? ((count + 31) / 32) * 32 : count) * attributes;
             Tensor gradient = rows_from_layout(state.grad.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells), count, slots);
-            Tensor lr_scale = Tensor::full({count, 1}, 1.0f, Device::GPU);
-            Tensor enabled = Tensor::full({count, 1}, 1.0f, Device::GPU, DataType::Bool);
+            Tensor lr_scale, enabled;
             const auto apply_mask = [&](const Tensor& mask, float scale) {
-                if (!mask.is_valid() || !mask.numel())
+                if (!mask.is_valid() || !mask.numel() || scale == 1.0f)
                     return;
                 const size_t length = std::min(count, mask.numel() > offset ? mask.numel() - offset : 0);
                 auto effective = Tensor::zeros({count, 1}, Device::GPU, DataType::Bool);
                 if (length)
                     effective.slice(0, 0, length).copy_from(mask.slice(0, offset, offset + length).reshape(TensorShape{length, 1}));
-                lr_scale = lr_scale * (effective.to(DataType::Float32) * (scale - 1.0f) + 1.0f);
+                const Tensor factor = effective.to(DataType::Float32) * (scale - 1.0f) + 1.0f;
+                lr_scale = lr_scale.is_valid() ? lr_scale * factor : factor;
                 if (scale == 0.0f)
-                    enabled = enabled.logical_and(effective.logical_not());
+                    enabled = enabled.is_valid() ? enabled.logical_and(effective.logical_not()) : effective.logical_not();
             };
             apply_mask(frozen_mask_, frozen_lr_scale_);
             apply_mask(crop_damping_mask_, cropbox_lr_scale_);
-            const float bc1 = static_cast<float>(1.0 / (1.0 - std::pow(config_.beta1, next_step)));
-            const float bc2 = static_cast<float>(1.0 / std::sqrt(1.0 - std::pow(config_.beta2, next_step)));
             if (type == ParamType::Means && per_splat_mean_step_ && mean_step_median_extent_ > 0 && mean_step_far_mask_storage_.is_valid()) {
                 const Tensor ratio = (splat_data_.scaling_raw().slice(0, offset, offset + count).mean(1, true).exp() / mean_step_median_extent_).clamp(mean_step_r_min_, mean_step_r_max_);
-                lr_scale = lr_scale * Tensor::where(mean_step_far_mask_storage_.slice(0, offset, offset + count).reshape(TensorShape{count, 1}), ratio, Tensor::ones_like(ratio));
+                const Tensor factor = Tensor::where(mean_step_far_mask_storage_.slice(0, offset, offset + count).reshape(TensorShape{count, 1}), ratio, Tensor::ones_like(ratio));
+                lr_scale = lr_scale.is_valid() ? lr_scale * factor : factor;
             }
             if (type == ParamType::Scaling && screen_share_n_ > 0 && screen_share_penalty_ > 0) {
                 const Tensor share = splat_data_._max_screen_share.slice(0, offset, offset + count).reshape(TensorShape{count, 1});
                 const Tensor hinge = (share.clamp_min(screen_share_limit_) / screen_share_limit_).log() * (screen_share_penalty_ / std::log(2.0f));
                 gradient = gradient + hinge * (old.second.sqrt() * bc2 + static_cast<float>(config_.eps));
             }
-            if (slots) {
+            if (slots && active_slots < slots) {
                 auto active = Tensor::zeros(shape, Device::GPU, DataType::Bool);
-                const auto active_slots = core::sh_float4_slots_for_rest(splat_data_.active_sh_coeffs_rest());
                 active.slice(1, 0, active_slots * 4).fill_(1.0f);
-                enabled = enabled.logical_and(active);
+                enabled = enabled.is_valid() ? enabled.logical_and(active) : active;
             }
-            const float beta1 = static_cast<float>(config_.beta1), beta2 = static_cast<float>(config_.beta2);
-            const Tensor first = Tensor::where(enabled, old.first * beta1 + gradient * (1.0f - beta1), old.first);
-            const Tensor second = Tensor::where(enabled, old.second * beta2 + gradient * gradient * (1.0f - beta2), old.second);
-            const Tensor change = first / (second.sqrt() * bc2 + static_cast<float>(config_.eps)) * lr_scale * (static_cast<float>(get_param_lr(type)) * bc1);
-            const Tensor delta = Tensor::where(enabled, change, Tensor::zeros_like(change));
+            Tensor first = old.first * beta1 + gradient * (1.0f - beta1);
+            Tensor second = old.second * beta2 + gradient * gradient * (1.0f - beta2);
+            if (enabled.is_valid()) {
+                first = Tensor::where(enabled, first, old.first);
+                second = Tensor::where(enabled, second, old.second);
+            }
+            Tensor change = first / (second.sqrt() * bc2 + static_cast<float>(config_.eps));
+            if (lr_scale.is_valid())
+                change = change * lr_scale;
+            change = change * learning_rate;
+            const Tensor delta = enabled.is_valid() ? Tensor::where(enabled, change, Tensor::zeros_like(change)) : change;
             if (slots) {
                 const bool q16 = splat_data_.shN_value_quantized();
                 const size_t rest = splat_data_.max_sh_coeffs_rest();
@@ -359,11 +384,12 @@ namespace lfs::training {
                     const size_t code_count = core::sh_value_quant::sh_value_u16_count(count, rest);
                     const auto codes = param.reshape({-1}).slice(0, code_start, code_start + code_count);
                     const auto bounds = splat_data_.shN_value_bounds().reshape({-1, 2}).slice(0, offset / 256, (offset + count + 255) / 256);
-                    values = core::reorder_sh_to_swizzled(core::sh_value_quant::decode_shN_u16_to_canonical_tensor(codes, bounds, count, rest), count, rest, rest);
+                    values = Tensor::zeros(shape, Device::GPU);
+                    values.slice(1, 0, rest * 3).copy_from(core::sh_value_quant::decode_shN_u16_to_canonical_tensor(codes, bounds, count, rest).reshape(TensorShape{count, rest * 3}));
                 } else {
                     values = param.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells).to(DataType::Float32);
                 }
-                const Tensor updated = rows_from_layout(values, count, slots) - delta;
+                const Tensor updated = (q16 ? values : rows_from_layout(values, count, slots)) - delta;
                 const auto swizzled = layout_from_rows(updated, slots);
                 if (q16) {
                     Tensor codes, bounds;

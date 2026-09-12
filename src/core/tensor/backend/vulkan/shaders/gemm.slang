@@ -7,6 +7,8 @@ static const uint LFS_PUSH_CONSTANT_SIZE = 64;
 const uint kTransposeB = 0;
 [SpecializationConstant]
 const uint kBiasRelu = 0;
+[SpecializationConstant]
+const uint kSmallMatrix = 0;
 
 static const uint kTileM = 64;
 static const uint kTileN = 64;
@@ -51,6 +53,31 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID,
     Ptr<float, Access.Read> a = (Ptr<float, Access.Read>)parameters.aAddress;
     Ptr<float, Access.Read> b = (Ptr<float, Access.Read>)parameters.bAddress;
     Ptr<float, Access.ReadWrite> c = (Ptr<float, Access.ReadWrite>)parameters.cAddress;
+
+    if (kSmallMatrix != 0)
+    {
+        // Tiny batched transforms share a workgroup instead of reserving a
+        // 64x64 tile for each matrix.
+        const uint3 groups = spirv_asm { result:$$uint3 = OpLoad builtin(NumWorkgroups:uint3); };
+        for (uint index = groupId.x * LFS_LOCAL_SIZE_X + thread;
+             index < parameters.batch * m * n;
+             index += groups.x * LFS_LOCAL_SIZE_X)
+        {
+            const uint batch = index / (m * n);
+            const uint row = (index / n) % m;
+            const uint col = index % n;
+            float value = 0.0f;
+            // Retain the tiled kernel's 16-term padded sum, including rounding and signed zeros.
+            for (uint kk = 0; kk < kTileK; ++kk)
+            {
+                const float av = kk < k ? a[uint64_t(batch) * parameters.strideA + row * k + kk] : 0.0f;
+                const float bv = kk < k ? b[uint64_t(batch) * parameters.strideB + (kk * n + col)] : 0.0f;
+                value += av * bv;
+            }
+            c[uint64_t(batch) * parameters.strideC + row * n + col] = value;
+        }
+        return;
+    }
 
     float accumulator[kThreadTile][kThreadTile];
     for (uint i = 0; i < kThreadTile; ++i)

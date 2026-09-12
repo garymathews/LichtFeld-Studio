@@ -122,8 +122,15 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID, uniform Parameters param
             storeByte(parameters.outputAddress, index, value);
         }
         else if (kOutputDType == 5)
-            storeByte(parameters.outputAddress, index,
-                      loadAsFloat(parameters.inputAddress, index) != 0.0f ? 1u : 0u);
+        {
+            // Compare float bits so Metal's denormal flushing cannot turn a nonzero input into false.
+            const bool nonzero = kInputDType == 0
+                ? ((((Ptr<uint, Access.Read>)parameters.inputAddress)[index] & 0x7fffffffu) != 0u)
+                : kInputDType == 1
+                    ? ((((Ptr<uint16_t, Access.Read>)parameters.inputAddress)[index] & 0x7fffu) != 0u)
+                    : loadAsInt64(parameters.inputAddress, index) != int64_t(0);
+            storeByte(parameters.outputAddress, index, nonzero ? 1u : 0u);
+        }
         else
             ((Ptr<uint, Access.ReadWrite>)parameters.outputAddress)[index] =
                 uint(loadAsInt64(parameters.inputAddress, index));

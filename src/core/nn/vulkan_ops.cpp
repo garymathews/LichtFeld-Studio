@@ -23,16 +23,17 @@ namespace lfs::core::nn::vulkan {
             int32_t pad_h = 0, pad_w = 0, dilation_h = 0, dilation_w = 0;
             int32_t offset = 0, columns = 0, mode = 0, coord = 0, include_pad = 0;
             float u0 = 0, u1 = 0, v0 = 0, v1 = 0;
+            uint64_t weight_address = 0;
         };
-        static_assert(sizeof(Push) == 112);
+        static_assert(sizeof(Push) == 120);
 
-        Tensor fp32(const Tensor& t) { return t.to(DataType::Float32).contiguous(); }
+        Tensor fp32(const Tensor& t) { return (t.dtype() == DataType::Float32 ? t : t.to(DataType::Float32)).contiguous(); }
 
         Tensor empty(const Tensor& like, const TensorShape& shape) {
             return internal::allocate_like(like, shape, DataType::Float32);
         }
 
-        void dispatch(uint32_t kind, const Tensor& input, Tensor& output, Push push) {
+        void dispatch(uint32_t kind, const Tensor& input, Tensor& output, Push push, const Tensor* weight = nullptr) {
             if (output.numel() == 0)
                 return;
             LFS_ASSERT_MSG(output.numel() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
@@ -40,14 +41,23 @@ namespace lfs::core::nn::vulkan {
             const auto src = internal::storage_ref(input);
             const auto dst = internal::storage_ref(output);
             const auto context = internal::acquire_vulkan_context();
-            const uint32_t groups = internal::vk::dispatch_groups(*context, output.numel());
+            size_t work = output.numel();
+            if (kind == 6) {
+                const size_t planes = output.numel() / (size_t(push.height) * push.width);
+                const size_t tiles_y = (size_t(push.height) + 15) / 16;
+                const size_t tiles_x = (size_t(push.width) + 15) / 16;
+                work = planes * tiles_y * tiles_x * internal::vk::kLocalSize;
+            }
+            const uint32_t groups = internal::vk::dispatch_groups(*context, work);
             push.input_address = internal::vk::address(src);
             push.output_address = internal::vk::address(dst);
             push.total = static_cast<uint32_t>(output.numel());
             push.step = groups * internal::vk::kLocalSize;
+            const std::array reads{src, weight ? internal::storage_ref(*weight) : internal::StorageRef{}};
+            if (weight)
+                push.weight_address = internal::vk::address(reads[1]);
             const std::array constants{kind};
             const auto& pipeline = context->pipelines().specialized("inference", sizeof(Push), constants);
-            const std::array reads{src};
             const std::array writes{dst};
             context->recorders().record(reads, writes, [&](VkCommandBuffer command) {
                 vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
@@ -190,7 +200,18 @@ namespace lfs::core::nn::vulkan {
         }
         if (bias)
             out = out.add(fp32(*bias).reshape({1, cout, 1, 1}));
-        return activate(out, params.activation).to(input.dtype());
+        out = activate(out, params.activation);
+        return input.dtype() == DataType::Float32 ? out : out.to(input.dtype());
+    }
+
+    Tensor gaussian_blur_11(const Tensor& input, const Tensor& coefficients) {
+        const auto x = input.contiguous(), weights = coefficients.contiguous();
+        LFS_ASSERT_MSG(x.ndim() == 4 && x.dtype() == DataType::Float32 &&
+                           weights.dtype() == DataType::Float32 && weights.numel() == x.shape()[1] * 11,
+                       "SSIM blur requires NCHW float data and 11 coefficients per channel");
+        auto out = empty(x, x.shape());
+        dispatch(6, x, out, Push{.channels = static_cast<int32_t>(x.shape()[1]), .height = static_cast<int32_t>(x.shape()[2]), .width = static_cast<int32_t>(x.shape()[3])}, &weights);
+        return out;
     }
 
     Tensor resize(const Tensor& input, int height, int width, ResizeMode mode, CoordTransform coord) {

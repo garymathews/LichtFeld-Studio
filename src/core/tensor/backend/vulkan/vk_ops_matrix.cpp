@@ -103,9 +103,11 @@ namespace lfs::core::internal {
             LFS_ASSERT_MSG(lhs.dtype == DataType::Float32 && rhs.dtype == DataType::Float32 &&
                                output.dtype == DataType::Float32,
                            "Vulkan GEMM requires Float32 operands");
-            LFS_ASSERT_MSG(program.batch <= context.caps().max_workgroup_count[2],
+            const bool small = !transpose_b && bias == nullptr && program.m <= 4 && program.n <= 4 && program.k <= 4 &&
+                               program.batch <= INT32_MAX / (program.m * program.n);
+            LFS_ASSERT_MSG(small || program.batch <= context.caps().max_workgroup_count[2],
                            "Vulkan GEMM batch count exceeds the device workgroup limit");
-            const std::array constants{transpose_b ? 1u : 0u, bias != nullptr ? 1u : 0u};
+            const std::array constants{transpose_b ? 1u : 0u, bias != nullptr ? 1u : 0u, small ? 1u : 0u};
             const VulkanPipeline& pipeline =
                 context.pipelines().specialized("gemm", sizeof(GemmPush), constants);
             const size_t rows_per_dispatch =
@@ -131,6 +133,12 @@ namespace lfs::core::internal {
                     .stride_b = checked_u32(program.k * program.n, "Vulkan GEMM rhs batch stride exceeds uint32"),
                     .stride_c = checked_u32(program.m * program.n, "Vulkan GEMM output batch stride exceeds uint32"),
                 };
+                if (small) {
+                    record_dispatch(context, pipeline, push,
+                                    std::span<const StorageRef>(reads.data(), read_count), writes,
+                                    dispatch_groups(context, program.batch * program.m * program.n), 1, 1);
+                    return;
+                }
                 record_dispatch(context, pipeline, push,
                                 std::span<const StorageRef>(reads.data(), read_count), writes,
                                 groups_x, static_cast<uint32_t>((rows + kGemmTile - 1) / kGemmTile),

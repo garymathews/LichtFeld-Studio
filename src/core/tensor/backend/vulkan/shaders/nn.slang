@@ -1,3 +1,5 @@
+#include "float_math.slangh"
+
 static const uint LFS_LOCAL_SIZE_X = 256;
 static const uint LFS_PUSH_CONSTANT_SIZE = 72;
 
@@ -23,21 +25,6 @@ struct Parameters
     uint spatial;
     uint pad0;
 };
-
-// First NaN wins and equal-magnitude zeros follow the sign rule, matching the
-// CUDA max_reduce_op functor used by the pooling kernel.
-float ieeeMaximum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u)
-        return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u)
-        return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits & rhsBits) & 0x80000000u);
-    return lhs < rhs ? rhs : lhs;
-}
 
 [numthreads(LFS_LOCAL_SIZE_X, 1, 1)]
 void main(uint3 dispatchThreadId : SV_DispatchThreadID, uniform Parameters parameters)

@@ -49,9 +49,12 @@ uint64_t logicalOffset(uint linear, uniform Parameters parameters)
     for (uint reverse = 0; reverse < parameters.rank; ++reverse)
     {
         const uint dimension = parameters.rank - reverse - 1;
-        const uint64_t coordinate = uint64_t(linear) % parameters.dims[dimension];
-        linear = uint(uint64_t(linear) / parameters.dims[dimension]);
-        offset += coordinate * parameters.strides[dimension];
+        // linear < count <= UINT_MAX, so larger dimensions still yield quotient zero.
+        // Keep offsets wide without paying for emulated 64-bit division on Metal.
+        const uint extent = uint(min(parameters.dims[dimension], uint64_t(0xffffffffu)));
+        const uint coordinate = linear % extent;
+        linear /= extent;
+        offset += uint64_t(coordinate) * parameters.strides[dimension];
     }
     return offset;
 }
@@ -60,12 +63,12 @@ uint64_t logicalOffset(uint linear, uniform Parameters parameters)
 void main(uint3 dispatchThreadId : SV_DispatchThreadID, uniform Parameters parameters)
 {
     const uint3 numWorkgroups = spirv_asm { result:$$uint3 = OpLoad builtin(NumWorkgroups:uint3); };
-    const uint stride = numWorkgroups.x * LFS_LOCAL_SIZE_X;
-    for (uint index = dispatchThreadId.x; index < parameters.count; index += stride)
+    const uint64_t stride = uint64_t(numWorkgroups.x) * LFS_LOCAL_SIZE_X;
+    for (uint64_t index = dispatchThreadId.x; index < parameters.count; index += stride)
     {
-        const uint64_t strided = logicalOffset(index, parameters);
-        const uint64_t inputIndex = kScatter != 0 ? uint64_t(index) : strided;
-        const uint64_t outputIndex = kScatter != 0 ? strided : uint64_t(index);
+        const uint64_t strided = logicalOffset(uint(index), parameters);
+        const uint64_t inputIndex = kScatter != 0 ? index : strided;
+        const uint64_t outputIndex = kScatter != 0 ? strided : index;
         if (kInputDType == 2 && kOutputDType == 0)
         {
             ((Ptr<float, Access.ReadWrite>)parameters.outputAddress)[outputIndex] =

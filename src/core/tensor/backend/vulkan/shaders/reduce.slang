@@ -95,47 +95,7 @@ void storeByte(uint64_t address, uint64_t index, uint value)
     } while (true);
 }
 
-float ieeeRound(float value)
-{
-    if (!isfinite(value))
-        return value;
-    const float lower = floor(value);
-    const float fraction = value - lower;
-    float rounded = fraction < 0.5f ? lower
-                  : fraction > 0.5f ? lower + 1.0f
-                                    : (fmod(lower, 2.0f) == 0.0f ? lower : lower + 1.0f);
-    if (rounded == 0.0f && (asuint(value) & 0x80000000u) != 0u)
-        return asfloat(0x80000000u);
-    return rounded;
-}
-
-// First NaN wins and equal-magnitude zeros follow the sign rule, matching the
-// CUDA max_reduce_op and min_reduce_op functors.
-float ieeeMaximum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u)
-        return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u)
-        return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits & rhsBits) & 0x80000000u);
-    return lhs < rhs ? rhs : lhs;
-}
-
-float ieeeMinimum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u)
-        return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u)
-        return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits | rhsBits) & 0x80000000u);
-    return rhs < lhs ? rhs : lhs;
-}
+#include "float_math.slangh"
 
 float applyChainOp(float value, ChainOp op, uint index)
 {

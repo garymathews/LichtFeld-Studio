@@ -3,6 +3,9 @@
 #include "core/nn/ops.hpp"
 #include "photometric_loss.hpp"
 #include <cmath>
+#if LFS_TENSOR_VULKAN
+#include "core/nn/vulkan_ops.hpp"
+#endif
 
 namespace lfs::training::losses {
 
@@ -30,7 +33,7 @@ namespace lfs::training::losses {
         }
         const float l1_scale = (1.f - weight) / denominator;
         Tensor loss = (weights.is_valid() ? delta.abs() * weights : delta.abs()).sum() * l1_scale;
-        Tensor grad = (delta.gt(0.f).to(DataType::Float32) - delta.lt(0.f).to(DataType::Float32)) * l1_scale;
+        Tensor grad = delta.sign() * l1_scale;
         if (weights.is_valid()) grad = grad * weights;
         if (weight == 0.0f)
             return {loss.reshape({1}), grad};
@@ -49,9 +52,14 @@ namespace lfs::training::losses {
             for (size_t c = 1; c < channels; ++c)
                 std::copy_n(coefficients.data(), 11, coefficients.data() + c * 11);
             gaussian_horizontal_ = Tensor::from_vector(coefficients, {channels, 1, 1, 11}, Device::GPU);
+#if !LFS_TENSOR_VULKAN
             gaussian_vertical_ = gaussian_horizontal_.reshape({static_cast<int>(channels), 1, 11, 1});
+#endif
         }
         const auto blur = [&](const Tensor& image) {
+#if LFS_TENSOR_VULKAN
+            return core::nn::vulkan::gaussian_blur_11(image, gaussian_horizontal_);
+#else
             core::nn::Conv2dParams horizontal;
             horizontal.pad_w = 5;
             horizontal.groups = static_cast<int>(channels);
@@ -60,6 +68,7 @@ namespace lfs::training::losses {
             vertical.groups = static_cast<int>(channels);
             return core::nn::conv2d(core::nn::conv2d(image, gaussian_horizontal_, nullptr, horizontal),
                                     gaussian_vertical_, nullptr, vertical);
+#endif
         };
         const Tensor mu_x = blur(prediction);
         const Tensor mu_y = blur(gt);

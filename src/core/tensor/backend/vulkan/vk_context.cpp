@@ -186,6 +186,7 @@ namespace lfs::core::internal {
             vkGetPhysicalDeviceProperties2(device, &properties);
             const VkSubgroupFeatureFlags subgroup_required =
                 VK_SUBGROUP_FEATURE_BASIC_BIT |
+                VK_SUBGROUP_FEATURE_VOTE_BIT |
                 VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
                 VK_SUBGROUP_FEATURE_BALLOT_BIT |
                 VK_SUBGROUP_FEATURE_SHUFFLE_BIT;

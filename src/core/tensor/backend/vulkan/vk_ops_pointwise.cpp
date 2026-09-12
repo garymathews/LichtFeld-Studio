@@ -264,16 +264,16 @@ namespace lfs::core::internal {
             case DataType::Float32:
                 return output == DataType::Float16 || output == DataType::Int32 ||
                        output == DataType::Int64 || output == DataType::UInt8 ||
-                       output == DataType::UInt32;
+                       output == DataType::UInt32 || output == DataType::Bool;
             case DataType::Float16:
                 return output == DataType::Float32 || output == DataType::Int32 ||
-                       output == DataType::Int64 || output == DataType::UInt8;
+                       output == DataType::Int64 || output == DataType::UInt8 || output == DataType::Bool;
             case DataType::Int32:
                 return output == DataType::Float32 || output == DataType::Float16 ||
-                       output == DataType::Int64 || output == DataType::UInt8;
+                       output == DataType::Int64 || output == DataType::UInt8 || output == DataType::Bool;
             case DataType::Int64:
                 return output == DataType::Float32 || output == DataType::Float16 ||
-                       output == DataType::Int32 || output == DataType::UInt8;
+                       output == DataType::Int32 || output == DataType::UInt8 || output == DataType::Bool;
             case DataType::UInt8:
             case DataType::Bool:
                 return output == DataType::Float32 || output == DataType::Float16 ||

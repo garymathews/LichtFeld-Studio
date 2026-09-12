@@ -1,3 +1,5 @@
+#include "float_math.slangh"
+
 static const uint LFS_LOCAL_SIZE_X = 256;
 static const uint LFS_PUSH_CONSTANT_SIZE = 136;
 #include "half_bits.slangh"
@@ -66,28 +68,6 @@ uint broadcastOffset(uint linear, uint rank, uint dims[8], uint outputRank,
         }
     }
     return sourceOffset;
-}
-
-float ieeeMaximum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u) return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u) return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits & rhsBits) & 0x80000000u);
-    return lhs < rhs ? rhs : lhs;
-}
-
-float ieeeMinimum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u) return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u) return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits | rhsBits) & 0x80000000u);
-    return rhs < lhs ? rhs : lhs;
 }
 
 float floatOp(float lhs, float rhs)

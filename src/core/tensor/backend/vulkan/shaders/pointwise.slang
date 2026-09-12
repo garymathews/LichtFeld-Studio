@@ -69,71 +69,7 @@ void storeByte(uint64_t address, uint64_t index, uint value)
     } while (true);
 }
 
-float ieeeRound(float value)
-{
-    if (!isfinite(value))
-        return value;
-    const float lower = floor(value);
-    const float fraction = value - lower;
-    float rounded = fraction < 0.5f ? lower
-                  : fraction > 0.5f ? lower + 1.0f
-                                    : (fmod(lower, 2.0f) == 0.0f ? lower : lower + 1.0f);
-    if (rounded == 0.0f && (asuint(value) & 0x80000000u) != 0u)
-        return asfloat(0x80000000u);
-    return rounded;
-}
-
-float ieeeMaximum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u)
-        return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u)
-        return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits & rhsBits) & 0x80000000u);
-    return lhs < rhs ? rhs : lhs;
-}
-
-float ieeeMinimum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u)
-        return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u)
-        return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits | rhsBits) & 0x80000000u);
-    return rhs < lhs ? rhs : lhs;
-}
-
-float accurateLog1p(float value)
-{
-    if (value == 0.0f)
-        return value;
-    if (value <= -1.0f || !isfinite(value))
-        return log(1.0f + value);
-
-    const float sum = 1.0f + value;
-    const int exponentBits = (asint(sum) - 1061158912) & -8388608;
-    const float reducedValue = asfloat(asint(value) - exponentBits);
-    const float scale = asfloat(1082130432 - exponentBits);
-    const float x = reducedValue + fma(0.25f, scale, -1.0f);
-    const float exponent = float(exponentBits) * 1.1920928955078125e-7f;
-
-    float polynomial = fma(-0.04534861445426941f, x, 0.10546888411045074f);
-    polynomial = fma(polynomial, x, -0.13229703903198242f);
-    polynomial = fma(polynomial, x, 0.14491446316242218f);
-    polynomial = fma(polynomial, x, -0.16641564667224884f);
-    polynomial = fma(polynomial, x, 0.199888676404953f);
-    polynomial = fma(polynomial, x, -0.2500019669532776f);
-    polynomial = fma(polynomial, x, 0.33333510160446167f);
-    polynomial = fma(polynomial, x, -0.5f);
-    const float reducedLog = fma(polynomial * x, x, x);
-    return fma(exponent, 0.6931471824645996f, reducedLog);
-}
+#include "float_math.slangh"
 
 float accurateAsin(float value)
 {

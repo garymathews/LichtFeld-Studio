@@ -6,6 +6,13 @@
 #include "core/tensor_backend.hpp"
 #include <climits>
 
+#if LFS_TENSOR_VULKAN
+#include "core/tensor/backend/vulkan/vk_ops_common.hpp"
+#include "core/tensor/backend/vulkan/vk_pipelines.hpp"
+#include "core/tensor/backend/vulkan/vk_recorder.hpp"
+#include "core/tensor/internal/tensor_impl.hpp"
+#endif
+
 #include "core/assert.hpp"
 #include "core/tensor.hpp"
 
@@ -28,6 +35,35 @@ namespace lfs::core::sh_value_quant {
         constexpr float kEps = 1e-20f;
         constexpr float kInactiveLo = 1e30f;
         constexpr float kInactiveHi = -1e30f;
+
+#if LFS_TENSOR_VULKAN
+        void dispatch_quant(const Tensor& input_tensor, Tensor& output_tensor, Tensor& bounds,
+                            const size_t n, const uint32_t slots, const uint32_t cells,
+                            const bool encode) {
+            struct Push {
+                uint64_t input, output, bounds;
+                uint32_t n, slots, cells, padding;
+            };
+            static_assert(sizeof(Push) == 40);
+            const auto input = internal::storage_ref(input_tensor);
+            const auto output = internal::storage_ref(output_tensor);
+            const auto limits = internal::storage_ref(bounds);
+            const Push push{
+                internal::vk::address(input), internal::vk::address(output), internal::vk::address(limits),
+                internal::vk::checked_u32(n, "SH q16 primitive count exceeds uint32"), slots, cells, 0};
+            const auto context = internal::acquire_vulkan_context();
+            const std::array constants{encode ? 1u : 0u, input_tensor.dtype() == DataType::Float16 ? 1u : 0u};
+            const auto& pipeline = context->pipelines().specialized("sh_quant", sizeof(Push), constants);
+            const std::array reads{input, encode ? internal::StorageRef{} : limits};
+            const std::array writes{output, encode ? limits : internal::StorageRef{}};
+            const auto groups = internal::vk::dispatch_groups(*context, encode ? n : n * cells);
+            context->recorders().record(reads, writes, [&](VkCommandBuffer command) {
+                vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+                vkCmdPushConstants(command, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(command, groups, 1, 1);
+            });
+        }
+#endif
 
         Tensor pad_dim0(const Tensor& src, const size_t extra) {
             if (extra == 0) {
@@ -158,6 +194,23 @@ namespace lfs::core::sh_value_quant {
         const size_t n_quant_blocks = n_bounds_for_prims(n_primitives);
         const size_t n_32_out = sh_swizzled_block_count(n_primitives);
 
+#if LFS_TENSOR_VULKAN
+        if (backend == GpuBackend::Vulkan && slots_per_prim && slots_per_prim <= kMaxEncodeCells / 4 &&
+            n_cells_per_prim <= kMaxEncodeCells &&
+            n_primitives <= static_cast<size_t>(INT_MAX) / 48 &&
+            (src_float4_swizzled.dtype() == DataType::Float32 || src_float4_swizzled.dtype() == DataType::Float16)) {
+            const Tensor source = src_float4_swizzled.contiguous();
+            LFS_ASSERT_MSG(source.numel() >= n_32_out * slots_per_prim * kShReorderSize * 4u,
+                           "SH q16 tensor encode source is too small");
+            Tensor codes = internal::allocate_like(source, TensorShape{n_32_out * kShReorderSize * n_cells_per_prim}, DataType::Float16);
+            Tensor bounds = internal::allocate_like(source, TensorShape{n_quant_blocks, 2}, DataType::Float32);
+            dispatch_quant(source, codes, bounds, n_primitives, slots_per_prim, n_cells_per_prim, true);
+            codes_out = std::move(codes);
+            bounds_out = std::move(bounds);
+            return;
+        }
+#endif
+
         Tensor cells = gather_block_cells(
             src_float4_swizzled, n_primitives, slots_per_prim, n_encode, n_quant_blocks);
         cells.set_stream(src_float4_swizzled.stream());
@@ -244,6 +297,14 @@ namespace lfs::core::sh_value_quant {
                            bounds.numel() >= blocks * 2 && codes.device() == bounds.device() &&
                            gpu_backend_of(codes) == gpu_backend_of(bounds),
                        "SH q16 codes and bounds do not match the primitive layout/backend");
+#if LFS_TENSOR_VULKAN
+        if (gpu_backend_of(codes) == GpuBackend::Vulkan) {
+            Tensor output = internal::allocate_like(codes, TensorShape{n, rest, 3}, DataType::Float32);
+            Tensor limits = bounds.contiguous();
+            dispatch_quant(codes, output, limits, n, 0, cells, false);
+            return output;
+        }
+#endif
         const Tensor bytes = codes.view_as(DataType::UInt8).reshape(TensorShape{count, 2}).to(DataType::Float32);
         const Tensor decoded_codes = bytes.slice(1, 0, 1) + bytes.slice(1, 1, 2) * 256.0f;
         const Tensor rows = decoded_codes.reshape(TensorShape{groups, cells, 32}).permute({0, 2, 1}).contiguous().reshape(TensorShape{groups * 32, cells}).slice(0, 0, n);

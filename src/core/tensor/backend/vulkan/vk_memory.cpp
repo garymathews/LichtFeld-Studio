@@ -240,9 +240,6 @@ namespace lfs::core::internal {
         // residency. Cache completed blocks, including dedicated allocations,
         // until a synchronized trim instead of destroying them while another
         // thread's submission still carries that residency set.
-        if (cached_bytes() > kCacheTrimThreshold) {
-            trim();
-        }
         std::unique_ptr<AllocationRecord> record;
         {
             std::lock_guard lock(allocations_mutex_);
@@ -255,6 +252,10 @@ namespace lfs::core::internal {
             }
         }
         if (!record) {
+            // Reuse matching buffers before trimming to avoid recreating them.
+            if (cached_bytes() > kCacheTrimThreshold) {
+                trim();
+            }
             record = std::make_unique<AllocationRecord>();
             record->allocated_size = bucket_size;
             record->direct = direct;
@@ -290,12 +291,7 @@ namespace lfs::core::internal {
                 result == VK_ERROR_OUT_OF_HOST_MEMORY ||
                 result == VK_ERROR_OUT_OF_POOL_MEMORY ||
                 result == VK_ERROR_FRAGMENTED_POOL) {
-                context_.recorders().wait_all();
-                {
-                    std::lock_guard lock(allocations_mutex_);
-                    collect_retired_locked(context_.completed_timeline());
-                    destroy_free_locked();
-                }
+                trim();
                 result = vmaCreateBuffer(
                     context_.allocator(), &buffer_info, &allocation_info,
                     &record->buffer, &record->allocation, &mapping_info);

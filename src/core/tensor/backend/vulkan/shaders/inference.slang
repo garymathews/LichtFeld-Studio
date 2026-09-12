@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
 // SPDX-License-Identifier: GPL-3.0-or-later
 static const uint LFS_LOCAL_SIZE_X = 256;
-static const uint LFS_PUSH_CONSTANT_SIZE = 112;
+static const uint LFS_PUSH_CONSTANT_SIZE = 120;
 
 [SpecializationConstant]
-const uint kOperation = 0; // im2col, col2im, resize, pool, activation, grid
+const uint kOperation = 0; // im2col, col2im, resize, pool, activation, grid, SSIM blur
 
 struct Parameters
 {
@@ -34,6 +34,7 @@ struct Parameters
     float u1;
     float v0;
     float v1;
+    uint64_t weightAddress;
 };
 
 float sample(float* input, int plane, int y, int x, Parameters p)
@@ -67,11 +68,58 @@ float erfApprox(float x)
     return x < 0.0 ? -r : r;
 }
 
+// Keep the intermediate of the two SSIM passes in threadgroup memory.
+groupshared float blurInput[26 * 26];
+groupshared float blurHorizontal[26 * 16];
+
 [numthreads(LFS_LOCAL_SIZE_X, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uniform Parameters p)
 {
     float* input = (float*)p.inputAddress;
     float* output = (float*)p.outputAddress;
+    if (kOperation == 6)
+    {
+        const uint lane = id.x % 256u;
+        const uint tilesX = (uint(p.width) + 15u) / 16u;
+        const uint tilesY = (uint(p.height) + 15u) / 16u;
+        const uint planes = p.total / (uint(p.width) * uint(p.height));
+        for (uint tile = id.x / 256u; tile < planes * tilesX * tilesY; tile += p.step / 256u)
+        {
+            const uint plane = tile / (tilesX * tilesY);
+            const int x0 = int(tile % tilesX) * 16;
+            const int y0 = int((tile / tilesX) % tilesY) * 16;
+            float* weights = (float*)p.weightAddress + (plane % uint(p.channels)) * 11u;
+            for (uint i = lane; i < 26u * 26u; i += 256u)
+            {
+                const int x = x0 + int(i % 26u) - 5;
+                const int y = y0 + int(i / 26u) - 5;
+                blurInput[i] = x >= 0 && x < p.width && y >= 0 && y < p.height
+                                   ? input[(plane * uint(p.height) + uint(y)) * uint(p.width) + uint(x)] : 0.0f;
+            }
+            GroupMemoryBarrierWithGroupSync();
+            for (uint i = lane; i < 26u * 16u; i += 256u)
+            {
+                float sum = 0.0f;
+                [unroll]
+                for (uint tap = 0; tap < 11u; ++tap)
+                    sum += weights[tap] * blurInput[(i / 16u) * 26u + i % 16u + tap];
+                blurHorizontal[i] = sum;
+            }
+            GroupMemoryBarrierWithGroupSync();
+            const int x = x0 + int(lane % 16u);
+            const int y = y0 + int(lane / 16u);
+            if (x < p.width && y < p.height)
+            {
+                float sum = 0.0f;
+                [unroll]
+                for (uint tap = 0; tap < 11u; ++tap)
+                    sum += weights[tap] * blurHorizontal[(lane / 16u + tap) * 16u + lane % 16u];
+                output[(plane * uint(p.height) + uint(y)) * uint(p.width) + uint(x)] = sum;
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        return;
+    }
     for (uint index = id.x; index < p.total; index += p.step)
     {
         float value = 0.0;

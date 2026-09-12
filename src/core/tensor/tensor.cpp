@@ -1666,6 +1666,17 @@ namespace lfs::core {
             return contiguous().to(dtype);
         }
 
+        if (dtype == DataType::Bool && device_ == Device::GPU &&
+            internal::gpu_backend_tag(*this) == GpuBackend::Vulkan &&
+            (dtype_ == DataType::Float32 || dtype_ == DataType::Float16 ||
+             dtype_ == DataType::Int32 || dtype_ == DataType::Int64)) {
+            auto result = internal::allocate_like(*this, shape_, dtype);
+            internal::backend_ops_for(*this).convert_type(
+                internal::storage_ref(*this), internal::storage_ref(result),
+                numel(), internal::ExecContext{result.stream()});
+            return result;
+        }
+
 // Macro for type conversions using launch_convert_type
 #define CONVERT_DTYPE_CUDA(FROM_TYPE, TO_TYPE, FROM_DTYPE, TO_DTYPE)         \
     if (dtype_ == FROM_DTYPE && dtype == TO_DTYPE) {                         \
@@ -2144,6 +2155,10 @@ namespace lfs::core {
         if (numel() == 0) {
             return *this;
         }
+        // Queue Vulkan fills, retaining this overload's signed-zero behavior.
+        if (device_ == Device::GPU && internal::gpu_backend_tag(*this) == GpuBackend::Vulkan &&
+            (value != 0.0f || !std::signbit(value)))
+            return fill_(value, stream());
         preserve_lazy_snapshots_before_write();
 
         // CRITICAL FIX: For non-contiguous tensors (from slice/view operations),

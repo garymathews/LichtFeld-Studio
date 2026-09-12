@@ -51,9 +51,9 @@ namespace lfs::core {
 
     // A Vulkan-backend tensor's storage for a consumer on the same device. The
     // buffer is valid while keep_alive is held; pending_timeline_value is the
-    // value of vulkan_backend_timeline() after which every pending write to the
-    // tensor is complete (0 when nothing is pending); the query flushes the
-    // recorder that owns those writes so the value will be signalled.
+    // value of vulkan_backend_timeline() after which all pending reads and writes
+    // to the tensor are complete (0 when nothing is pending); the query flushes the
+    // recorder that owns those accesses so the value will be signalled.
     struct TensorVulkanBuffer {
         void* buffer = nullptr;
         uint64_t offset = 0;

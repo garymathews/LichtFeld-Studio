@@ -254,9 +254,11 @@ namespace lfs::training {
                                      impl.model->_densification_info.shape() != TensorShape{2, n}))
             throw std::invalid_argument("Vulkan densification needs a Float32 HW error map and 2N model statistics");
         impl.pending_backward = false;
-        for (const auto& region : impl.regions) {
+        // The last forward region is still resident in the renderer.
+        for (auto it = impl.regions.rbegin(); it != impl.regions.rend(); ++it) {
+            const auto& region = *it;
             auto gate = impl.last_gate;
-            if (impl.regions.size() != 1) {
+            if (it != impl.regions.rbegin()) {
                 gate = impl.render(region);
                 if (gate.count_overflow || gate.raw_count > impl.max_tile_instances)
                     throw std::runtime_error("Training region changed between forward and backward");

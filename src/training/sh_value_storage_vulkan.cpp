@@ -240,9 +240,19 @@ namespace lfs::training::sh_value {
         // Read back block IDs, never the primitive index array. Untouched codes
         // and bounds are copied verbatim and incur no requantization drift.
         const auto blocks = touched.nonzero().reshape({-1}).cpu().to_vector_int64();
-        size_t pending_blocks = 0;
-        for (const auto block : blocks) {
-            const size_t start = size_t(block) * 256, end = std::min(start + 256, n);
+        // Cap each contiguous batch; drain sparse batches after at least 4096 queued rows.
+        constexpr size_t max_batch_rows = 131072;
+        constexpr size_t sync_interval_rows = 4096;
+        size_t pending_rows = 0;
+        for (size_t i = 0; i < blocks.size();) {
+            const size_t start = size_t(blocks[i++]) * 256;
+            size_t end = start + 256;
+            // Batch adjacent blocks while preserving untouched codes and bounds.
+            while (i < blocks.size() && size_t(blocks[i]) * 256 == end && end - start < max_batch_rows) {
+                end += 256;
+                ++i;
+            }
+            end = std::min(end, n);
             auto canonical = Tensor::zeros({end - start, rest, 3}, splat.shN().device());
             if (start < old_n) {
                 const size_t keep = std::min(end, old_n) - start;
@@ -266,9 +276,9 @@ namespace lfs::training::sh_value {
                 }
             }
             encode_block(canonical, start, rest, storage);
-            if (++pending_blocks == 16) {
+            if ((pending_rows += end - start) >= sync_interval_rows) {
                 with_idle_vulkan_device([](const auto&) {});
-                pending_blocks = 0;
+                pending_rows = 0;
             }
         }
         publish_storage(splat, std::move(storage));

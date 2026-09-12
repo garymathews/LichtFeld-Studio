@@ -1,3 +1,5 @@
+#include "float_math.slangh"
+
 static const uint LFS_LOCAL_SIZE_X = 256;
 static const uint LFS_PUSH_CONSTANT_SIZE = 160;
 
@@ -175,32 +177,6 @@ int wrapIndex(int index, uint extent)
         return int(uint(index) % extent);
     const uint remainder = uint(-index) % extent;
     return remainder == 0u ? 0 : int(extent - remainder);
-}
-
-float ieeeMaximum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u)
-        return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u)
-        return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits & rhsBits) & 0x80000000u);
-    return lhs < rhs ? rhs : lhs;
-}
-
-float ieeeMinimum(float lhs, float rhs)
-{
-    const uint lhsBits = asuint(lhs);
-    const uint rhsBits = asuint(rhs);
-    if ((lhsBits & 0x7fffffffu) > 0x7f800000u)
-        return lhs;
-    if ((rhsBits & 0x7fffffffu) > 0x7f800000u)
-        return rhs;
-    if ((lhsBits & 0x7fffffffu) == 0u && (rhsBits & 0x7fffffffu) == 0u)
-        return asfloat((lhsBits | rhsBits) & 0x80000000u);
-    return rhs < lhs ? rhs : lhs;
 }
 
 float combineFloat(float accumulator, float value)

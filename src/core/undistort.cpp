@@ -624,6 +624,8 @@ namespace lfs::core {
                                     Device::CPU);
         const size_t src_plane = static_cast<size_t>(params.src_width) * params.src_height;
         const size_t dst_plane = static_cast<size_t>(params.dst_width) * params.dst_height;
+        const float* const input_data = input.ptr<float>();
+        float* const output_data = output.ptr<float>();
         for (int y = 0; y < params.dst_height; ++y) {
             for (int x = 0; x < params.dst_width; ++x) {
                 const float nx = (x + PIXEL_CENTER_OFFSET - params.dst_cx) / params.dst_fx;
@@ -637,8 +639,8 @@ namespace lfs::core {
                     sx >= params.src_width || sy >= params.src_height)
                     continue;
                 for (size_t c = 0; c < src.shape()[0]; ++c) {
-                    output.ptr<float>()[c * dst_plane + static_cast<size_t>(y) * params.dst_width + x] =
-                        bilinear_sample(input.ptr<float>() + c * src_plane, params.src_width,
+                    output_data[c * dst_plane + static_cast<size_t>(y) * params.dst_width + x] =
+                        bilinear_sample(input_data + c * src_plane, params.src_width,
                                         params.src_height, params.src_width, sx, sy);
                 }
             }

@@ -13,6 +13,7 @@ namespace lfs::core::nn::vulkan {
     Tensor activate(const Tensor& input, Activation activation);
     Tensor conv(const Tensor& input, const Tensor& weight, const Tensor* bias,
                 const Conv2dParams& params, bool transpose = false);
+    LFS_CORE_API Tensor gaussian_blur_11(const Tensor& input, const Tensor& coefficients);
     Tensor resize(const Tensor& input, int height, int width, ResizeMode mode, CoordTransform coord);
     Tensor pool(const Tensor& input, int kh, int kw, int sh, int sw, int ph, int pw,
                 bool average = false, bool count_include_pad = true);

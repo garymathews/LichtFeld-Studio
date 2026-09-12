@@ -545,7 +545,7 @@ namespace lfs::core {
                         .dst = internal::storage_ref(result),
                         .bytes = result.bytes(),
                         .value = fill,
-                        .synchronous = !asynchronous,
+                        .synchronous = !asynchronous && internal::gpu_backend_tag(result) != GpuBackend::Vulkan,
                         .context = internal::ExecContext{
                             asynchronous ? result.stream() : nullptr},
                     });

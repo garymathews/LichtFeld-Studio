@@ -187,22 +187,26 @@ namespace lfs::core::internal {
         std::lock_guard lock(mutex_);
         collect_completed_locked(context_.completed_timeline());
         Recorder& recorder = current_locked();
-        const auto flush_foreign_producer = [&](const StorageRef storage) {
+        const auto flush_foreign_access = [&](const StorageRef storage) {
             if (storage.meta != nullptr &&
                 storage.meta->pending_recorder.load(std::memory_order_acquire) != recorder.id) {
                 ensure_submitted_locked(storage);
             }
         };
         for (const StorageRef storage : reads) {
-            flush_foreign_producer(storage);
+            flush_foreign_access(storage);
         }
         for (const StorageRef storage : writes) {
-            flush_foreign_producer(storage);
+            flush_foreign_access(storage);
         }
         begin_locked(recorder);
         global_barrier(recorder.command);
         command(recorder.command);
         ++recorder.command_count;
+        // A later writer on another thread must submit these readers first.
+        for (const StorageRef storage : reads) {
+            stamp(storage, recorder.id, recorder.reserved_value);
+        }
         for (const StorageRef storage : writes) {
             stamp(storage, recorder.id, recorder.reserved_value);
         }

@@ -139,6 +139,7 @@ if(NOT LFS_TENSOR_CUDA)
         rasterization/fast_rasterizer.cpp rasterization/gsplat_rasterizer.cpp)
 endif()
 add_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
+target_compile_definitions(lfs_training PRIVATE LFS_TENSOR_VULKAN=$<BOOL:${LFS_TENSOR_VULKAN}>)
 
 target_include_directories(lfs_training
     PUBLIC

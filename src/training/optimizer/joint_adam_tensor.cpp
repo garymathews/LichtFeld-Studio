@@ -1,8 +1,9 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "joint_adam_tensor.hpp"
-#include "core/tensor_backend.hpp"
+#include "core/tensor/internal/joint_moments.hpp"
 #include "core/tensor/internal/tensor_index_validation.hpp"
+#include "core/tensor_backend.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
 #include <limits>
 #include <optional>
@@ -37,6 +38,9 @@ namespace lfs::training::joint_adam {
                                 const int bits, const size_t cells_per_block, const Tensor* cell_indices) {
         const size_t stored_cells = validate_storage(packed, bounds, bits, cells_per_block);
         const size_t cells = cell_indices ? cell_indices->numel() : stored_cells;
+        TensorMoments decoded;
+        if (!cell_indices && core::internal::try_decode_joint_moments(packed, bounds, bits, cells_per_block, kEps, decoded.first, decoded.second))
+            return decoded;
         const size_t blocks = bounds.shape()[0];
         const size_t bpc = bytes_per_cell(bits);
         Tensor selected_bytes, selected_bounds;
@@ -82,6 +86,8 @@ namespace lfs::training::joint_adam {
                 moment->device() != packed.device() || core::gpu_backend_of(*moment) != core::gpu_backend_of(packed))
                 throw std::invalid_argument("Joint Adam moments do not match packed storage");
         }
+        if (core::internal::try_encode_joint_moments(moments.first, moments.second, packed, bounds, bits, cells_per_block, kEps, valid_cells))
+            return;
         std::optional<core::GpuBackendScope> backend;
         if (const auto kind = core::gpu_backend_of(packed))
             backend.emplace(*kind);

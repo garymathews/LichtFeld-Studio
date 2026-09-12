@@ -1858,14 +1858,23 @@ namespace lfs::vis {
     }
 
     float TrainerManager::getEstimatedRemainingSeconds() const {
-        const float elapsed = getElapsedSeconds();
-        const int current_iter = getCurrentIteration();
-        const int total_iter = getTotalIterations();
-
-        if (current_iter <= 0 || elapsed <= 0.0f || total_iter <= current_iter)
+        if (!trainer_)
             return 0.0f;
 
-        const float secs_per_iter = elapsed / static_cast<float>(current_iter);
+        auto elapsed = accumulated_training_time_;
+        const int current_iter = getCurrentIteration();
+        const int total_iter = getTotalIterations();
+        const int timed_iterations = current_iter - checkpoint_baseline_iteration_.value_or(0);
+        if (checkpoint_baseline_iteration_ && restored_accumulated_training_time_)
+            elapsed -= *restored_accumulated_training_time_;
+        if (getState() == TrainingState::Running)
+            elapsed += std::chrono::steady_clock::now() - training_start_time_;
+        const float elapsed_seconds = std::chrono::duration<float>(elapsed).count();
+
+        if (timed_iterations <= 0 || elapsed_seconds <= 0.0f || total_iter <= current_iter)
+            return 0.0f;
+
+        const float secs_per_iter = elapsed_seconds / static_cast<float>(timed_iterations);
         return secs_per_iter * static_cast<float>(total_iter - current_iter);
     }
 
