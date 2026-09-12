@@ -16,10 +16,10 @@ target_include_directories(lfs_diagnostics
         ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-target_link_libraries(lfs_diagnostics
-    PUBLIC
-        CUDA::cudart
-)
+if(TARGET CUDA::cudart)
+    target_link_libraries(lfs_diagnostics PUBLIC CUDA::cudart)
+    target_compile_definitions(lfs_diagnostics PRIVATE LFS_DIAGNOSTICS_CUDA=1)
+endif()
 
 target_compile_features(lfs_diagnostics PUBLIC cxx_std_23)
 

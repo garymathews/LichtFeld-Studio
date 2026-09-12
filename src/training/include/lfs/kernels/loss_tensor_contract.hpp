@@ -6,6 +6,7 @@
 #include "core/assert.hpp"
 #include "core/cuda_safe_format.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor_backend.hpp"
 
 #include <climits>
 #include <cmath>
@@ -30,8 +31,8 @@ namespace lfs::training::kernels {
             const bool target,
             const std::string_view name) {
             LFS_ASSERT_MSG(input.is_valid(), lfs::core::detail::format_cuda_safe("{} must be a valid tensor", name));
-            LFS_ASSERT_MSG(input.device() == lfs::core::Device::CUDA,
-                           lfs::core::detail::format_cuda_safe("{} must be a CUDA tensor", name));
+            LFS_ASSERT_MSG(input.device() == lfs::core::Device::GPU,
+                           lfs::core::detail::format_cuda_safe("{} must be a GPU tensor", name));
             LFS_ASSERT_MSG(input.ndim() == 3 || input.ndim() == 4,
                            lfs::core::detail::format_cuda_safe("{} must have shape [C,H,W] or [N,C,H,W] (shape={})",
                                                                name, input.shape().str()));
@@ -72,6 +73,8 @@ namespace lfs::training::kernels {
         LFS_ASSERT_MSG(prepared_prediction.shape() == prepared_target.shape(),
                        lfs::core::detail::format_cuda_safe("Loss prediction and target shapes must match (prediction={}, target={})",
                                                            prepared_prediction.shape().str(), prepared_target.shape().str()));
+        LFS_ASSERT_MSG(lfs::core::gpu_backend_of(prediction) == lfs::core::gpu_backend_of(target),
+                       "Loss prediction and target must use the same GPU backend");
         return {
             .prediction = std::move(prepared_prediction),
             .target = std::move(prepared_target),
@@ -94,7 +97,7 @@ namespace lfs::training::kernels {
         const lfs::core::Tensor& input,
         const lfs::core::Tensor& prepared_image) {
         LFS_ASSERT_MSG(input.is_valid(), "Loss mask must be a valid tensor");
-        LFS_ASSERT_MSG(input.device() == lfs::core::Device::CUDA, "Loss mask must be a CUDA tensor");
+        LFS_ASSERT_MSG(input.device() == lfs::core::Device::GPU, "Loss mask must be a GPU tensor");
         LFS_ASSERT_MSG(input.dtype() == lfs::core::DataType::Float32 ||
                            input.dtype() == lfs::core::DataType::UInt8 ||
                            input.dtype() == lfs::core::DataType::Bool,
@@ -105,6 +108,8 @@ namespace lfs::training::kernels {
                        lfs::core::detail::format_cuda_safe("Loss mask must have shape [H,W] or [1,H,W] (shape={})",
                                                            input.shape().str()));
 
+        LFS_ASSERT_MSG(lfs::core::gpu_backend_of(input) == lfs::core::gpu_backend_of(prepared_image),
+                       "Loss mask and image must use the same GPU backend");
         auto mask = input.contiguous();
         if (mask.ndim() == 3)
             mask = mask.squeeze(0);

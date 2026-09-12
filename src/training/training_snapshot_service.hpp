@@ -9,7 +9,7 @@
 #include "core/parameters.hpp"
 #include "core/uuid.hpp"
 
-#include <cuda_runtime_api.h>
+#include "core/cuda_stream_fwd.hpp"
 
 #include <chrono>
 #include <cstddef>

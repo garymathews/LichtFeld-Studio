@@ -6,6 +6,9 @@
 
 // Re-export public API
 #include "io/exporter.hpp"
+#ifndef __cpp_lib_move_only_function
+#include <itlib/ufunction.hpp>
+#endif
 
 namespace lfs::io {
 
@@ -30,7 +33,11 @@ namespace lfs::io {
     Result<void> encode_sog(const SplatData&, const SogEncodeOptions&, SogSink&);
     Result<void> encode_sog_directory(const SplatData&, const SogEncodeOptions&);
     // CPU-only I/O and WebP decode. Invoke the returned closure on the owning CUDA thread.
+#ifdef __cpp_lib_move_only_function
     using SogDirectoryReconstruct = std::move_only_function<Result<SplatData>()>;
+#else
+    using SogDirectoryReconstruct = itlib::ufunction<Result<SplatData>()>;
+#endif
     // Bounded entry access shared by directory and bundle readers.
     using SogEntryReader = std::function<Result<std::vector<uint8_t>>(const std::string&, size_t)>;
     Result<SogDirectoryReconstruct> prepare_sog_entries(const SogEntryReader&, const std::string& prefix);

@@ -6,9 +6,10 @@
 #include "core/cuda_error.hpp"
 #include "core/environment.hpp"
 #include "core/logger.hpp"
+#include "core/tensor/internal/cuda_event_pool.hpp"
+#include "core/tensor/internal/stream_lifetime.hpp"
+#include "core/tensor_backend.hpp"
 #include "diagnostics/vram_profiler.hpp"
-#include "internal/cuda_event_pool.hpp"
-#include "internal/stream_lifetime.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -188,6 +189,7 @@ namespace lfs::core {
         }
 
         const bool use_pinned =
+            gpu_backend_available(GpuBackend::CUDA) &&
             enabled_.load(std::memory_order_acquire) &&
             !force_fallback_for_testing_.load(std::memory_order_acquire) &&
             !cuda_is_unavailable();

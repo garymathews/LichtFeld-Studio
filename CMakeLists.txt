@@ -2,16 +2,25 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# windows/linux platform independent
+cmake_minimum_required(VERSION 3.30)
+
+if(CMAKE_HOST_APPLE)
+    set(_lfs_default_cuda OFF)
+else()
+    set(_lfs_default_cuda ON)
+endif()
+option(LFS_TENSOR_CUDA "Compile CUDA tensor, rasterizer and training backends" ${_lfs_default_cuda})
+unset(_lfs_default_cuda)
+
+# A supplied toolchain takes precedence. System packages can also satisfy the
+# build; an unset VCPKG_ROOT must not become /scripts/buildsystems.
 set(RAW_VCPKG_PATH $ENV{VCPKG_ROOT})
 file(TO_CMAKE_PATH "${RAW_VCPKG_PATH}" VCPKG_ROOT)
 
-if ("${CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
+if ("${CMAKE_TOOLCHAIN_FILE}" STREQUAL "" AND NOT "${VCPKG_ROOT}" STREQUAL "")
     message(STATUS "user didn't specify CMAKE_TOOLCHAIN_FILE manually, so let's use default -> ${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
     set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
 endif()
-
-cmake_minimum_required(VERSION 3.30)
 
 # Manifest-mode vcpkg runs only while CMake configures. Track overlay-port
 # contents explicitly so the usual `cmake --build` regeneration also reruns
@@ -24,6 +33,10 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LFS_VCPKG_OVERL
 # cache values are visible before project(), when the vcpkg toolchain resolves
 # manifest features.
 list(REMOVE_ITEM VCPKG_MANIFEST_FEATURES tests vulkan-validation)
+if(CMAKE_HOST_APPLE AND NOT LFS_TENSOR_CUDA)
+    set(VCPKG_MANIFEST_NO_DEFAULT_FEATURES ON)
+    list(APPEND VCPKG_MANIFEST_FEATURES macos-application)
+endif()
 if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
@@ -94,8 +107,8 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VcpkgProfiles.cmake")
 lfs_validate_vcpkg_profile()
 
-project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CUDA CXX C)
-
+project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CXX C)
+include(GNUInstallDirs)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SelectFastLinker.cmake")
 
 # On Linux, hide symbols pulled in from third-party image / compression static
@@ -337,6 +350,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # CUDA setup
+if(LFS_TENSOR_CUDA)
 # On Windows, nvidia-smi.exe is in System32, but CMake might be running as 32-bit
 # which causes WOW64 redirection. Explicitly search in Sysnative to avoid this.
 if(WIN32)
@@ -452,6 +466,11 @@ if(NOT TARGET CUDA::nvToolsExt)
 endif()
 
 message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
+else()
+    set(LFS_RUNTIME_MIN_SM 0)
+endif()
+add_compile_definitions(LFS_TENSOR_CUDA=$<BOOL:${LFS_TENSOR_CUDA}>)
+
 
 # Find packages
 find_package(TBB REQUIRED)
@@ -657,7 +676,7 @@ else()
         lfs_core
         lfs_io
         lfs_video
-        fastlfs_backend
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:fastlfs_backend>
         lfs_python_utils
     )
 endif()
@@ -666,8 +685,8 @@ target_link_libraries(${PROJECT_NAME}
         PRIVATE
         ${LFS_APP_INTERNAL_LINK_LIBS}
 
-        CUDA::cudart
-        CUDA::curand
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::cudart>
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::curand>
         spdlog::spdlog
         taywee::args
         SDL3::SDL3
@@ -1067,7 +1086,13 @@ if(WIN32 AND _exe_is_multi_config)
 endif()
 
 # Platform-specific settings
-if(UNIX)
+if(APPLE)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        BUILD_RPATH "@executable_path;@executable_path/lib"
+        INSTALL_RPATH "@executable_path;@executable_path/../Frameworks;@executable_path/../lib"
+        BUILD_WITH_INSTALL_RPATH FALSE
+        INSTALL_RPATH_USE_LINK_PATH FALSE)
+elseif(UNIX)
     if(BUILD_PORTABLE)
         set_target_properties(${PROJECT_NAME} PROPERTIES
                 INSTALL_RPATH "$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib"
@@ -1227,7 +1252,6 @@ endif()
 set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
 set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
 
-include(GNUInstallDirs)
 include(InstallRequiredSystemLibraries)
 
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -1257,6 +1281,11 @@ install(TARGETS lfs_mcp
 )
 install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
 
+if(APPLE AND (NOT CMAKE_INSTALL_BINDIR STREQUAL "bin" OR
+              NOT CMAKE_INSTALL_LIBDIR STREQUAL "lib" OR
+              NOT CMAKE_INSTALL_DATADIR STREQUAL "share"))
+    message(FATAL_ERROR "macOS runtime lookup requires relative bin, lib and share install directories; customize CMAKE_INSTALL_PREFIX instead")
+endif()
 set(INSTALL_RESOURCE_DIR "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio")
 if(_LFS_VULKAN_RASTERIZER_SPV_DIR)
     install(DIRECTORY "${_LFS_VULKAN_RASTERIZER_SPV_DIR}/"
@@ -1331,8 +1360,8 @@ if(TARGET nvimgcodec)
     endif()
 endif()
 
-# Portable build: bundle runtime dependencies via GET_RUNTIME_DEPENDENCIES
-if(BUILD_PORTABLE)
+# Portable builds and macOS installations need their non-system runtime libraries.
+if(BUILD_PORTABLE OR APPLE)
     # Exclusion patterns for system libraries
     # nvcuda.dll is provided by the NVIDIA GPU driver, not the CUDA Toolkit
     set(_PRE_EXCLUDE [[api-ms-.*]] [[ext-ms-.*]] [[API-MS-.*]] [[EXT-MS-.*]] [[nvcuda[.]dll]] [[libcuda[.]so.*]])
@@ -1343,6 +1372,21 @@ if(BUILD_PORTABLE)
             [[.*libdl[.]so.*]] [[.*libm[.]so[.].*]] [[.*librt[.]so.*]]
             [[.*libstdc[+][+].*]] [[.*libgcc_s.*]]
             [[.*libnvimgcodec.*]] [[.*libnvjpeg_ext.*]])
+
+    if(APPLE)
+        list(APPEND _PRE_EXCLUDE [[^/System/Library/]] [[^/usr/lib/]])
+        list(APPEND _POST_EXCLUDE [[^/System/Library/]])
+        find_library(LFS_MOLTENVK_LIBRARY MoltenVK
+            HINTS "$ENV{VULKAN_SDK}/lib" /opt/homebrew/opt/molten-vk/lib /usr/local/opt/molten-vk/lib REQUIRED)
+        install(FILES "${LFS_MOLTENVK_LIBRARY}" DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+        file(RELATIVE_PATH _lfs_icd_library_path
+            "${CMAKE_INSTALL_PREFIX}/${INSTALL_RESOURCE_DIR}/vulkan"
+            "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/libMoltenVK.dylib")
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/MoltenVK_icd.json"
+            "{\"file_format_version\":\"1.0.0\",\"ICD\":{\"library_path\":\"${_lfs_icd_library_path}\",\"api_version\":\"1.2.0\",\"is_portability_driver\":true}}")
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/MoltenVK_icd.json"
+            DESTINATION "${INSTALL_RESOURCE_DIR}/vulkan")
+    endif()
 
     # Search directories for runtime dependencies (quoted for paths with spaces on Windows)
     set(_RUNTIME_SEARCH_DIRS
@@ -1392,6 +1436,9 @@ if(BUILD_PORTABLE)
     endfunction()
 
     bundle_runtime_deps("$<TARGET_FILE:${PROJECT_NAME}>" FALSE)
+    if(TARGET lfs_py)
+        bundle_runtime_deps("$<TARGET_FILE:lfs_py>" TRUE)
+    endif()
     if(TARGET nvjpeg_ext)
         bundle_runtime_deps("$<TARGET_FILE:nvjpeg_ext>" TRUE)
     endif()
@@ -1432,6 +1479,10 @@ if(BUILD_PORTABLE)
             endif()
         " COMPONENT runtime)
     endif()
+endif()
+
+if(APPLE)
+    install(SCRIPT "${CMAKE_SOURCE_DIR}/cmake/RelocateMacOS.cmake" COMPONENT runtime)
 endif()
 
 # Build statistics (parses .ninja_log, no Python required)

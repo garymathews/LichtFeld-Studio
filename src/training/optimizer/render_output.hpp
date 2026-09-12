@@ -26,6 +26,13 @@ namespace lfs::training {
         lfs::core::Camera* camera = nullptr; // Current training camera, when available
         int width = 0;
         int height = 0;
+
+        // Replace the solid background already included by the rasterizer.
+        void composite_background(const core::Tensor& pixels, const core::Tensor& solid = {}) {
+            if (!pixels.is_valid()) return;
+            const auto difference = solid.is_valid() ? pixels - solid.reshape({3, 1, 1}) : pixels;
+            image = image + difference * (alpha.reshape(core::TensorShape{1, image.shape()[1], image.shape()[2]}).neg() + 1.f);
+        }
     };
 
     enum class RenderMode {

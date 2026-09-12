@@ -8,14 +8,21 @@
 #include "core/error_reporter.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/nn/ops.hpp"
 #include "core/path_utils.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/tensor_impl.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/memory_pool.hpp"
+#endif
 #include "cuda/image_format_kernels.cuh"
 #include "diagnostics/vram_profiler.hpp"
 #include "io/nvcodec_image_loader.hpp"
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <stb_image.h>
 
 #include <algorithm>
@@ -310,6 +317,7 @@ namespace lfs::io {
             return instances;
         }
 
+#if LFS_TENSOR_CUDA
         std::shared_ptr<NvCodecImageLoader> acquire_nvcodec_loader(size_t decoder_pool_size) {
             std::lock_guard<std::mutex> lock(get_nvcodec_mutex());
             auto& instances = get_nvcodec_loader_cache();
@@ -331,6 +339,7 @@ namespace lfs::io {
             instances[requested_pool_size].instance = instance;
             return instance;
         }
+#endif
 
         void retain_nvcodec_loader_cache(size_t decoder_pool_size) {
             std::lock_guard<std::mutex> lock(get_nvcodec_mutex());
@@ -387,16 +396,7 @@ namespace lfs::io {
             tensor = lfs::core::undistort_image(tensor, scaled, nullptr);
 
             if (restore_uint8) {
-                auto uint8_tensor = lfs::core::Tensor::empty(
-                    tensor.shape(), lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
-                cuda::launch_float32_chw_to_uint8_chw(
-                    tensor.ptr<float>(),
-                    uint8_tensor.ptr<uint8_t>(),
-                    tensor.shape()[1],
-                    tensor.shape()[2],
-                    tensor.shape()[0],
-                    static_cast<cudaStream_t>(params.cuda_stream));
-                tensor = std::move(uint8_tensor);
+                tensor = (tensor.clamp(0.f, 1.f) * 255.f + .5f).to(lfs::core::DataType::UInt8);
             }
         }
 
@@ -450,6 +450,7 @@ namespace lfs::io {
             }
         }
 
+#if LFS_TENSOR_CUDA
         [[nodiscard]] lfs::core::Tensor decode_cached_rgb_tensor(
             const std::shared_ptr<NvCodecImageLoader>& nvcodec,
             const std::shared_ptr<std::vector<uint8_t>>& jpeg_data,
@@ -470,6 +471,7 @@ namespace lfs::io {
 
             return tensor;
         }
+#endif
 
         std::tuple<uint8_t*, int, int> load_grayscale_stb(const std::filesystem::path& path) {
             int w, h, c;
@@ -477,6 +479,7 @@ namespace lfs::io {
             return {data, w, h};
         }
 
+#if LFS_TENSOR_CUDA
         void synchronize_async_upload_before_free(cudaStream_t stream, const char* context) {
             // A null stream means the legacy default stream. Synchronizing it
             // here would impose a device-wide barrier on unrelated callers.
@@ -488,6 +491,7 @@ namespace lfs::io {
                     std::string(context) + " upload sync failed: " + cudaGetErrorString(err));
             }
         }
+#endif
 
     } // namespace
 
@@ -556,6 +560,7 @@ namespace lfs::io {
             io_threads_.emplace_back([this] { prefetch_thread_func(); });
         }
 
+#if LFS_TENSOR_CUDA
         if (nvcodec_available) {
             // On failure fall back to the default stream rather than a bad handle.
             if (const cudaError_t err = cudaStreamCreateWithFlags(&decode_stream_, cudaStreamNonBlocking); err != cudaSuccess) {
@@ -565,8 +570,11 @@ namespace lfs::io {
             gpu_decode_thread_ = std::thread([this] { gpu_batch_decode_thread_func(); });
         }
 
+#endif
         sidecar_streams_.resize(config_.cold_process_threads, nullptr);
         for (size_t i = 0; i < config_.cold_process_threads; ++i) {
+
+#if LFS_TENSOR_CUDA
             if (const cudaError_t err = cudaStreamCreateWithFlags(&sidecar_streams_[i], cudaStreamNonBlocking);
                 err != cudaSuccess) {
                 LOG_WARN("[PipelinedImageLoader] sidecar stream creation failed for worker {} ({}), sidecars fall back to default stream",
@@ -574,6 +582,8 @@ namespace lfs::io {
                          cudaGetErrorString(err));
                 sidecar_streams_[i] = nullptr;
             }
+#endif
+
             cold_process_threads_.emplace_back([this, i] { cold_process_thread_func(i); });
         }
 
@@ -619,6 +629,7 @@ namespace lfs::io {
         // too late because shutdown destroys the stream first.
         clear();
 
+#if LFS_TENSOR_CUDA
         cudaDeviceSynchronize();
         if (decode_stream_) {
             lfs::core::CudaMemoryPool::instance().release_stream(decode_stream_);
@@ -632,6 +643,7 @@ namespace lfs::io {
                 stream = nullptr;
             }
         }
+#endif
         sidecar_streams_.clear();
         release_nvcodec_loader_cache(config_.decoder_pool_size);
 
@@ -987,6 +999,12 @@ namespace lfs::io {
 
     lfs::core::Tensor PipelinedImageLoader::load_image_immediate(
         const std::filesystem::path& path, const LoadParams& params) {
+#if !LFS_TENSOR_CUDA
+        auto decoded = decode_file_on_cpu(path, params);
+        apply_requested_undistort(decoded, params);
+        return decoded;
+#else
+
         const auto cache_key = make_cache_key(path, params);
         const bool is_original_jpeg = is_jpeg_file_signature(path);
         const bool needs_requested_processing = load_params_need_processing(params);
@@ -1107,6 +1125,8 @@ namespace lfs::io {
 
         apply_requested_undistort(decoded, params);
         return decoded;
+
+#endif
     }
 
     std::string PipelinedImageLoader::make_cache_key(const std::filesystem::path& path, const LoadParams& params) const {
@@ -1158,6 +1178,38 @@ namespace lfs::io {
     lfs::core::Tensor PipelinedImageLoader::decode_file_on_cpu(
         const std::filesystem::path& path,
         const LoadParams& params) const {
+#if !LFS_TENSOR_CUDA
+        using namespace lfs::core;
+        if (params.cuda_stream)
+            throw TensorError("CUDA stream supplied for portable image decode");
+        {
+            std::lock_guard lock(stats_mutex_);
+            ++stats_.cpu_decode_calls;
+        }
+        Tensor host;
+        if (config_.use_16bit_color) {
+            auto [raw, width, height, channels] = load_image_u16(path, params.resize_factor, params.max_width);
+            std::unique_ptr<void, decltype(&free_image)> owner(raw, free_image);
+            if (!raw)
+                throw std::runtime_error("Failed to decode image: " + path_to_utf8(path));
+            host = Tensor::empty({size_t(height), size_t(width), size_t(channels)}, Device::CPU);
+            auto* pixels = host.ptr<float>();
+            for (size_t i = 0; i < host.numel(); ++i)
+                pixels[i] = raw[i] / 65535.f;
+            if (params.output_uint8)
+                host = (host * 255.f + .5f).to(DataType::UInt8);
+        } else {
+            auto [raw, width, height, channels] = load_image(path, params.resize_factor, params.max_width);
+            std::unique_ptr<void, decltype(&free_image)> owner(raw, free_image);
+            if (!raw)
+                throw std::runtime_error("Failed to decode image: " + path_to_utf8(path));
+            host = Tensor::from_blob(raw, TensorShape{size_t(height), size_t(width), size_t(channels)}, Device::CPU, DataType::UInt8).clone();
+            if (!params.output_uint8)
+                host = host.to(DataType::Float32) / 255.f;
+        }
+        return host.permute({2, 0, 1}).contiguous().to(Device::GPU);
+#else
+
         using lfs::core::DataType;
         using lfs::core::Device;
         using lfs::core::Tensor;
@@ -1242,8 +1294,11 @@ namespace lfs::io {
         }
 
         return decoded;
+
+#endif
     }
 
+#if LFS_TENSOR_CUDA
     void PipelinedImageLoader::write_derived_cache(NvCodecImageLoader& nvcodec,
                                                    const lfs::core::Tensor& tensor,
                                                    const std::string& cache_key,
@@ -1269,6 +1324,7 @@ namespace lfs::io {
             }
         }
     }
+#endif
 
     std::string PipelinedImageLoader::make_sidecar_key(
         const PrefetchedImage& item,
@@ -1310,6 +1366,7 @@ namespace lfs::io {
         return key.str();
     }
 
+#if LFS_TENSOR_CUDA
     void PipelinedImageLoader::write_sidecar_cache(NvCodecImageLoader& nvcodec,
                                                    const lfs::core::Tensor& tensor,
                                                    const PrefetchedImage& item,
@@ -1356,7 +1413,6 @@ namespace lfs::io {
             }
         }
     }
-
     lfs::core::Tensor PipelinedImageLoader::decode_cached_sidecar(NvCodecImageLoader& nvcodec,
                                                                   const PrefetchedImage& item,
                                                                   void* cuda_stream) {
@@ -1389,8 +1445,15 @@ namespace lfs::io {
         normal.set_stream(static_cast<cudaStream_t>(cuda_stream));
         return lfs::core::resize_normal_prior(normal, height, width, static_cast<cudaStream_t>(cuda_stream));
     }
+#endif
 
     cudaEvent_t PipelinedImageLoader::record_sidecar_ready_event(cudaStream_t stream) {
+#if !LFS_TENSOR_CUDA
+        if (stream)
+            throw lfs::core::TensorError("CUDA sidecar stream on non-CUDA build");
+        return nullptr;
+#else
+
         cudaEvent_t event = nullptr;
         if (const cudaError_t create_err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
             create_err != cudaSuccess) {
@@ -1408,6 +1471,8 @@ namespace lfs::io {
             return nullptr;
         }
         return event;
+
+#endif
     }
 
     std::pair<int, int> PipelinedImageLoader::sidecar_target_size(
@@ -1765,10 +1830,16 @@ namespace lfs::io {
     }
 
     void PipelinedImageLoader::destroy_sidecar_ready_event(cudaEvent_t& event) {
+#if !LFS_TENSOR_CUDA
+        LFS_ASSERT_MSG(event == nullptr, "CUDA sidecar event on non-CUDA build");
+#else
+
         if (event) {
             cudaEventDestroy(event);
             event = nullptr;
         }
+
+#endif
     }
 
     void PipelinedImageLoader::reconcile_ledger_on_shutdown() {
@@ -1985,9 +2056,7 @@ namespace lfs::io {
             pair.stream = stream;
         if (sidecar_ready_event) {
             CUevent_st*& slot = depth ? pair.depth_ready_event : pair.normal_ready_event;
-            if (slot) {
-                cudaEventDestroy(slot);
-            }
+            destroy_sidecar_ready_event(slot);
             slot = sidecar_ready_event;
         }
 
@@ -2244,6 +2313,7 @@ namespace lfs::io {
         }
     }
 
+#if LFS_TENSOR_CUDA
     void PipelinedImageLoader::gpu_batch_decode_thread_func() {
         LFS_VRAM_SCOPE("io.image_loader");
         // Tensor ops on this thread (decode targets, format conversion) home
@@ -2637,8 +2707,125 @@ namespace lfs::io {
             }
         }
     }
+#endif
+
+#if !LFS_TENSOR_CUDA
+    void PipelinedImageLoader::process_portable_item(const PrefetchedImage& item) {
+        using namespace lfs::core;
+        if (item.is_mask || item.is_depth || item.is_normal || item.alpha_as_mask) {
+            int width = 0, height = 0;
+            Tensor hwc;
+            if (item.alpha_as_mask) {
+                auto [raw, w, h, c] = load_image_with_alpha(item.path, item.params.resize_factor, item.params.max_width);
+                std::unique_ptr<void, decltype(&free_image)> owner(raw, free_image);
+                if (!raw || c != 4)
+                    throw std::runtime_error("Invalid RGBA image: " + path_to_utf8(item.path));
+                width = w;
+                height = h;
+                hwc = Tensor::from_blob(raw, TensorShape{size_t(h), size_t(w), 4}, Device::CPU, DataType::UInt8).to(DataType::Float32) / 255.f;
+            } else if (item.is_mask) {
+                auto [raw, w, h] = load_grayscale_stb(item.path);
+                std::unique_ptr<void, decltype(&stbi_image_free)> owner(raw, stbi_image_free);
+                if (!raw)
+                    throw std::runtime_error("Invalid mask image: " + path_to_utf8(item.path));
+                width = w;
+                height = h;
+                hwc = Tensor::from_blob(raw, TensorShape{size_t(h), size_t(w), 1}, Device::CPU, DataType::UInt8).to(DataType::Float32) / 255.f;
+            } else {
+                auto [raw, w, h, c] = load_image_float(item.path);
+                std::unique_ptr<float, decltype(&free_image_float)> owner(raw, free_image_float);
+                if (!raw || c < 1 || (item.is_normal && c < 3))
+                    throw std::runtime_error("Invalid sidecar image: " + path_to_utf8(item.path));
+                width = w;
+                height = h;
+                hwc = Tensor::from_blob(raw, TensorShape{size_t(h), size_t(w), size_t(c)}, Device::CPU, DataType::Float32).clone();
+            }
+            Tensor image, aux;
+            if (item.alpha_as_mask) {
+                image = hwc.slice(2, 0, 3).permute({2, 0, 1}).contiguous();
+                aux = hwc.slice(2, 3, 4).squeeze(2).contiguous();
+            } else if (item.is_normal) {
+                aux = (hwc.slice(2, 0, 3).permute({2, 0, 1}).contiguous() * 2.f - 1.f).contiguous();
+                if (item.normal_srgb)
+                    srgb_normal_prior_to_linear_chw(aux.ptr<float>(), aux.numel());
+                if (item.normal_flip_yz)
+                    flip_normal_prior_yz_chw(aux.ptr<float>(), size_t(width) * height);
+                if (item.normal_transform_world_to_camera)
+                    transform_normal_prior_world_to_camera_chw(aux.ptr<float>(), size_t(width) * height, item.normal_world_to_camera);
+                aux = resize_normal_prior(aux, height, width);
+            } else {
+                aux = hwc.slice(2, 0, 1).squeeze(2).contiguous();
+            }
+            if (item.undistort) {
+                const auto scaled = scale_undistort_params(*item.undistort, width, height);
+                if (image.is_valid())
+                    image = undistort_image(image, scaled, nullptr);
+                aux = item.is_normal ? undistort_image(aux, scaled, nullptr) : undistort_mask(aux, scaled, nullptr);
+            }
+            auto [target_width, target_height] = sidecar_target_size(item, width, height);
+            if (item.alpha_as_mask) {
+                target_height = image.size(1);
+                target_width = image.size(2);
+                if (item.params.output_uint8)
+                    image = (image.clamp(0.f, 1.f) * 255.f + .5f).to(DataType::UInt8);
+            }
+            if (item.is_normal)
+                aux = resize_normal_prior(aux.contiguous(), target_height, target_width);
+            else if (item.is_depth)
+                aux = resize_depth_prior(aux.contiguous(), target_height, target_width);
+            else {
+                if (aux.size(0) != size_t(target_height) || aux.size(1) != size_t(target_width))
+                    aux = nn::resize2d(aux.unsqueeze(0).unsqueeze(0).to(Device::GPU), target_height, target_width, nn::ResizeMode::Bilinear, nn::CoordTransform::HalfPixel).squeeze(0).squeeze(0);
+                const auto& mask_params = item.alpha_as_mask ? item.alpha_mask_params : item.mask_params;
+                if (mask_params.invert)
+                    aux = aux * -1.f + 1.f;
+                aux = process_mask(std::move(aux), mask_params.threshold);
+            }
+            // Assignment to an existing Tensor view copies into that
+            // view. Construct new handles so uploads cannot copy back
+            // into CPU storage when no resize detached the source view.
+            auto device_aux = aux.device() == Device::GPU ? aux : aux.to(Device::GPU);
+            auto device_image = image.is_valid() && image.device() != Device::GPU ? image.to(Device::GPU) : image;
+            internal::backend_ops_for(device_aux).synchronize_device();
+            if (item.is_depth)
+                try_complete_pair(item.sequence_id, item.loader_generation, std::nullopt, std::nullopt, nullptr, std::move(device_aux));
+            else if (item.is_normal)
+                try_complete_pair(item.sequence_id, item.loader_generation, std::nullopt, std::nullopt, nullptr, std::nullopt, std::move(device_aux));
+            else
+                try_complete_pair(item.sequence_id, item.loader_generation, device_image.is_valid() ? std::optional<Tensor>(std::move(device_image)) : std::nullopt, std::move(device_aux), nullptr);
+        } else {
+            auto decoded = decode_file_on_cpu(item.path, item.params);
+            apply_requested_undistort(decoded, item.params);
+            internal::backend_ops_for(decoded).synchronize_device();
+            try_complete_pair(item.sequence_id, item.loader_generation, std::move(decoded), std::nullopt, nullptr);
+        }
+    }
+#endif
 
     void PipelinedImageLoader::cold_process_thread_func(const size_t worker_index) {
+#if !LFS_TENSOR_CUDA
+        using namespace lfs::core;
+        (void)worker_index;
+        while (running_) {
+            PrefetchedImage item;
+            try {
+                item = cold_queue_.pop();
+            } catch (const std::runtime_error&) { break; }
+            try {
+                process_portable_item(item);
+            } catch (...) {
+                const auto message = describe_current_exception("non-standard portable image decode exception");
+                if (item.is_mask || item.is_depth || item.is_normal) {
+                    std::unique_lock lock(pending_pairs_mutex_);
+                    const auto kind = item.is_mask ? SidecarKind::Mask : item.is_depth ? SidecarKind::Depth
+                                                                                       : SidecarKind::Normal;
+                    fail_sidecar_locked(item.sequence_id, item.loader_generation, kind, item.path, message, lock);
+                } else
+                    publish_image_failure(item.sequence_id, item.loader_generation, item.path, message);
+            }
+        }
+#else
+
         const cudaStream_t sidecar_stream =
             worker_index < sidecar_streams_.size() ? sidecar_streams_[worker_index] : nullptr;
         while (running_) {
@@ -3109,6 +3296,8 @@ namespace lfs::io {
                 }
             }
         }
+
+#endif
     }
 
 } // namespace lfs::io

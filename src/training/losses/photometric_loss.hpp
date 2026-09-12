@@ -39,7 +39,8 @@ namespace lfs::training::losses {
         std::expected<std::pair<lfs::core::Tensor, Context>, std::string> forward(
             const lfs::core::Tensor& rendered,
             const lfs::core::Tensor& gt_image,
-            const Params& params);
+            const Params& params,
+            const lfs::core::Tensor& pixel_weight = {});
 
         // fused / pure-SSIM / decoupled / masked variants share one arena.
         [[nodiscard]] kernels::LossWorkspaceArena& arena() { return arena_; }
@@ -49,6 +50,11 @@ namespace lfs::training::losses {
         const kernels::SSIMWorkspace& ssim_workspace() const { return arena_.pure_ssim(); }
 
     private:
+        Context forward_vulkan(const lfs::core::Tensor& prediction,
+                               const lfs::core::Tensor& target, float ssim_weight,
+                               const lfs::core::Tensor& pixel_weight);
+        lfs::core::Tensor gaussian_horizontal_;
+        lfs::core::Tensor gaussian_vertical_;
         // Shared grow-only storage for mutually-exclusive L1+SSIM workspaces.
         lfs::training::kernels::LossWorkspaceArena arena_;
 

@@ -1,87 +1,6 @@
 {
+  "name": "lichtfeld-studio",
   "builtin-baseline": "c3867e714dd3a51c272826eea77267876517ed99",
-  "dependencies": [
-    "cppzmq",
-    "curl",
-    "args",
-    "assimp",
-    {
-      "name": "ffmpeg",
-      "features": [
-        "avcodec",
-        "avfilter",
-        "avformat",
-        "nvcodec",
-        "swscale",
-        "x264"
-      ]
-    },
-    "freetype",
-    "fmt",
-    "glm",
-    {
-      "name": "libarchive",
-      "default-features": false,
-      "features": [
-        "bzip2",
-        "lzma",
-        "zstd"
-      ]
-    },
-    "libdeflate",
-    "libjpeg-turbo",
-    "libpng",
-    "libplacebo",
-    "libwebp",
-    "nanobind",
-    {
-      "name": "nativefiledialog-extended",
-      "platform": "windows | osx"
-    },
-    "nlohmann-json",
-    {
-      "name": "python3",
-      "features": [
-        "extensions"
-      ]
-    },
-    {
-      "name": "rmlui",
-      "features": [
-        "svg"
-      ]
-    },
-    {
-      "name": "sdl3",
-      "features": [
-        "vulkan"
-      ]
-    },
-    "spdlog",
-    "tbb",
-    "tiff",
-    "tinyexr",
-    "vulkan",
-    {
-      "name": "vulkan-loader",
-      "features": [
-        "xcb",
-        "xlib"
-      ],
-      "platform": "linux"
-    },
-    "vulkan-memory-allocator",
-    "volk",
-    {
-      "name": "glslang",
-      "features": [
-        "tools"
-      ]
-    },
-    "shader-slang",
-    "xxhash",
-    "zstd"
-  ],
   "features": {
     "tests": {
       "description": "Dependencies used only by the C++ test targets",
@@ -100,6 +19,125 @@
           "host": true
         },
         "vulkan-validationlayers"
+      ]
+    },
+    "application-common": {
+      "description": "Shared desktop application and training dependencies",
+      "dependencies": [
+        "cppzmq",
+        "curl",
+        "args",
+        "assimp",
+        {
+          "name": "ffmpeg",
+          "features": [
+            "avcodec",
+            "avfilter",
+            "avformat",
+            "swscale",
+            "x264"
+          ]
+        },
+        "freetype",
+        "fmt",
+        "glm",
+        {
+          "name": "libarchive",
+          "default-features": false,
+          "features": [
+            "bzip2",
+            "lzma",
+            "zstd"
+          ]
+        },
+        "libdeflate",
+        "libjpeg-turbo",
+        "libpng",
+        "libwebp",
+        "nanobind",
+        {
+          "name": "nativefiledialog-extended",
+          "platform": "windows | osx"
+        },
+        "nlohmann-json",
+        {
+          "name": "python3",
+          "features": [
+            "extensions"
+          ]
+        },
+        {
+          "name": "rmlui",
+          "features": [
+            "svg"
+          ]
+        },
+        {
+          "name": "sdl3",
+          "features": [
+            "vulkan"
+          ]
+        },
+        "spdlog",
+        "tbb",
+        "tiff",
+        "tinyexr",
+        "vulkan",
+        {
+          "name": "vulkan-loader",
+          "features": [
+            "xcb",
+            "xlib"
+          ],
+          "platform": "linux"
+        },
+        "vulkan-memory-allocator",
+        "volk",
+        {
+          "name": "glslang",
+          "features": [
+            "tools"
+          ]
+        },
+        {
+          "name": "shader-slang",
+          "host": true
+        },
+        "xxhash",
+        "zstd",
+        "spirv-headers"
+      ]
+    },
+    "application": {
+      "description": "Desktop application and training dependencies",
+      "dependencies": [
+        {
+          "name": "lichtfeld-studio",
+          "default-features": false,
+          "features": [
+            "application-common"
+          ]
+        },
+        {
+          "name": "ffmpeg",
+          "features": [
+            "nvcodec"
+          ]
+        },
+        "libplacebo"
+      ]
+    },
+    "macos-application": {
+      "description": "Native arm64 macOS application dependencies without NVIDIA codecs or HDR libplacebo",
+      "dependencies": [
+        {
+          "name": "lichtfeld-studio",
+          "default-features": false,
+          "features": [
+            "application-common"
+          ]
+        },
+        "vulkan-loader"
       ]
     }
   },
@@ -196,5 +234,8 @@
       "name": "shader-slang",
       "version": "2026.5"
     }
+  ],
+  "default-features": [
+    "application"
   ]
 }

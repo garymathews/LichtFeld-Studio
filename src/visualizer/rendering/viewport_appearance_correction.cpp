@@ -14,7 +14,9 @@
 #include "training/training_manager.hpp"
 #include <algorithm>
 #include <cstdint>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <exception>
 #include <format>
 #include <mutex>
@@ -69,6 +71,7 @@ namespace lfs::vis {
             const PPISPOverrides& overrides,
             const lfs::training::PPISPRegion& region = {},
             const lfs::core::Tensor& controller_params = {}) {
+#if LFS_TENSOR_CUDA
             const bool was_hwc = (rgb.ndim() == 3 && rgb.shape()[2] == 3);
             const auto input = was_hwc ? rgb.permute({2, 0, 1}).contiguous() : rgb;
             const bool is_training_camera = ppisp.is_known_frame(camera_uid);
@@ -104,7 +107,11 @@ namespace lfs::vis {
             }
 
             return (was_hwc && result.is_valid()) ? result.permute({1, 2, 0}).contiguous() : result;
-        }
+
+#else
+            throw std::runtime_error("PPISP appearance correction is unavailable on Vulkan");
+#endif
+}
 
         [[nodiscard]] lfs::core::Tensor applyStandaloneAppearance(
             const lfs::core::Tensor& rgb,
@@ -366,6 +373,8 @@ namespace lfs::vis {
             // allocate CNN intermediates at export resolution).
             lfs::core::Tensor controller_params;
             if (apply_ppisp && controller_pool != nullptr) {
+#if LFS_TENSOR_CUDA
+
                 const bool is_training_camera = ppisp->is_known_frame(camera_uid);
                 const int camera_idx =
                     is_training_camera ? ppisp->camera_index(ppisp->camera_for_frame(camera_uid)) : 0;
@@ -382,6 +391,9 @@ namespace lfs::vis {
                 controller_pool->allocate_buffers(thumbnail.size(1), thumbnail.size(2));
                 controller_params = controller_pool->predict(controller_idx, thumbnail.unsqueeze(0), 1.0f).clone();
                 cudaDeviceSynchronize();
+            #else
+                return std::unexpected("PPISP controller inference is unavailable on this GPU backend");
+#endif
             }
 
             lfs::core::Tensor output = image_u8_hwc_cpu;

@@ -598,6 +598,9 @@ def toggle_fullscreen() -> None:
 def is_fullscreen() -> bool:
     """Check if the window is in fullscreen mode"""
 
+def get_gpu_backend() -> str:
+    """Return the active tensor GPU backend (cuda or vulkan)"""
+
 def get_vulkan_capabilities() -> dict:
     """Return Vulkan device capabilities used to gate rendering controls"""
 
@@ -677,7 +680,13 @@ class Tensor:
 
     @property
     def device(self) -> str:
-        """Device: 'cpu' or 'cuda'"""
+        """
+        Device: 'cpu', 'cuda', or 'vulkan', matching the tensor's storage backend
+        """
+
+    @property
+    def backend(self) -> str:
+        """Backend: 'cpu' for CPU tensors, 'cuda' or 'vulkan' for GPU tensors"""
 
     @property
     def dtype(self) -> str:
@@ -699,6 +708,9 @@ class Tensor:
 
     def cuda(self) -> Tensor:
         """Move tensor to CUDA"""
+
+    def gpu(self) -> Tensor:
+        """Move tensor to GPU"""
 
     def contiguous(self) -> Tensor:
         """Make tensor contiguous"""

@@ -417,6 +417,25 @@ float4 get_sh_coeff_4(in SpherHarmCoeffs coeffs, uint idx) {
     return float4(0);
 }
 
+// Inverse of read_spherical_harmonics_coeffs_split, including the swizzle.
+void write_spherical_harmonics_coeffs_split_grads(
+    SpherHarmCoeffs coeffs, uint g_idx, RWStructuredBuffer<float> sh0,
+    RWStructuredBuffer<float4> shN, uint slots) {
+    sh0[3*g_idx+0] = coeffs.coeff0.x;
+    sh0[3*g_idx+1] = coeffs.coeff0.y;
+    sh0[3*g_idx+2] = coeffs.coeff0.z;
+    for (uint i = 0; i < min(slots, 12u); ++i) {
+        float4 value = float4(get_sh_coeff_4(coeffs, i).w,
+                              get_sh_coeff_4(coeffs, i+1).xyz);
+      #if SH_REORDER_SIZE <= 1
+        shN[slots*g_idx+i] = value;
+      #else
+        shN[(g_idx/SH_REORDER_SIZE)*(slots*SH_REORDER_SIZE) +
+            SH_REORDER_SIZE*i + g_idx%SH_REORDER_SIZE] = value;
+      #endif
+    }
+}
+
 #if !USE_FLOAT4_BATCH_WRITE
 
 #define _WRITE_F3(i) \

@@ -20,6 +20,7 @@
 
 #include "barrier_planner.h"
 #include "buffer.h"
+#include "perf_timer.h"
 #include "rendering/vulkan_result.hpp"
 #include "rendering/vulkan_wait.hpp"
 
@@ -49,7 +50,7 @@ public:
                             VmaAllocator external_allocator,
                             VkPipelineCache external_pipeline_cache = VK_NULL_HANDLE);
     void cleanup();
-    void cleanupBuffers(VulkanGSPipelineBuffers& buffers);
+    void cleanupBuffers(VulkanGSPipelineBuffers& buffers, bool wait = true);
     void assignBufferLabels(VulkanGSPipelineBuffers& buffers);
 
     // Phase 7A: injectable Vulkan dispatch (production default = real symbols).
@@ -108,6 +109,9 @@ public:
     void writeTimestamp(int delta);
     bool writeTimestampNoExcept(int delta);
     void addTimerCallback(TimerCallback callback);
+    // Recording markers belong to this pipeline, just like query counts and
+    // pending batch slots. Training and viewport pipelines can coexist.
+    PerfTimer::State perf_timer_state;
     void setCpuTimerCallback(CpuTimerCallback callback);
 
     size_t getCurrentAllocSize() const { return current_vram; }

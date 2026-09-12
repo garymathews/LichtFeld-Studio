@@ -89,9 +89,20 @@ namespace lfs::vis {
                 dirty_.store(false, std::memory_order_release);
         }
 
-        [[nodiscard]] lfs::core::param::OptimizationParameters copyActiveParams() const {
+        [[nodiscard]] lfs::core::param::OptimizationParameters copyActiveParams(std::uint64_t* serial = nullptr) const {
             std::lock_guard lock(params_mutex_);
+            if (serial) *serial = dirty_serial_.load(std::memory_order_acquire);
             return getActiveParams();
+        }
+
+        bool restoreActiveParamsIfUnchanged(
+            const lfs::core::param::OptimizationParameters& params, const std::uint64_t serial) {
+            std::lock_guard lock(params_mutex_);
+            if (serial != dirty_serial_.load(std::memory_order_acquire)) return false;
+            setActiveStrategy(params.strategy);
+            getActiveParams() = params;
+            dirty_.store(false, std::memory_order_release);
+            return true;
         }
 
         template <typename F>
@@ -103,7 +114,7 @@ namespace lfs::vis {
 
     private:
         bool loaded_ = false;
-        std::string active_strategy_ = std::string(lfs::core::param::kStrategyMRNF);
+        std::string active_strategy_ = std::string(lfs::core::param::kDefaultTrainingStrategy);
 
         // Session defaults
         lfs::core::param::OptimizationParameters mcmc_session_;

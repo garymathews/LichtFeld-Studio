@@ -164,7 +164,7 @@ namespace lfs::python {
                     return;
                 if (static_cast<size_t>(index) >= stroke->numel())
                     return;
-                rendering::set_selection_element(stroke->ptr<bool>(), index, add);
+                rendering::set_selection_element(*stroke, index, add);
             },
             nb::arg("index"), nb::arg("add") = true, "Select/deselect a single gaussian by index (for ring selection mode).");
 

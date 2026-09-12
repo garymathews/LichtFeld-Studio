@@ -4,18 +4,24 @@
 
 #include "preprocessing/preprocess.hpp"
 
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/environment.hpp"
+#include "core/executable_path.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/nn/models/moge2.hpp"
 #include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor_backend.hpp"
 #include "depth_anchor_cache.hpp"
 
 #include "io/loader.hpp"
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include "indicators.hpp"
 #include <curl/curl.h>
@@ -182,11 +188,7 @@ namespace {
             return lfs::core::utf8_to_path(*env);
         std::error_code ec;
         std::vector<fs::path> roots;
-#ifdef __linux__
-        const auto exe = fs::read_symlink("/proc/self/exe", ec);
-        if (!ec)
-            roots.push_back(exe.parent_path());
-#endif
+        roots.push_back(lfs::core::getExecutableDir());
         roots.push_back(fs::current_path());
         for (const auto& root : roots) {
             fs::path cursor = root;
@@ -744,13 +746,7 @@ namespace {
                                          path_to_string(lfw_path) + ": " +
                                          std::string(loaded.error().detail()));
             model_ = std::move(*loaded);
-            int device = 0;
-            cudaDeviceProp properties{};
-            if (cudaGetDevice(&device) != cudaSuccess ||
-                cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
-                throw std::runtime_error("Failed to query native MoGe CUDA device");
-            }
-            LOG_INFO("Normal estimation: native engine on CUDA device {} ({})", device, properties.name);
+            LOG_INFO("Normal estimation: native engine on {}", lfs::core::gpu_backend_name(lfs::core::default_gpu_backend()));
         }
 
         HeadMaps run(const Image& image, int64_t num_tokens) {
@@ -764,8 +760,7 @@ namespace {
                 input_ = lfs::core::Tensor::empty(shape, lfs::core::Device::CUDA,
                                                   lfs::core::DataType::Float32);
             }
-            LFS_CUDA_CHECK(cudaMemcpyAsync(input_.data_ptr(), chw.data(), input_.bytes(),
-                                           cudaMemcpyHostToDevice, input_.stream()));
+            input_.copy_from(lfs::core::Tensor::from_vector(chw, shape, lfs::core::Device::CPU));
             auto result = model_.forward(input_, num_tokens);
             if (!result)
                 throw std::runtime_error("Native MoGe-2 forward failed: " +
@@ -891,6 +886,12 @@ namespace {
     // folder is skipped (the trainer fits and caches it on first run instead).
     void precompute_depth_anchors(const lfs::core::param::PreprocessParameters& params) {
         if (!needs_depth(params.mode)) {
+            return;
+        }
+        // This optional training cache still uses CUDA projection kernels.
+        // Vulkan inference must not hand its buffers to those raw CUDA kernels.
+        if (lfs::core::default_gpu_backend() != lfs::core::GpuBackend::CUDA) {
+            LOG_INFO("Depth anchors: CUDA training will fit and cache anchors at startup");
             return;
         }
         try {
@@ -1088,9 +1089,8 @@ namespace {
         if (!progress)
             print_plan_summary(params, plan, &model_path);
 
-        int cuda_devices = 0;
-        if (cudaGetDeviceCount(&cuda_devices) != cudaSuccess || cuda_devices <= 0) {
-            throw std::runtime_error("Native MoGe-2 inference requires a CUDA device");
+        if (!lfs::core::gpu_backend_available(lfs::core::default_gpu_backend())) {
+            throw std::runtime_error("Native MoGe-2 inference requires an available GPU backend");
         }
 
         const fs::path lfw_path = lfw_path_for_onnx(model_path);

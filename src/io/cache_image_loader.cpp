@@ -4,15 +4,21 @@
 
 #include "io/cache_image_loader.hpp"
 #include "core/cuda/undistort/undistort.hpp"
+#include "core/host_metrics.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
 #include "io/cuda/image_format_kernels.cuh"
+#endif
 #include "io/nvcodec_image_loader.hpp"
 
 #include <algorithm>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <fstream>
 
 #ifdef __linux__
@@ -38,6 +44,11 @@ namespace lfs::io {
         if (GlobalMemoryStatusEx(&mem_info)) {
             return mem_info.ullTotalPhys;
         }
+#endif
+#ifdef __APPLE__
+        const auto metrics = lfs::core::host_metrics::sample();
+        if (metrics.ram_valid)
+            return metrics.system_total_bytes;
 #endif
         return DEFAULT_FALLBACK_MEMORY_GB * BYTES_PER_GB;
     }
@@ -67,6 +78,11 @@ namespace lfs::io {
         if (GlobalMemoryStatusEx(&mem_info)) {
             return mem_info.ullAvailPhys;
         }
+#endif
+#ifdef __APPLE__
+        const auto metrics = lfs::core::host_metrics::sample();
+        if (metrics.ram_valid)
+            return metrics.system_total_bytes - std::min(metrics.system_total_bytes, metrics.system_used_bytes);
 #endif
         return DEFAULT_FALLBACK_AVAILABLE_GB * BYTES_PER_GB;
     }
@@ -382,6 +398,7 @@ namespace lfs::io {
 
     namespace {
 
+#if LFS_TENSOR_CUDA
         NvCodecImageLoader& get_nvcodec_loader() {
             static std::once_flag init_flag;
             // nvImageCodec can throw during process shutdown after CUDA/nvJPEG teardown.
@@ -398,6 +415,7 @@ namespace lfs::io {
             return *instance;
         }
 
+#endif
         lfs::core::Tensor decode_with_cpu_fallback(const std::filesystem::path& path, const LoadParams& params) {
             using namespace lfs::core;
 
@@ -412,23 +430,17 @@ namespace lfs::io {
             std::memcpy(cpu_tensor.data_ptr(), img_data, static_cast<size_t>(height) * width * channels);
             free_image(img_data);
 
-            auto gpu_uint8 = cpu_tensor.cuda();
-            const auto H = static_cast<size_t>(height);
-            const auto W = static_cast<size_t>(width);
-            const auto C = static_cast<size_t>(channels);
-
-            if (params.output_uint8) {
-                auto output = Tensor::empty(TensorShape({C, H, W}), Device::CUDA, DataType::UInt8);
-                lfs::io::cuda::launch_uint8_hwc_to_uint8_chw(
-                    gpu_uint8.ptr<uint8_t>(), output.ptr<uint8_t>(), H, W, C,
-                    static_cast<cudaStream_t>(params.cuda_stream));
-                return output;
+            if (params.cuda_stream && default_gpu_backend() != GpuBackend::CUDA)
+                throw TensorError("CUDA stream supplied for Vulkan image decode");
+            auto output = cpu_tensor.permute({2, 0, 1}).contiguous().to(Device::GPU);
+            if (!params.output_uint8 || params.undistort)
+                output = output.to(DataType::Float32) / 255.f;
+            if (params.undistort) {
+                const auto scaled = scale_undistort_params(*params.undistort, width, height);
+                output = undistort_image(output, scaled, static_cast<cudaStream_t>(params.cuda_stream));
+                if (params.output_uint8)
+                    output = (output.clamp(0.f, 1.f) * 255.f + .5f).to(DataType::UInt8);
             }
-
-            auto output = Tensor::empty(TensorShape({C, H, W}), Device::CUDA, DataType::Float32);
-            lfs::io::cuda::launch_uint8_hwc_to_float32_chw(
-                gpu_uint8.ptr<uint8_t>(), output.ptr<float>(), H, W, C,
-                static_cast<cudaStream_t>(params.cuda_stream));
             return output;
         }
 
@@ -470,7 +482,8 @@ namespace lfs::io {
 
         const bool is_jpeg = jpeg_bytes.size() >= 2 && jpeg_bytes[0] == 0xFF && jpeg_bytes[1] == 0xD8;
 
-        if (is_jpeg) {
+#if LFS_TENSOR_CUDA
+        if (is_jpeg && default_gpu_backend() == GpuBackend::CUDA) {
             try {
                 auto& nvcodec = get_nvcodec_loader();
 
@@ -558,6 +571,7 @@ namespace lfs::io {
                 return decode_with_cpu_fallback(path, params);
             }
         }
+#endif
 
         return decode_with_cpu_fallback(path, params);
     }
@@ -573,7 +587,7 @@ namespace lfs::io {
         LOG_INFO("[CacheLoader] Checking nvImageCodec availability...");
 
         // is_available() now runs comprehensive diagnostics and logs detailed info
-        bool available = NvCodecImageLoader::is_available();
+        bool available = lfs::core::default_gpu_backend() == lfs::core::GpuBackend::CUDA && NvCodecImageLoader::is_available();
         nv_image_codec_available_ = available
                                         ? NvImageCodecMode::Available
                                         : NvImageCodecMode::UnAvailable;

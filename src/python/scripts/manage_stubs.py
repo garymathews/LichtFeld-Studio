@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 from pathlib import Path
 import shutil
 import sys
@@ -89,7 +90,15 @@ def prune_generated_stubs(root: Path) -> None:
 
 
 def read_normalized(path: Path) -> bytes:
-    return path.read_bytes().replace(b"\r\n", b"\n")
+    content = path.read_bytes().replace(b"\r\n", b"\n")
+    # Clang and GCC spell unbound C++ template annotations as `>>` and
+    # `> >` respectively. Ignore only this demangler spacing, preserving
+    # Python signatures, documentation and changes to the actual type names.
+    return re.sub(
+        rb'(:[ \t]*")([^"\n]*::[^"\n]*<[^"\n]*)(")',
+        lambda match: match[1] + re.sub(rb'>[ \t]+(?=>)', b'>', match[2]) + match[3],
+        content,
+    )
 
 
 def remove_empty_dirs(root: Path) -> None:

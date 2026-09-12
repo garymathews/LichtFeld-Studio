@@ -141,7 +141,7 @@ namespace lfs::training {
 
         std::expected<void, std::string> execute(const Command& cmd);
 
-        void drain_enqueued(TrainingSnapshot& view);
+        bool drain_enqueued(TrainingSnapshot& view, const std::function<void()>& before_mutation = {});
 
         std::vector<OperationInfo> operations(std::optional<CommandTarget> target = std::nullopt) const;
         std::vector<MutableFieldInfo> mutables(std::optional<CommandTarget> target = std::nullopt) const;
@@ -149,8 +149,8 @@ namespace lfs::training {
     private:
         CommandCenter();
 
-        std::expected<void, std::string> exec_model(const Command& cmd, TrainingSnapshot& view);
-        std::expected<void, std::string> exec_optimizer(const Command& cmd, TrainingSnapshot& view);
+        std::expected<void, std::string> exec_model(const Command& cmd, TrainingSnapshot& view, const std::function<void()>& before_mutation);
+        std::expected<void, std::string> exec_optimizer(const Command& cmd, TrainingSnapshot& view, const std::function<void()>& before_mutation);
         std::expected<void, std::string> exec_session(const Command& cmd, TrainingSnapshot& view);
 
         // Helpers

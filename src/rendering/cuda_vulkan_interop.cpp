@@ -4,6 +4,8 @@
 
 #include "cuda_vulkan_interop.hpp"
 
+#if LFS_TENSOR_CUDA
+
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/memory_pool.hpp"
 #include "image_layout.hpp"
@@ -935,3 +937,38 @@ namespace lfs::rendering {
     }
 
 } // namespace lfs::rendering
+
+#else
+namespace lfs::rendering {
+    namespace {
+        constexpr auto unavailable = "CUDA/Vulkan interop is unavailable in this build; use Vulkan-owned buffers and images";
+    }
+    void setExpectedVulkanDeviceUuid(const std::array<std::uint8_t,16>&) {}
+    std::optional<std::string> verifyCudaMatchesVulkanDevice() { return unavailable; }
+
+    CudaVulkanUploadStream::~CudaVulkanUploadStream() = default;
+    CudaVulkanUploadStream::CudaVulkanUploadStream(CudaVulkanUploadStream&&) noexcept = default;
+    CudaVulkanUploadStream& CudaVulkanUploadStream::operator=(CudaVulkanUploadStream&&) noexcept = default;
+    bool CudaVulkanUploadStream::init() { last_error_=unavailable; return false; }
+    bool CudaVulkanUploadStream::synchronize() { last_error_=unavailable; return false; }
+    void CudaVulkanUploadStream::reset() noexcept { last_error_.clear(); }
+
+    CudaVulkanInterop::~CudaVulkanInterop() = default;
+    CudaVulkanInterop::CudaVulkanInterop(CudaVulkanInterop&&) noexcept = default;
+    CudaVulkanInterop& CudaVulkanInterop::operator=(CudaVulkanInterop&&) noexcept = default;
+    bool CudaVulkanInterop::init(CudaVulkanExternalImageImport,CudaVulkanExternalSemaphoreImport) { last_error_=unavailable; return false; }
+    void CudaVulkanInterop::reset() { last_error_.clear(); }
+    bool CudaVulkanInterop::valid() const { return false; }
+    bool CudaVulkanInterop::copyTensorToSurface(const core::Tensor&,cudaStream_t,bool) const { last_error_=unavailable; return false; }
+    bool CudaVulkanInterop::wait(std::uint64_t,cudaStream_t) const { last_error_=unavailable; return false; }
+    bool CudaVulkanInterop::signal(std::uint64_t,cudaStream_t) const { last_error_=unavailable; return false; }
+
+    CudaTimelineSemaphore::~CudaTimelineSemaphore() = default;
+    CudaTimelineSemaphore::CudaTimelineSemaphore(CudaTimelineSemaphore&&) noexcept = default;
+    CudaTimelineSemaphore& CudaTimelineSemaphore::operator=(CudaTimelineSemaphore&&) noexcept = default;
+    bool CudaTimelineSemaphore::init(CudaVulkanExternalSemaphoreImport) { last_error_=unavailable; return false; }
+    void CudaTimelineSemaphore::reset() { last_error_.clear(); }
+    bool CudaTimelineSemaphore::cudaSignal(std::uint64_t,cudaStream_t) const { last_error_=unavailable; return false; }
+    bool CudaTimelineSemaphore::cudaWait(std::uint64_t,cudaStream_t) const { last_error_=unavailable; return false; }
+}
+#endif

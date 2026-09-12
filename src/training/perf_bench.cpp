@@ -5,10 +5,14 @@
 
 #include "core/alloc_counter.hpp"
 #include "core/logger.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/pinned_memory_allocator.hpp"
+#endif
 #include "diagnostics/vram_ledger_model.hpp"
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -47,12 +51,17 @@ namespace lfs::training {
         }
 
         void sample_cuda_used(std::size_t& used, std::size_t& total) {
+#if LFS_TENSOR_CUDA
             std::size_t free_b = 0;
             std::size_t total_b = 0;
             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b >= free_b) {
                 used = total_b - free_b;
                 total = total_b;
             }
+#else
+            (void)used; (void)total;
+#endif
+
         }
 
         void sample_pool_hwm(std::size_t& used_high, std::size_t& reserved_high,
@@ -198,17 +207,21 @@ namespace lfs::training {
     }
 
     void PerfBenchCollector::destroy_phase_event_pool() {
+#if LFS_TENSOR_CUDA
         for (auto& ev : phase_events_) {
             if (ev) {
                 (void)cudaEventDestroy(ev);
                 ev = nullptr;
             }
         }
+
+#endif
         phase_events_.clear();
         phase_pool_ready_ = false;
     }
 
     bool PerfBenchCollector::ensure_phase_event_pool() {
+#if LFS_TENSOR_CUDA
         if (phase_pool_ready_) {
             return true;
         }
@@ -227,6 +240,10 @@ namespace lfs::training {
         }
         phase_pool_ready_ = true;
         return true;
+#else
+        return false;
+#endif
+
     }
 
     void PerfBenchCollector::reset_phase_session() {
@@ -251,14 +268,20 @@ namespace lfs::training {
             static_cast<std::size_t>(phase_current_index_) *
                 static_cast<std::size_t>(kPhaseBoundaryCount) +
             static_cast<std::size_t>(bi);
+#if LFS_TENSOR_CUDA
         if (cudaEventRecord(phase_events_[ev_idx], timing_stream_) != cudaSuccess) {
             (void)cudaGetLastError();
             return;
         }
+
+#endif
         sample.seen_mask |= (1u << bi);
     }
 
     void PerfBenchCollector::configure(const bool enable, const int warmup) {
+#if !LFS_TENSOR_CUDA
+        if (enable) throw std::invalid_argument("CUDA phase benchmarking is unavailable on Vulkan; use wall-clock training metrics");
+#endif
         g_perf_bench_enabled.store(enable, std::memory_order_relaxed);
         if (!enable) {
             phase_active_iter_ = 0;
@@ -524,10 +547,12 @@ namespace lfs::training {
             warmup_ms_sum_ += ms;
             ++warmup_steps_;
         } else {
+#if LFS_TENSOR_CUDA
             const auto pinned_stats = lfs::core::PinnedMemoryAllocator::instance().get_stats();
             peak_steady_pinned_host_bytes_ = std::max(
                 peak_steady_pinned_host_bytes_,
                 pinned_stats.allocated_bytes + pinned_stats.cached_bytes);
+#endif
             steady_allocs_ += allocs;
             steady_ms_sum_ += ms;
             ++steady_steps_;
@@ -756,6 +781,7 @@ namespace lfs::training {
         std::array<std::vector<double>, kDerivedPhaseCount> phase_gpu{};
         int phase_valid = 0;
 
+#if LFS_TENSOR_CUDA
         if (phase_pool_ready_ && phase_sample_count_ > 0) {
             // Bench-end only: the training loop has finished; make events readable.
             if (timing_stream_ != nullptr) {
@@ -832,6 +858,8 @@ namespace lfs::training {
             }
         }
 
+
+#endif
         std::array<PhaseStats, kDerivedPhaseCount> phase_stats{};
         for (int p = 0; p < kDerivedPhaseCount; ++p) {
             phase_stats[static_cast<std::size_t>(p)] =

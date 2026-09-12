@@ -49,7 +49,9 @@
 #include <nlohmann/json.hpp>
 #include <stb_image_write.h>
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -799,7 +801,8 @@ namespace lfs::vis::project {
                 auto trainer = std::make_unique<
                     lfs::training::Trainer>(
                     scene_manager.getScene());
-                trainer->setParams(params);
+                if (const auto result = trainer->setParams(params); !result)
+                    throw std::runtime_error(result.error());
                 trainer_manager->setScene(
                     &scene_manager.getScene());
                 trainer_manager->setTrainer(
@@ -1183,7 +1186,9 @@ namespace lfs::vis::project {
                         false, std::memory_order_release);
                     return;
                 }
+#if LFS_TENSOR_CUDA
                 (void)cudaSetDevice(0);
+#endif
                 auto* scene_manager =
                     viewer_.getSceneManager();
                 if (!scene_manager || !document_) {
@@ -1800,9 +1805,7 @@ namespace lfs::vis::project {
                         path, error);
                 if (!error) {
                     const auto system_time =
-                        std::chrono::clock_cast<
-                            std::chrono::system_clock>(
-                            file_time);
+                        std::chrono::time_point_cast<std::chrono::system_clock::duration>(std::chrono::file_clock::to_sys(file_time));
                     unix_seconds =
                         std::chrono::system_clock::to_time_t(
                             system_time);

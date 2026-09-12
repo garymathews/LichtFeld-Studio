@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "ssog.hpp"
 #include "core/logger.hpp"
+#include "core/tensor_backend.hpp"
 #include "io/atomic_output.hpp"
 #include "io/splat_decimate.hpp"
 #include "sogs.hpp"
@@ -15,7 +16,6 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
-#include <cuda_runtime.h>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -540,8 +540,9 @@ namespace lfs::io {
                 throw std::runtime_error("Temporary export directory already exists");
             progress(o, 0, "Preparing SSOG");
             std::vector<HostSplats> levels;
-            size_t free_cuda = 0, total_cuda = 0;
-            const bool memory_known = cudaMemGetInfo(&free_cuda, &total_cuda) == cudaSuccess;
+            const auto memory = lfs::core::gpu_backend_memory_info(lfs::core::default_gpu_backend());
+            const size_t free_cuda = memory.free_bytes;
+            const bool memory_known = memory.total_bytes > 0;
             const double level_rows = input.size() * (1.0 - std::pow(double(o.lod_ratio), o.lod_levels)) / (1.0 - o.lod_ratio);
             const double resident_bytes = level_rows * (14 + 3 * input.max_sh_coeffs_rest()) * sizeof(float);
             // Leave most free VRAM for decimation and bounded unit workspaces.

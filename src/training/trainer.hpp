@@ -83,6 +83,7 @@ namespace lfs::vis::project {
 
 namespace lfs::training {
     class AdamOptimizer;
+    class VulkanTrainingRasterizer;
     struct TrainerRetryTestAccess;
     struct TrainerCropboxMaskTestAccess;
     struct PPISPFileMetadata;
@@ -302,14 +303,23 @@ namespace lfs::training {
         // timeline imported into CUDA, plus the latest timeline value covering
         // submits that bound live training storage. The trainer waits the value
         // on its stream before the next step's in-place writes.
+#if LFS_TENSOR_CUDA
         void setViewerReleaseFence(cudaExternalSemaphore_t semaphore);
+#endif
         void publishViewerBorrow(uint64_t value);
 
         lfs::core::param::TrainingParameters getParams() const {
             std::lock_guard<std::mutex> lock(params_mutex_);
             return params_;
         }
-        void setParams(const lfs::core::param::TrainingParameters& params);
+        struct ParameterUpdateResult {
+            core::param::TrainingParameters parameters;
+            std::string error;
+            std::optional<std::uint64_t> source_serial;
+        };
+        std::optional<ParameterUpdateResult> take_parameter_update_result();
+        [[nodiscard]] std::expected<void, std::string> setParams(const lfs::core::param::TrainingParameters& params,
+                                                                 std::optional<std::uint64_t> source_serial = std::nullopt);
         void set_lpips_weights_path(std::optional<std::filesystem::path> path);
         void setSplatTensorAllocator(lfs::core::SplatTensorAllocator allocator) {
             splat_tensor_allocator_ = std::move(allocator);
@@ -339,7 +349,7 @@ namespace lfs::training {
         /// stops training because the post-mutation device state is not known safe.
         [[nodiscard]] bool endExportableDensifyBarrier();
 
-        void setOnIterationStart(std::function<void()> cb) { on_iteration_start_ = std::move(cb); }
+        void setOnControlPoll(std::function<void()> cb) { on_control_poll_ = std::move(cb); }
 
         lfs::core::Scene* getScene() const { return scene_; }
         std::shared_ptr<lfs::io::PipelinedImageLoader> getActiveImageLoader() const;
@@ -433,6 +443,13 @@ namespace lfs::training {
         void shutdown();
 
     private:
+        friend class MetalTrainerControl_PausedEditsAndParametersStayConsistent_Test;
+        friend class MetalTrainerControl_BackgroundReplacementIsConsistent_Test;
+        friend class MetalTrainerControl_SnapshotFailureIsTerminalAndRecoverable_Test;
+        friend class MetalTrainerControl_SnapshotLayoutReplansOnlyOnce_Test;
+        friend class MetalTrainerControl_LoadingChangesAreRejectedAndEvaluationStepsUpdate_Test;
+        friend class MetalTrainerControl_RangeEditOnlyChangesSelectedRows_Test;
+        friend class MetalTrainerFailure_BackwardStatisticsCannotPublishAnIncompleteCheckpoint_Test;
         friend class lfs::vis::VisualizerImplResetTest_TrainingSnapshotCleanupTerminalizesProjectWrite_Test;
         friend class lfs::vis::VisualizerImplResetTest_TrainingSnapshotPrepareFailureTerminalizesProjectWrite_Test;
         friend class lfs::vis::VisualizerImplResetTest_TrainingSnapshotSupersedeTerminalizesOldAndCompletesNew_Test;
@@ -645,6 +662,11 @@ namespace lfs::training {
 
         // Handle control requests
         void handle_control_requests(int iter, std::stop_token stop_token = {});
+#if !LFS_TENSOR_CUDA
+        void drain_control_commands();
+        double active_step_ms_ = 0.0;
+#endif
+        std::optional<std::uint64_t> project_snapshot_retry_id_;
         void prepare_project_snapshot_at_safe_point(
             int capture_iteration,
             const std::filesystem::path& path,
@@ -661,6 +683,7 @@ namespace lfs::training {
         [[nodiscard]] lfs::Result<void>
         initialize_project_snapshot_service();
         void capture_project_snapshot_at_safe_point(int iteration);
+        void capture_scheduled_project_snapshot(int iter);
         void consume_requested_project_snapshot(int iteration);
         [[nodiscard]] int project_snapshot_iteration() const;
         void attach_live_document_context(
@@ -678,10 +701,9 @@ namespace lfs::training {
         void abandon_pending_project_requests(
             std::string_view reason);
         void clear_prepared_project_request();
-        void apply_pending_params_at_safe_point();
-        void apply_param_side_effects(
-            const lfs::core::param::TrainingParameters& params,
-            bool background_image_path_changed);
+        std::expected<void, std::string> apply_pending_params_at_safe_point();
+        std::expected<void, std::string> apply_parameter_update(core::param::TrainingParameters update);
+
 
         void updateGTLoadConfigSnapshot();
         void clearActiveImageLoader();
@@ -723,6 +745,9 @@ namespace lfs::training {
         mutable std::mutex params_mutex_;
         lfs::core::param::TrainingParameters params_;
         std::optional<lfs::core::param::TrainingParameters> pending_params_;
+        uint64_t params_revision_ = 0;
+        std::optional<std::uint64_t> pending_params_source_serial_;
+        std::optional<ParameterUpdateResult> parameter_update_result_;
         lfs::core::SplatTensorAllocator splat_tensor_allocator_;
         std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>> provided_splits_;
 
@@ -741,6 +766,11 @@ namespace lfs::training {
         uint64_t bg_image_cache_clock_ = 0;
         lfs::core::Tensor random_bg_buffer_{}; // Reusable buffer for random background
         std::unique_ptr<TrainingProgress> progress_;
+#if !LFS_TENSOR_CUDA
+        std::unique_ptr<VulkanTrainingRasterizer> vulkan_rasterizer_;
+        std::unique_ptr<VulkanTrainingRasterizer> metrics_rasterizer_;
+        std::mutex metrics_rasterizer_mutex_;
+#endif
         size_t train_dataset_size_ = 0;
         size_t total_cameras_count_ = 0;
         std::shared_ptr<CameraLossHeatmapState> camera_loss_heatmap_;
@@ -942,6 +972,8 @@ namespace lfs::training {
 
         // Current training state
         std::atomic<int> current_iteration_{0};
+        std::atomic<int> completed_iteration_{0};
+        std::uint64_t completed_mutation_epoch_ = 0;
         std::atomic<float> current_loss_{0.0f};
 
         // Monotonic, never rolls back. Incremented at the frozen persistent
@@ -976,7 +1008,9 @@ namespace lfs::training {
         std::array<cudaEvent_t, READER_DONE_RING> reader_done_events_{};
         uint32_t reader_done_head_ = 0;
         uint32_t reader_done_pending_ = 0;
+#if LFS_TENSOR_CUDA
         cudaExternalSemaphore_t viewer_release_semaphore_ = nullptr;
+#endif
         std::atomic<uint64_t> viewer_borrow_value_{0};
         uint64_t viewer_borrow_waited_ = 0;
         mutable std::mutex stream_sync_mutex_;
@@ -1003,6 +1037,9 @@ namespace lfs::training {
         static constexpr size_t LOSS_RING = 4;
         struct LossReadbackSlot {
             float* pinned = nullptr;
+#if !LFS_TENSOR_CUDA
+            float host_value = 0.f;
+#endif
             cudaEvent_t done = nullptr;
             int iter = 0;
             bool in_flight = false;
@@ -1013,7 +1050,9 @@ namespace lfs::training {
         // Always-compiled fault-injection seam used only by the OOM
         // recovery tests. Empty in production, where cudaDeviceSynchronize is
         // called directly.
+#if LFS_TENSOR_CUDA
         std::function<cudaError_t()> recovery_sync_for_testing_;
+#endif
 
         void submitLossReadback(const lfs::core::Tensor& total_loss, int iter);
         std::expected<void, std::string> harvestLossReadbacks(bool drain, bool in_controller_phase);
@@ -1021,7 +1060,7 @@ namespace lfs::training {
         // Python control scripts (file paths) to execute before training starts
         std::vector<std::filesystem::path> python_scripts_;
 
-        std::function<void()> on_iteration_start_;
+        std::function<void()> on_control_poll_;
         std::function<bool()> exportable_densify_barrier_begin_;
         std::function<bool()> exportable_densify_barrier_end_;
         int exportable_densify_barrier_depth_ = 0;

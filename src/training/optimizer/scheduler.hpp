@@ -48,6 +48,7 @@ namespace lfs::training {
               params_to_update_(params_to_update) {
         }
 
+        void set_gamma(double gamma) { gamma_ = gamma; }
         void step();
 
         // Serialization for checkpoints

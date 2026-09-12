@@ -273,28 +273,34 @@ namespace lfs::training {
         return filtered;
     }
 
-    void CommandCenter::drain_enqueued(TrainingSnapshot& view) {
+    bool CommandCenter::drain_enqueued(TrainingSnapshot& view, const std::function<void()>& before_mutation) {
         std::vector<Command> local;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             local.swap(pending_commands_);
         }
-        for (const auto& cmd : local) {
-            switch (cmd.target) {
-            case CommandTarget::Model:
-                if (auto result = exec_model(cmd, view); !result)
-                    LOG_WARN("exec_model failed for op '{}': {}", cmd.op, result.error());
-                break;
-            case CommandTarget::Optimizer:
-                if (auto result = exec_optimizer(cmd, view); !result)
-                    LOG_WARN("exec_optimizer failed for op '{}': {}", cmd.op, result.error());
-                break;
-            case CommandTarget::Session:
-                if (auto result = exec_session(cmd, view); !result)
-                    LOG_WARN("exec_session failed for op '{}': {}", cmd.op, result.error());
-                break;
+        bool mutated = false;
+        for (size_t i = 0; i < local.size(); ++i) {
+            const auto& cmd = local[i];
+            const auto begin = [&] {
+                if (before_mutation) before_mutation();
+                mutated = true;
+            };
+            try {
+                std::expected<void, std::string> result;
+                switch (cmd.target) {
+                case CommandTarget::Model: result = exec_model(cmd, view, begin); break;
+                case CommandTarget::Optimizer: result = exec_optimizer(cmd, view, begin); break;
+                case CommandTarget::Session: result = exec_session(cmd, view); break;
+                }
+                if (!result)
+                    LOG_WARN("Rejected queued command '{}': {}", cmd.op, result.error());
+            } catch (...) {
+                LOG_ERROR("Command '{}' failed; {} subsequent queued commands cancelled", cmd.op, local.size() - i - 1);
+                throw;
             }
         }
+        return mutated;
     }
 
     std::expected<core::Tensor*, std::string> CommandCenter::resolve_attribute(lfs::core::SplatData& model, const std::string& name, size_t& row_dim_out) {
@@ -349,8 +355,7 @@ namespace lfs::training {
             if (len == 0) {
                 return mask;
             }
-            auto slice = mask.slice(0, s.start, effective_end);
-            slice = core::Tensor::ones_bool({len}, device);
+            mask.slice(0, s.start, effective_end).fill_(1.f);
             return mask;
         }
         case SelectionKind::Indices: {
@@ -429,7 +434,7 @@ namespace lfs::training {
         return {};
     }
 
-    std::expected<void, std::string> CommandCenter::exec_model(const Command& cmd, TrainingSnapshot& view) {
+    std::expected<void, std::string> CommandCenter::exec_model(const Command& cmd, TrainingSnapshot& view, const std::function<void()>& before_mutation) {
         if (!view.trainer) {
             return std::unexpected("No active trainer available for model command");
         }
@@ -465,6 +470,9 @@ namespace lfs::training {
             prev_capacity = tensor->capacity();
         }
 
+        core::Tensor candidate = *tensor;
+        auto* destination = tensor;
+        tensor = &candidate;
         auto mask = build_row_mask(cmd.selection, rows, tensor->device());
         if (!mask) {
             return std::unexpected(mask.error());
@@ -505,6 +513,10 @@ namespace lfs::training {
             return result;
         }
 
+        if (before_mutation) before_mutation();
+        *destination = std::move(candidate);
+        tensor = destination;
+
         // For shN, write the mutated canonical view back into swizzled storage.
         if (is_shN) {
             model.shN_set_from_canonical(shN_canon, prev_capacity);
@@ -531,7 +543,7 @@ namespace lfs::training {
         return result;
     }
 
-    std::expected<void, std::string> CommandCenter::exec_optimizer(const Command& cmd, TrainingSnapshot& view) {
+    std::expected<void, std::string> CommandCenter::exec_optimizer(const Command& cmd, TrainingSnapshot& view, const std::function<void()>& before_mutation) {
         if (!view.trainer) {
             return std::unexpected("No active trainer available for optimizer command");
         }
@@ -541,6 +553,8 @@ namespace lfs::training {
             if (it == cmd.args.end()) {
                 return std::unexpected("set_lr requires value");
             }
+            if (std::get<double>(it->second) < 0) return std::unexpected("Learning rate must be nonnegative");
+            if (before_mutation) before_mutation();
             opt.set_lr(static_cast<float>(std::get<double>(it->second)));
             return {};
         }
@@ -550,6 +564,8 @@ namespace lfs::training {
                 return std::unexpected("scale_lr requires factor");
             }
             const double f = std::get<double>(it->second);
+            if (f < 0 || !std::isfinite(opt.get_lr() * f)) return std::unexpected("Invalid learning rate factor");
+            if (before_mutation) before_mutation();
             opt.set_lr(opt.get_lr() * static_cast<float>(f));
             return {};
         }

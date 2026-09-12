@@ -327,6 +327,15 @@ namespace lfs::core {
                    static_cast<float>(iter) < normal_end_fraction * total_f;
         }
 
+        std::string OptimizationParameters::validate_training_backend(const GpuBackend backend) const {
+            if (backend == GpuBackend::Vulkan &&
+                (strategy != kStrategyMCMC || gut || ppisp_active() || bilateral_grid_active() ||
+                 enable_sparsity || use_depth_loss || use_normal_loss)) {
+                return "Metal/Vulkan training supports MCMC. Appearance correction, sparsity, depth and normal supervision are not available on this backend.";
+            }
+            return {};
+        }
+
         int OptimizationParameters::resolved_ppisp_controller_activation_step(const int total_iterations) const {
             if (ppisp_controller_activation_step >= 0)
                 return ppisp_controller_activation_step;
@@ -655,6 +664,9 @@ namespace lfs::core {
         OptimizationParameters OptimizationParameters::mcmc_defaults() {
             auto p = OptimizationParameters{};
             p.strategy = std::string(kStrategyMCMC);
+#if !LFS_TENSOR_CUDA
+            p.undistort = true;
+#endif
             return p;
         }
 

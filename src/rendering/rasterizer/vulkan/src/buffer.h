@@ -257,6 +257,7 @@ struct VulkanGSPipelineBuffers {
     Buffer<sortingKey_t>& sorted_keys() { return is_unsorted_1 ? sorting_keys_2 : sorting_keys_1; }
     Buffer<sortingKey_t>& unsorted_gauss_idx() { return is_unsorted_1 ? sorting_gauss_idx_1 : sorting_gauss_idx_2; }
     Buffer<sortingKey_t>& sorted_gauss_idx() { return is_unsorted_1 ? sorting_gauss_idx_2 : sorting_gauss_idx_1; }
+    const Buffer<sortingKey_t>& sorted_gauss_idx() const { return is_unsorted_1 ? sorting_gauss_idx_2 : sorting_gauss_idx_1; }
 
     // pixels
     Buffer<float> tile_batch_pixel_state;      // (num_batches, TILE_SIZE, 4)

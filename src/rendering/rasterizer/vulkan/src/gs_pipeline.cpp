@@ -487,9 +487,10 @@ void VulkanGSPipeline::destroyBufferRetireTimeline() {
     next_buffer_retire_value_ = 1;
 }
 
-void VulkanGSPipeline::cleanupBuffers(VulkanGSPipelineBuffers& buffers) {
+void VulkanGSPipeline::cleanupBuffers(VulkanGSPipelineBuffers& buffers, const bool wait) {
     HOST_GUARD;
-    waitForPendingBatch();
+    if (wait)
+        waitForPendingBatch();
     drainRetiredBufferShells(/*force=*/true);
     assert(retired_buffer_shells_.empty());
 #define _(name)                                   \
@@ -1004,7 +1005,7 @@ void VulkanGSPipeline::beginCommandBatch() {
 
     commandBatchInProgress = true;
     try {
-        PerfTimer::hostToc();
+        PerfTimer::hostToc(this);
         vulkan_dispatch_.cmd_reset_query_pool(
             command_buffer, timestamp_query_pool, 0, MAX_TIMESTAMP_QUERY_COUNT);
         PerfTimer::popMarkers(this);
@@ -1020,7 +1021,7 @@ void VulkanGSPipeline::cancelCommandBatch() noexcept {
     pending_timeline_waits_.clear();
     timestampNumWritten = 0;
     timestampStackDepth = 0;
-    PerfTimer::discardMarkers();
+    PerfTimer::discardMarkers(this);
 
     if (!was_recording)
         return;
@@ -1040,7 +1041,7 @@ void VulkanGSPipeline::cancelCommandBatch() noexcept {
         }
     }
     try {
-        PerfTimer::hostTic();
+        PerfTimer::hostTic(this);
     } catch (const std::exception& error) {
         fprintf(stderr, "Failed to restore Vulkan host timer after batch cancellation: %s\n", error.what());
     } catch (...) {
@@ -1541,9 +1542,9 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence,
     if (use_fence) {
         [[maybe_unused]] auto cpu_timer = timeCpuStage("vksplat.command_batch.wait_fence");
         if (vulkan_dispatch_.reset_fences == nullptr) {
-            PerfTimer::discardMarkers();
+            PerfTimer::discardMarkers(this);
             timestampNumWritten = 0;
-            PerfTimer::hostTic();
+            PerfTimer::hostTic(this);
             throwRendererContractViolation(
                 "endCommandBatch fence path requires VulkanDispatch reset_fences",
                 LFS_SOURCE_SITE_CURRENT());
@@ -1562,9 +1563,9 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence,
             wait_ctx);
         if (!wait_outcome.has_value() ||
             *wait_outcome != lfs::rendering::WaitOutcome::Ready) {
-            PerfTimer::discardMarkers();
+            PerfTimer::discardMarkers(this);
             timestampNumWritten = 0;
-            PerfTimer::hostTic();
+            PerfTimer::hostTic(this);
             const std::string outcome_label = wait_outcome.has_value()
                                                   ? std::string(waitOutcomeLabel(*wait_outcome))
                                                   : std::string(wait_outcome.error().detail());
@@ -1580,9 +1581,9 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence,
         }
         const VkResult reset_result = vulkan_dispatch_.reset_fences(device, 1, &fence);
         if (reset_result != VK_SUCCESS) {
-            PerfTimer::discardMarkers();
+            PerfTimer::discardMarkers(this);
             timestampNumWritten = 0;
-            PerfTimer::hostTic();
+            PerfTimer::hostTic(this);
             lfs::rendering::throw_vk_result(
                 reset_result,
                 "vkResetFences",
@@ -1597,18 +1598,18 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence,
     } else if (signal_semaphore == VK_NULL_HANDLE || signal_value == 0) {
         [[maybe_unused]] auto cpu_timer = timeCpuStage("vksplat.command_batch.wait_idle");
         if (vulkan_dispatch_.queue_wait_idle == nullptr) {
-            PerfTimer::discardMarkers();
+            PerfTimer::discardMarkers(this);
             timestampNumWritten = 0;
-            PerfTimer::hostTic();
+            PerfTimer::hostTic(this);
             throwRendererContractViolation(
                 "endCommandBatch idle path requires VulkanDispatch queue_wait_idle",
                 LFS_SOURCE_SITE_CURRENT());
         }
         const VkResult idle_result = vulkan_dispatch_.queue_wait_idle(command_queue);
         if (idle_result != VK_SUCCESS) {
-            PerfTimer::discardMarkers();
+            PerfTimer::discardMarkers(this);
             timestampNumWritten = 0;
-            PerfTimer::hostTic();
+            PerfTimer::hostTic(this);
             lfs::rendering::throw_vk_result(
                 idle_result,
                 "vkQueueWaitIdle",
@@ -1622,19 +1623,19 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence,
         }
     }
 
-    PerfTimer::hostTic();
+    PerfTimer::hostTic(this);
 
     if (!use_fence && signal_semaphore != VK_NULL_HANDLE && signal_value != 0) {
         slot.pending_signal = signal_semaphore;
         slot.pending_signal_value = signal_value;
         slot.pending_timestamp_count = timestampNumWritten;
-        slot.pending_timestamp_marks = PerfTimer::takeMarkers();
+        slot.pending_timestamp_marks = PerfTimer::takeMarkers(this);
         timestampNumWritten = 0;
         return;
     }
 
     if (timestampNumWritten > 0) {
-        slot.pending_timestamp_marks = PerfTimer::takeMarkers();
+        slot.pending_timestamp_marks = PerfTimer::takeMarkers(this);
         try {
             collectTimestampResults(slot, timestampNumWritten);
             slot.pending_timestamp_marks.clear();

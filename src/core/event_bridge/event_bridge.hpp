@@ -7,6 +7,8 @@
 #include <concepts>
 #include <functional>
 #include <mutex>
+#include <string>
+#include <type_traits>
 #include <typeindex>
 #include <unordered_map>
 #include <vector>
@@ -48,7 +50,10 @@ namespace lfs::event {
         EventBridge& operator=(const EventBridge&) = delete;
 
         mutable std::mutex mutex_;
-        std::unordered_map<std::type_index, std::vector<std::pair<HandlerId, Handler>>> handlers_;
+        // Hidden RTTI is not coalesced between the executable and Python module
+        // on Darwin. Own the qualified type name so equivalent event types
+        // share a channel even when their type_info objects differ.
+        std::unordered_map<std::string, std::vector<std::pair<HandlerId, Handler>>> handlers_;
         std::atomic<HandlerId> next_id_{1};
     };
 

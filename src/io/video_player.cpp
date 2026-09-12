@@ -14,7 +14,7 @@ extern "C" {
 #include <libavutil/display.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_cuda.h>
+
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
@@ -328,7 +328,7 @@ namespace lfs::io {
             const AVCodec* codec = nullptr;
 
             // NVDEC cuvid does not reliably preserve Dolby Vision RPU side data.
-            if (hw_decoder_name && !has_dolby_vision) {
+            if (LFS_TENSOR_CUDA && hw_decoder_name && !has_dolby_vision) {
                 codec = avcodec_find_decoder_by_name(hw_decoder_name);
                 if (codec &&
                     av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) ==

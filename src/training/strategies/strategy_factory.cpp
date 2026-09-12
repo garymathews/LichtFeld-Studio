@@ -4,9 +4,11 @@
 
 #include "strategy_factory.hpp"
 #include "core/logger.hpp"
+#if LFS_TENSOR_CUDA
 #include "improved_gs_plus.hpp"
-#include "mcmc.hpp"
 #include "mrnf.hpp"
+#endif
+#include "mcmc.hpp"
 #include <format>
 #include <mutex>
 
@@ -34,6 +36,7 @@ namespace lfs::training {
             return std::make_unique<MCMC>(model);
         };
 
+#if LFS_TENSOR_CUDA
         registry_[std::string(core::param::kStrategyMRNF)] = [](core::SplatData& model)
             -> std::expected<std::unique_ptr<IStrategy>, std::string> {
             return std::make_unique<MRNF>(model);
@@ -43,6 +46,7 @@ namespace lfs::training {
             -> std::expected<std::unique_ptr<IStrategy>, std::string> {
             return std::make_unique<ImprovedGSPlus>(model);
         };
+#endif
     }
 
     bool StrategyFactory::register_creator(const std::string& name, Creator creator) {

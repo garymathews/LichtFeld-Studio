@@ -26,6 +26,10 @@ layout(binding=7) StructuredBuffer<float4> v_current_pixel_state;
 layout(binding=8) RWByteAddressBuffer v_xy_vs;
 layout(binding=9) RWByteAddressBuffer v_inv_cov_vs_opacity;
 layout(binding=10) RWByteAddressBuffer v_rgb;
+#if DENSIFICATION_MCMC
+layout(binding=11) StructuredBuffer<float> pixel_error;
+layout(binding=12) RWByteAddressBuffer densification_info;
+#endif
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -84,6 +88,10 @@ void main(
         {
             uint32_t g_idx = collected_idx[j];
             DifferentialPair<Splat_2D_AlphaBlend> dp_g;
+#if DENSIFICATION_MCMC
+            float blend_weight = 0.0f;
+            float weighted_error = 0.0f;
+#endif
             #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
                 float2 d_xy_vs = float2(0.0);
                 float4 d_inv_cov_vs_opacity = float4(0.0);
@@ -101,6 +109,10 @@ void main(
 
                 // Undo pixel state
                 current_pixel_state = undo_pixel_state(current_pixel_state, gauss_rgba);
+#if DENSIFICATION_MCMC
+                blend_weight = current_pixel_state.w * gauss_rgba.a;
+                weighted_error = blend_weight * pixel_error[pix_coord.y * W + pix_coord.x];
+#endif
 
                 // Back-prop automatically through blending and gaussian evaluation.
                 dp_g = diffPair(g);
@@ -146,6 +158,11 @@ void main(
             subgroupSumF32(temp_c0, float(d_rgb.x));
             subgroupSumF32(temp_c1, float(d_rgb.y));
             subgroupSumF32(temp_c2, float(d_rgb.z));
+#if DENSIFICATION_MCMC
+            float density_weight, density_error;
+            subgroupSumF32(density_weight, blend_weight);
+            subgroupSumF32(density_error, weighted_error);
+#endif
           #if SUBGROUP_REDUCE_BEFORE_ATOMIC
             // if (WaveIsFirstLane()) {
             if (thread_rank % SUBGROUP_SIZE == 0) {
@@ -168,10 +185,17 @@ void main(
                 _ATOMIC_ADD(v_rgb, 3*g_idx+0, temp_c0);
                 _ATOMIC_ADD(v_rgb, 3*g_idx+1, temp_c1);
                 _ATOMIC_ADD(v_rgb, 3*g_idx+2, temp_c2);
+#if DENSIFICATION_MCMC
+                _ATOMIC_ADD(densification_info, g_idx, density_weight);
+                _ATOMIC_ADD(densification_info, uniforms.num_splats+g_idx, density_error);
+#endif
             }
 
         #endif  // EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
         }
         splats_left_to_process -= block_size;
+        // All subgroups must finish reading before the next round overwrites
+        // the shared splat batch. Subgroup reduction is not a workgroup fence.
+        GroupMemoryBarrierWithGroupSync();
     }
 }

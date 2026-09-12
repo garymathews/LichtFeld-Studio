@@ -7,10 +7,17 @@
 
 #pragma once
 
+#if LFS_TENSOR_CUDA
+#include "core/cuda_stream_fwd.hpp"
+#include "core/float16.hpp"
+#include "core/cuda_safe_format.hpp"
 #include "core/cuda_error.hpp"
+#endif
 
 #include <cstdint>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 namespace lfs::core {
 

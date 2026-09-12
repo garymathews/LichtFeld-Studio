@@ -4,10 +4,14 @@
 #include "core/nn/models/lpips.hpp"
 
 #include "core/assert.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
-#include "internal/cuda_stream_context.hpp"
-#include "internal/size_bucketed_pool.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/size_bucketed_pool.hpp"
 #include "nn_kernels.hpp"
+#endif
+#include "core/tensor/internal/tensor_impl.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -50,10 +54,14 @@ namespace lfs::core::nn::models {
 
         std::size_t fast_activation_bytes(const std::size_t height, const std::size_t width,
                                           const bool tiled) {
+#if LFS_TENSOR_CUDA
             const auto pixels = height * width;
             return 4 * SizeBucketedPool::get_bucket_size(64 * pixels * sizeof(uint16_t)) +
                    (tiled ? 2 * SizeBucketedPool::get_bucket_size(3 * pixels * sizeof(float)) : 0) +
                    SizeBucketedPool::get_bucket_size(kBlocks * sizeof(float));
+#else
+            throw std::logic_error("CUDA activation sizing is unavailable in this build");
+#endif
         }
 
         lfs::Error lpips_error(const lfs::ErrorCode code, std::string detail) {
@@ -72,15 +80,12 @@ namespace lfs::core::nn::models {
 
         void recapture(Tensor& slot, const Tensor& src) {
             if (!slot.is_valid() || slot.dtype() != src.dtype() || slot.device() != src.device() ||
-                slot.shape() != src.shape()) {
+                slot.shape() != src.shape() || gpu_backend_of(slot) != gpu_backend_of(src)) {
                 slot = src.clone();
                 return;
             }
-            slot.set_stream(src.stream());
-            if (src.bytes() > 0) {
-                LFS_CUDA_CHECK(cudaMemcpyAsync(slot.data_ptr(), src.data_ptr(), src.bytes(),
-                                               cudaMemcpyDeviceToDevice, src.stream()));
-            }
+            // copy_from retains the source and dispatches through its actual backend.
+            slot.copy_from(src);
         }
     } // namespace
 
@@ -89,7 +94,7 @@ namespace lfs::core::nn::models {
                                    const std::size_t activation_budget_bytes) {
         if (device != Device::CUDA) {
             return lpips_error(lfs::ErrorCode::InvalidArgument,
-                               "LPIPS requires a CUDA device");
+                               "LPIPS requires a GPU device");
         }
         auto file = WeightFile::open(weights);
         if (!file)
@@ -156,10 +161,10 @@ namespace lfs::core::nn::models {
         if (height <= 0 || width <= 0)
             return 0;
         const std::size_t pixels = static_cast<std::size_t>(height) * static_cast<std::size_t>(width);
-        const std::size_t bytes_per_pixel = compute_ == DataType::Float16
+        const std::size_t bytes_per_pixel = compute_ == DataType::Float16 && gpu_backend_of(weights_.begin()->second) == GpuBackend::CUDA
                                                 ? kFastBytesPerPixel
                                                 : kExactBytesPerPixel;
-        const auto untiled_bytes = compute_ == DataType::Float16
+        const auto untiled_bytes = compute_ == DataType::Float16 && gpu_backend_of(weights_.begin()->second) == GpuBackend::CUDA
                                        ? fast_activation_bytes(height, width, false)
                                        : pixels * bytes_per_pixel;
         if (untiled_bytes <= activation_budget_bytes_)
@@ -172,7 +177,7 @@ namespace lfs::core::nn::models {
         if (max_crop_edge <= 2 * kTileHalo + 16)
             return 16;
         auto tile = std::max<std::size_t>(16, ((max_crop_edge - 2 * kTileHalo) / 16) * 16);
-        if (compute_ == DataType::Float16) {
+        if (compute_ == DataType::Float16 && gpu_backend_of(weights_.begin()->second) == GpuBackend::CUDA) {
             while (tile > 16 && fast_activation_bytes(std::min<std::size_t>(height, tile + 2 * kTileHalo),
                                                       std::min<std::size_t>(width, tile + 2 * kTileHalo), true) >
                                     activation_budget_bytes_)
@@ -189,9 +194,10 @@ namespace lfs::core::nn::models {
         const std::size_t tile_w = std::min<std::size_t>(static_cast<std::size_t>(width), tile);
         const std::size_t crop_h = std::min<std::size_t>(static_cast<std::size_t>(height), tile_h + 2 * kTileHalo);
         const std::size_t crop_w = std::min<std::size_t>(static_cast<std::size_t>(width), tile_w + 2 * kTileHalo);
-        if (compute_ == DataType::Float32)
+        if (compute_ == DataType::Float32 || gpu_backend_of(weights_.begin()->second) == GpuBackend::Vulkan)
             return crop_h * crop_w * kExactBytesPerPixel;
 
+#if LFS_TENSOR_CUDA
         // Count new allocations, including pool rounding. Existing buffers are
         // already reflected in cudaMemGetInfo; they need no second reservation.
         constexpr std::size_t driver_reserve = 64ULL * 1024 * 1024;
@@ -213,6 +219,9 @@ namespace lfs::core::nn::models {
                 bytes += SizeBucketedPool::get_bucket_size(taps_bytes);
         }
         return bytes;
+#else
+        return crop_h * crop_w * kExactBytesPerPixel;
+#endif
     }
 
     std::size_t Lpips::weights_bytes() const {
@@ -304,11 +313,13 @@ namespace lfs::core::nn::models {
 
     lfs::Result<float> Lpips::run(const Tensor& pred, const Tensor& target,
                                   const InputScaling scaling, LpipsTaps* taps) {
+        if (auto error = validate_pair(pred, target)) return *error;
+        GpuBackendScope backend_scope(*gpu_backend_of(pred));
         if (taps == nullptr && pred.is_valid() && target.is_valid() &&
             (pred.ndim() == 3 || pred.ndim() == 4) && pred.shape() == target.shape()) {
             const int height = static_cast<int>(pred.shape()[pred.ndim() - 2]);
             const int width = static_cast<int>(pred.shape()[pred.ndim() - 1]);
-            if (compute_ == DataType::Float16)
+            if (compute_ == DataType::Float16 && gpu_backend_of(weights_.begin()->second) == GpuBackend::CUDA)
                 return run_fast(pred, target, scaling);
             if (tile_size_for(height, width) < static_cast<std::size_t>(std::max(height, width)))
                 return run_tiled(pred, target, scaling);
@@ -322,15 +333,18 @@ namespace lfs::core::nn::models {
         if ((pred.ndim() != 3 && pred.ndim() != 4) || pred.shape()[pred.ndim() - 3] != 3 ||
             pred.dtype() != DataType::Float32 || pred.device() != Device::CUDA)
             return lpips_error(lfs::ErrorCode::InvalidArgument,
-                               "LPIPS prediction must be CUDA fp32 RGB [3,H,W] or [1,3,H,W]");
+                               "LPIPS prediction must be GPU fp32 RGB [3,H,W] or [1,3,H,W]");
         if (target.shape() != pred.shape() || target.dtype() != DataType::Float32 ||
             target.device() != Device::CUDA)
             return lpips_error(lfs::ErrorCode::InvalidArgument,
-                               "LPIPS target must match the CUDA fp32 prediction shape");
+                               "LPIPS target must match the GPU fp32 prediction shape");
         if ((pred.ndim() == 4 && pred.shape()[0] != 1) ||
             pred.shape()[pred.ndim() - 2] < 16 || pred.shape()[pred.ndim() - 1] < 16)
             return lpips_error(lfs::ErrorCode::InvalidArgument,
                                "LPIPS requires one image with height and width at least 16");
+        if (gpu_backend_of(pred) != gpu_backend_of(target) ||
+            gpu_backend_of(pred) != gpu_backend_of(weights_.begin()->second))
+            return lpips_error(lfs::ErrorCode::InvalidArgument, "LPIPS inputs and weights must use the same GPU backend");
         return std::nullopt;
     }
 
@@ -346,6 +360,7 @@ namespace lfs::core::nn::models {
 
     lfs::Result<float> Lpips::run_fast(const Tensor& pred, const Tensor& target,
                                        const InputScaling scaling) {
+#if LFS_TENSOR_CUDA
         if (auto error = validate_pair(pred, target))
             return std::move(*error);
         Tensor x_in = as_batch(pred).contiguous();
@@ -360,7 +375,9 @@ namespace lfs::core::nn::models {
         };
 
         const cudaStream_t stream = x_in.stream();
+#if LFS_TENSOR_CUDA
         lfs::core::CUDAStreamGuard stream_guard(stream);
+#endif
         if (y_in.stream() != stream) {
             cudaEvent_t ready = nullptr;
             LFS_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
@@ -522,6 +539,9 @@ namespace lfs::core::nn::models {
         if (!std::isfinite(total))
             return lpips_error(lfs::ErrorCode::Internal, "LPIPS produced a non-finite value");
         return total;
+#else
+        return lpips_error(lfs::ErrorCode::Unsupported, "The fused CUDA LPIPS path is unavailable; use the Vulkan tiled path");
+#endif
     }
 
     lfs::Result<float> Lpips::run_tiled(const Tensor& pred, const Tensor& target,
@@ -642,7 +662,9 @@ namespace lfs::core::nn::models {
             y = cast(y, compute_);
         }
         const cudaStream_t stream = x.stream();
+#if LFS_TENSOR_CUDA
         lfs::core::CUDAStreamGuard stream_guard(stream);
+#endif
         bind_weights_to_stream(stream);
         ActivationArenaGuard arena_guard(arena_);
         arena_.begin(stream);
@@ -735,7 +757,7 @@ namespace lfs::core::nn::models {
         for (const float value : values)
             total += value;
         if (taps)
-            LFS_CUDA_CHECK(cudaDeviceSynchronize());
+            internal::backend_ops_for(pred).synchronize_device();
         if (!std::isfinite(total))
             return lpips_error(lfs::ErrorCode::Internal, "LPIPS produced a non-finite value");
         return total;

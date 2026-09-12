@@ -730,7 +730,19 @@ namespace lfs::python {
     }
 
     void call_once_redirect(std::function<void()> fn) {
-        std::call_once(g_redirect_once, std::move(fn));
+        // Never wait for the once flag while holding the GIL: the initializer
+        // may release it during an import and must be able to acquire it again.
+        PyThreadState* state = PyGILState_Check() ? PyEval_SaveThread() : nullptr;
+        try {
+            std::call_once(g_redirect_once, [&fn] {
+                const GilAcquire initializer_gil;
+                fn();
+            });
+        } catch (...) {
+            if (state) PyEval_RestoreThread(state);
+            throw;
+        }
+        if (state) PyEval_RestoreThread(state);
     }
 
     void mark_plugins_loaded() { g_plugins_loaded.store(true, std::memory_order_release); }

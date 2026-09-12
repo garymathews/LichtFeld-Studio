@@ -4,6 +4,7 @@
 
 #include "training/training_manager.hpp"
 #include "core/error.hpp"
+#include "core/error_bus.hpp"
 #include "core/error_envelope.hpp"
 #include "core/error_reporter.hpp"
 #include "core/events.hpp"
@@ -16,15 +17,20 @@
 #include "core/services.hpp"
 #include "core/shareable_allocation_limit.hpp"
 #include "core/tensor.hpp"
-#include "core/tensor/internal/size_bucketed_pool.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/tensor_ops.hpp"
+#include "core/tensor/internal/size_bucketed_pool.hpp"
+#endif
+#include "core/tensor_backend.hpp"
 #include "python/gil.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/vulkan_external_tensor.hpp"
 #include "training/control/command_api.hpp"
+#if LFS_TENSOR_CUDA
 #include "training/rasterization/fast_rasterizer.hpp"
 #include "training/rasterization/gsplat/Ops.h"
 #include "training/rasterization/gsplat_rasterizer.hpp"
+#endif
 #include "training/training_setup.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/post_work_utils.hpp"
@@ -36,7 +42,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -181,6 +189,7 @@ namespace lfs::vis {
         };
 
         void release_training_thread_local_cuda_caches() noexcept {
+#if LFS_TENSOR_CUDA
             (void)lfs::training::release_fast_rasterizer_thread_local_caches();
             (void)lfs::training::release_gsplat_rasterizer_thread_local_caches();
             (void)gsplat_lfs::release_intersect_thread_local_cache();
@@ -188,6 +197,8 @@ namespace lfs::vis {
             // sort workspaces — explicit release before thread join so
             // high-water VRAM is not held until TLS dtor races CUDA teardown.
             lfs::training::release_fastgs_sort_workspace_buffers();
+
+#endif
         }
 
         [[nodiscard]] std::uint64_t thread_id_for_logging(const std::thread::id id) noexcept {
@@ -407,6 +418,12 @@ namespace lfs::vis {
         splat_interop_allocator_ = {};
         splat_interop_parent_.reset();
         splat_storage_.reset();
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan) {
+            // The adopted Vulkan device owns native Tensor buffers shared with
+            // the viewport. An empty allocator selects that normal allocation
+            // path; CUDA export/import storage is unnecessary here.
+            return lfs::core::SplatTensorAllocator{};
+        }
         lfs::core::SplatTensorAllocator tensor_allocator;
 
         const std::size_t configured_capacity =
@@ -444,12 +461,11 @@ namespace lfs::vis {
             lfs::core::SplatExportableStorage::growthCapacity(live_estimate, configured_capacity);
         std::size_t reserve_capacity = configured_capacity;
         if (reserve_capacity == 0) {
-            std::size_t free_mem = 0;
-            std::size_t total_mem = 0;
-            if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess && total_mem > 0) {
+            if (const auto memory = lfs::core::gpu_backend_memory_info(lfs::core::default_gpu_backend());
+                memory.total_bytes > 0) {
                 const std::size_t per_splat =
                     lfs::core::SplatExportableStorage::layoutBytesPerSplat(sh_degree);
-                reserve_capacity = total_mem / std::max<std::size_t>(per_splat, 1);
+                reserve_capacity = memory.total_bytes / std::max<std::size_t>(per_splat, 1);
                 reserve_capacity = std::min(reserve_capacity, std::size_t{0x7fffffff});
             }
             reserve_capacity = std::max(reserve_capacity, exportable_capacity);
@@ -578,12 +594,18 @@ namespace lfs::vis {
         // Full cuda-only↔Vulkan rebind is reserved for capacity grow (physical
         // remap). Generation-checked bind handles protect FastGS and Adam
         // readers from stale pointers during densification.
+#if LFS_TENSOR_CUDA
         if (const cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess) {
             LOG_ERROR("cudaDeviceSynchronize before densify exportable barrier failed: {} ({})",
                       cudaGetErrorName(err),
                       cudaGetErrorString(err));
             return false;
         }
+#else
+        try { lfs::core::with_idle_vulkan_device([](const auto&) {}); }
+        catch (const std::exception& e) { LOG_ERROR("Model synchronization failed: {}", e.what()); return false; }
+#endif
+
         exportable_densify_barrier_depth_ = 1;
         return true;
     }
@@ -596,12 +618,18 @@ namespace lfs::vis {
         if (exportable_densify_barrier_depth_ > 0) {
             return true;
         }
+#if LFS_TENSOR_CUDA
         if (const cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess) {
             LOG_ERROR("cudaDeviceSynchronize after densify exportable barrier failed: {} ({})",
                       cudaGetErrorName(err),
                       cudaGetErrorString(err));
             return false;
         }
+#else
+        try { lfs::core::with_idle_vulkan_device([](const auto&) {}); }
+        catch (const std::exception& e) { LOG_ERROR("Model synchronization failed: {}", e.what()); return false; }
+#endif
+
         return true;
     }
 
@@ -624,12 +652,18 @@ namespace lfs::vis {
         const auto old_bytes = splat_storage_->region_bytes;
         const std::uint64_t old_generation = splat_storage_->generation();
 
+#if LFS_TENSOR_CUDA
         if (const cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess) {
             LOG_ERROR("cudaDeviceSynchronize before exportable grow failed: {} ({})",
                       cudaGetErrorName(err),
                       cudaGetErrorString(err));
             return false;
         }
+#else
+        try { lfs::core::with_idle_vulkan_device([](const auto&) {}); }
+        catch (const std::exception& e) { LOG_ERROR("Model synchronization failed: {}", e.what()); return false; }
+#endif
+
 
         auto grew = splat_storage_->grow(want);
         if (!grew) {
@@ -692,12 +726,14 @@ namespace lfs::vis {
 
     void TrainerManager::setupStateMachineCallbacks() {
         state_machine_.setStateChangeCallback([this](TrainingState, TrainingState new_state) {
+#if LFS_TENSOR_CUDA
             const bool training_cache_active =
                 new_state == TrainingState::Starting ||
                 new_state == TrainingState::Running ||
                 new_state == TrainingState::Paused ||
                 new_state == TrainingState::Stopping;
             lfs::core::SizeBucketedPool::instance().set_training_active(training_cache_active);
+#endif
 
             if (new_state == TrainingState::Starting) {
                 auto& store = app_store();
@@ -1106,6 +1142,21 @@ namespace lfs::vis {
             return reject_start("Scene has no cameras", lfs::ErrorCode::FailedPrecondition);
         }
 
+#if LFS_TENSOR_CUDA
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan) {
+            return reject_start("Training is not supported on the Vulkan tensor backend",
+                                lfs::ErrorCode::FailedPrecondition);
+        }
+        if (scene_) {
+            if (const auto* model = scene_->getTrainingModel();
+                model && lfs::core::gpu_backend_of(model->means_raw()) ==
+                             lfs::core::GpuBackend::Vulkan) {
+                return reject_start("Training is not supported on a Vulkan-backend splat model",
+                                    lfs::ErrorCode::FailedPrecondition);
+            }
+        }
+#endif
+
         if (!state_machine_.transitionTo(TrainingState::Starting)) {
             LOG_WARN("Failed to transition to Starting");
             return false;
@@ -1450,6 +1501,8 @@ namespace lfs::vis {
         }
 
         LOG_DEBUG("Requesting training stop");
+        if (getState() == TrainingState::Running)
+            accumulated_training_time_ += std::chrono::steady_clock::now() - training_start_time_;
         if (!state_machine_.transitionTo(TrainingState::Stopping)) {
             LOG_WARN("Failed to transition to Stopping");
         }
@@ -1623,6 +1676,8 @@ namespace lfs::vis {
 
     void TrainerManager::dispatchTrainingCompleted(TrainingCompletionData completion) {
         auto emit_completion = [this, completion = std::move(completion)]() mutable {
+            accumulated_training_time_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<float>(completion.elapsed_seconds));
             if (!state_machine_.transitionToFinished(completion.reason)) {
                 LOG_WARN("Failed to transition to Finished");
             }
@@ -1726,6 +1781,30 @@ namespace lfs::vis {
         return pending_opt_params_.save_steps;
     }
 
+    void TrainerManager::processParameterUpdateResult(
+        std::optional<lfs::training::Trainer::ParameterUpdateResult> result) {
+        if (!result && trainer_) result = trainer_->take_parameter_update_result();
+        if (!result || result->error.empty()) return;
+        if (auto* manager = services().paramsOrNull(); manager && result->source_serial) {
+            if (!manager->restoreActiveParamsIfUnchanged(result->parameters.optimization, *result->source_serial))
+                return; // A newer UI edit owns these settings, even before it is queued.
+        }
+        LOG_WARN("Training settings retained: {}", result->error);
+        lfs::ErrorBus::instance().publish(lfs::ErrorNotification{
+            .error = lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .domain = lfs::ErrorDomain::Training,
+                .severity = lfs::Severity::Warning,
+                .user_message = "Training settings were not applied",
+                .detail = result->error,
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }),
+            .surface = lfs::ErrorSurface::Toast,
+            .actions = {},
+            .operation_id = lfs::OperationId::generate(),
+        });
+    }
+
     void TrainerManager::setSaveSteps(std::vector<size_t> save_steps) {
         save_steps = normalize_save_steps(std::move(save_steps));
         apply_save_steps(pending_opt_params_, save_steps);
@@ -1745,7 +1824,8 @@ namespace lfs::vis {
         if (!updated_active_params && trainer_) {
             auto params = trainer_->getParams();
             apply_save_steps(params.optimization, save_steps);
-            trainer_->setParams(params);
+            if (const auto result = trainer_->setParams(params); !result)
+                last_error_ = result.error();
         }
     }
 
@@ -2248,7 +2328,7 @@ namespace lfs::vis {
         LOG_INFO("Training thread started");
         LOG_TIMER("Training execution");
 
-        trainer_->setOnIterationStart([this] {
+        trainer_->setOnControlPoll([this] {
             if (auto* pm = services().paramsOrNull(); pm && pm->consumeDirty()) {
                 applyPendingParams();
             }
@@ -2417,9 +2497,11 @@ namespace lfs::vis {
         if (trainer_->isInitialized() && trainer_->getParams().resume_checkpoint.has_value()) {
             if (auto* const param_mgr = services().paramsOrNull()) {
                 auto params = trainer_->getParams();
-                params.optimization.save_steps = param_mgr->copyActiveParams().save_steps;
-                trainer_->setParams(params);
-                param_mgr->importTrainingParams(params);
+                std::uint64_t serial;
+                params.optimization.save_steps = param_mgr->copyActiveParams(&serial).save_steps;
+                if (const auto result = trainer_->setParams(params, serial); !result)
+                    processParameterUpdateResult(lfs::training::Trainer::ParameterUpdateResult{
+                        trainer_->getParams(), result.error(), serial});
             }
             LOG_DEBUG("Ignoring parameter updates for checkpoint-backed trainer (save steps kept)");
             return;
@@ -2430,8 +2512,11 @@ namespace lfs::vis {
         params.dataset = pending_dataset_params_;
 
         // Use ParameterManager in GUI mode, fallback to pending_opt_params_ for headless
+        std::optional<std::uint64_t> source_serial;
         if (auto* const param_mgr = services().paramsOrNull()) {
-            params.optimization = param_mgr->copyActiveParams();
+            std::uint64_t serial;
+            params.optimization = param_mgr->copyActiveParams(&serial);
+            source_serial = serial;
             LOG_DEBUG("Applied params: strategy={}, iter={}, max_cap={}",
                       params.optimization.strategy, params.optimization.iterations, params.optimization.max_cap);
         } else {
@@ -2447,7 +2532,9 @@ namespace lfs::vis {
                 params.optimization.enable_eval,
                 params.dataset.test_every);
         }
-        trainer_->setParams(params);
+        if (const auto accepted = trainer_->setParams(params, source_serial); !accepted)
+            processParameterUpdateResult(lfs::training::Trainer::ParameterUpdateResult{
+                previous_params, accepted.error(), source_serial});
     }
 
 } // namespace lfs::vis

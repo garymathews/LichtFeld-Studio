@@ -6,9 +6,12 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
+
+namespace lfs::core { class Tensor; }
 
 namespace lfs::training::kernels {
+    core::Tensor normalized_canny_edge_weights(const core::Tensor& image);
 
     void launch_fused_canny_edge_filter_chw(
         const float* d_input_chw,
