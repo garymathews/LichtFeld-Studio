@@ -62,6 +62,7 @@ namespace lfs::training {
         PPISP& ppisp,
         PPISPControllerPool* controller_pool,
         PPISPFileMetadata* metadata) {
+#if LFS_TENSOR_CUDA
 
         try {
             std::ifstream file;
@@ -142,7 +143,11 @@ namespace lfs::training {
         } catch (const std::exception& e) {
             return std::unexpected(std::string("Failed to load PPISP file: ") + e.what());
         }
-    }
+
+#else
+        return std::unexpected("PPISP sidecars are unavailable on Vulkan");
+#endif
+}
 
     std::filesystem::path find_ppisp_companion(const std::filesystem::path& splat_path) {
         auto companion = get_ppisp_companion_path(splat_path);

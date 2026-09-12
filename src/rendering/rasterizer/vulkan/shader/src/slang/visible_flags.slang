@@ -32,7 +32,8 @@ void main(
         out_visible_mask[group * LFS_VK_VISIBLE_MASK_WORDS_PER_WORKGROUP + lane] = 0u;
     if (lane == 0u)
         out_visible_block_counts[group] = 0;
-    GroupMemoryBarrierWithGroupSync();
+    // These stores target device buffers, not groupshared memory.
+    DeviceMemoryBarrierWithGroupSync();
 
     if (visible) {
         const uint32_t word = group * LFS_VK_VISIBLE_MASK_WORDS_PER_WORKGROUP +

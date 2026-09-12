@@ -179,6 +179,8 @@ endif()
 if(MSVC)
     target_compile_options(lichtfeld_format_tests PRIVATE /Gy)
     target_link_options(lichtfeld_format_tests PRIVATE /OPT:REF)
+elseif(APPLE)
+    target_link_options(lichtfeld_format_tests PRIVATE -Wl,-dead_strip)
 else()
     target_compile_options(lichtfeld_format_tests PRIVATE
         -ffunction-sections -fdata-sections
@@ -213,6 +215,42 @@ set_tests_properties(lichtfeld_format_tests PROPERTIES
 if(NOT BUILD_TESTS)
     message(STATUS "Building CPU-only format tests (no CUDA); full suite disabled")
     return()  # lichtfeld_format_tests is defined above; the rest needs CUDA/Torch
+endif()
+
+add_executable(lichtfeld_backend_tests
+    test_training_progress.cpp
+    ${CMAKE_SOURCE_DIR}/src/training/progress.cpp
+)
+target_include_directories(lichtfeld_backend_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/external
+)
+target_link_libraries(lichtfeld_backend_tests PRIVATE lfs_core GTest::gtest_main)
+if(LFS_TENSOR_VULKAN)
+    target_sources(lichtfeld_backend_tests PRIVATE test_tensor_vulkan_regressions.cpp)
+    target_compile_definitions(lichtfeld_backend_tests PRIVATE LFS_TENSOR_VULKAN=1)
+    target_link_libraries(lichtfeld_backend_tests PRIVATE Vulkan::Vulkan)
+endif()
+if(TARGET lfs_visualizer)
+    add_executable(lichtfeld_vulkan_wait_tests test_vulkan_wait_bounded.cpp)
+    target_include_directories(lichtfeld_vulkan_wait_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/visualizer)
+    target_link_libraries(lichtfeld_vulkan_wait_tests PRIVATE lfs_visualizer lfs_rendering lfs_core GTest::gtest_main)
+    add_test(NAME lichtfeld_vulkan_wait_tests COMMAND lichtfeld_vulkan_wait_tests --gtest_color=no)
+    set_tests_properties(lichtfeld_vulkan_wait_tests PROPERTIES LABELS "backend;fast" TIMEOUT 60)
+endif()
+add_test(NAME lichtfeld_backend_tests COMMAND lichtfeld_backend_tests --gtest_color=no)
+set_tests_properties(lichtfeld_backend_tests PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    LABELS "backend"
+    TIMEOUT 300
+)
+if(APPLE AND LFS_TENSOR_VULKAN)
+    set_tests_properties(lichtfeld_backend_tests PROPERTIES
+        ENVIRONMENT "VK_ICD_FILENAMES=${CMAKE_BINARY_DIR}/resources/vulkan/MoltenVK_icd.json"
+    )
+endif()
+if(NOT LFS_TENSOR_CUDA)
+    return()
 endif()
 
 # Reuse nanobind headers for Python UI regression tests
@@ -527,7 +565,6 @@ set(TEST_FILES
 list(APPEND TEST_FILES test_vksplat_input_packer.cpp)
 list(APPEND TEST_FILES test_viewer_sh_zerocopy_triad.cpp)
 # Phase 7A: bounded-wait machine + SubmissionState + QW-6 (GPU-free).
-list(APPEND TEST_FILES test_vulkan_wait_bounded.cpp)
 list(APPEND TEST_FILES test_submission_state_transitions.cpp)
 list(APPEND TEST_FILES test_vksplat_failed_submit_no_publish.cpp)
 # Epic #1496: computed barriers (GPU-free planner/tracker suites).

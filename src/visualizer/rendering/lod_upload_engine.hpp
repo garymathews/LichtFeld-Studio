@@ -13,7 +13,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 #include <list>
 #include <mutex>
 #include <vector>

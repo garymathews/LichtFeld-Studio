@@ -11,6 +11,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <cstdint>
 #else
 #include <limits.h>
 #include <unistd.h>
@@ -41,6 +44,14 @@ namespace lfs::core {
 
         path.resize(size);
         return std::filesystem::path(path);
+#elif defined(__APPLE__)
+        uint32_t size = 0;
+        _NSGetExecutablePath(nullptr, &size);
+        std::string path(size, '\0');
+        if (_NSGetExecutablePath(path.data(), &size) != 0) {
+            throw std::runtime_error("_NSGetExecutablePath failed");
+        }
+        return std::filesystem::canonical(path.c_str());
 #else
         char path[PATH_MAX];
         const ssize_t count = readlink("/proc/self/exe", path, PATH_MAX - 1);
@@ -75,6 +86,10 @@ namespace lfs::core {
             return exe_dir;
         }();
         return resource_base;
+    }
+
+    inline bool usingDevelopmentResources() {
+        return getResourceBaseDir() == getExecutableDir() / "resources";
     }
 
     inline std::filesystem::path getAssetsDir() { return getResourceBaseDir() / "assets"; }

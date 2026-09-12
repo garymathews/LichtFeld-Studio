@@ -3,8 +3,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "photometric_loss.hpp"
+#include "core/tensor_backend.hpp"
 #include "diagnostics/vram_profiler.hpp"
+#if LFS_TENSOR_CUDA
 #include "lfs/kernels/l1_loss.cuh"
+#endif
 #include "lfs/kernels/loss_tensor_contract.hpp"
 #include "lfs/kernels/ssim.cuh"
 #include <cstdint>
@@ -42,18 +45,34 @@ namespace lfs::training::losses {
     PhotometricLoss::forward(
         const lfs::core::Tensor& rendered,
         const lfs::core::Tensor& gt_image,
-        const Params& params) {
+        const Params& params,
+        const lfs::core::Tensor& pixel_weight) {
         try {
             lfs::training::kernels::validate_loss_weight(params.lambda_dssim);
             auto [rendered_4d, gt_4d] =
                 lfs::training::kernels::prepare_loss_images(rendered, gt_image);
 
+            const auto mask = pixel_weight.is_valid()
+                                  ? kernels::prepare_loss_mask(pixel_weight, rendered_4d) : core::Tensor{};
+            if (lfs::core::gpu_backend_of(rendered_4d) == core::GpuBackend::Vulkan) {
+                auto ctx = forward_vulkan(rendered_4d, gt_4d, params.lambda_dssim, mask);
+                if (rendered.ndim() == 3)
+                    ctx.grad_image = ctx.grad_image.squeeze(0);
+                return std::make_pair(ctx.loss_tensor, std::move(ctx));
+            }
+#if LFS_TENSOR_CUDA
             lfs::core::Tensor grad_combined;
             lfs::core::Tensor loss_tensor_gpu;
 
             LFS_TRACE("loss.photometric.forward");
             // Optimize: only compute what's needed based on lambda_dssim
-            if (params.lambda_dssim == 0.0f) {
+            if (mask.is_valid()) {
+                auto& workspace = arena_.masked_fused();
+                auto [loss, context] = kernels::masked_fused_l1_ssim_forward(
+                    rendered_4d, gt_4d, mask, params.lambda_dssim, workspace);
+                grad_combined = kernels::masked_fused_l1_ssim_backward(context, workspace);
+                loss_tensor_gpu = loss;
+            } else if (params.lambda_dssim == 0.0f) {
                 LFS_TRACE("loss.l1.forward");
                 // Pure L1 loss
                 size_t N = rendered_4d.numel();
@@ -112,6 +131,9 @@ namespace lfs::training::losses {
                 .loss_tensor = loss_tensor_gpu,
                 .grad_image = grad_combined};
             return std::make_pair(loss_tensor_gpu, ctx);
+#else
+            return std::unexpected("Photometric loss requires the Vulkan backend in this build");
+#endif
         } catch (const std::exception& e) {
             return std::unexpected(std::format("Error computing photometric loss with gradient: {}", e.what()));
         }

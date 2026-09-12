@@ -1554,51 +1554,6 @@ namespace lfs::core::tensor_ops {
     // Beats permute+contiguous for many large-inner shapes by avoiding the
     // full-tensor transpose copy bandwidth.
 
-    namespace {
-        thread_local ReducePathForTesting g_reduce_path_override =
-            ReducePathForTesting::None;
-        thread_local ReducePathForTesting g_reduce_last_path =
-            ReducePathForTesting::Default;
-    } // namespace
-
-    void set_reduce_path_override_for_testing(ReducePathForTesting path) noexcept {
-        g_reduce_path_override = path;
-    }
-    ReducePathForTesting reduce_path_override_for_testing() noexcept {
-        return g_reduce_path_override;
-    }
-    ReducePathForTesting reduce_last_path_for_testing() noexcept {
-        return g_reduce_last_path;
-    }
-    void set_reduce_last_path_for_testing(ReducePathForTesting path) noexcept {
-        g_reduce_last_path = path;
-    }
-
-    bool should_prefer_strided_over_transpose(
-        size_t outer_size, size_t reduce_size, size_t inner_size) noexcept {
-        // Measured argmin on RTX 4080 (microbench, µs):
-        //   [64,512,512] dim0:  strided ~109  vs transpose ~570  → strided
-        //   [32,128,512] dim1:  strided ~17   vs transpose ~23   → strided
-        //   [4,2048,256] dim1:  strided ~18   vs transpose ~38   → strided
-        //   [1,4096,512] dim1:  strided ~18   vs transpose ~52   → strided
-        //   [8,64,1024]  dim1:  strided ~9.5  vs transpose ~8.0  → transpose (edge)
-        //   [16,16,256]  dim0:  strided ~3.9  vs transpose ~6.0  → strided
-        //
-        // New strided_fast kernel (coalesced inner, unrolled) beats the old
-        // ~74µs strided path; full-tensor transpose copy only edges out when
-        // the reduce axis is short (copy is cheap) and output is wide.
-        const size_t output_elems = outer_size * inner_size;
-        if (output_elems == 0 || reduce_size == 0 || inner_size < 256) {
-            return false; // small-inner uses legacy warp_strided / other paths
-        }
-        const size_t numel = outer_size * reduce_size * inner_size;
-        // Cheap-copy edge: short reduce + wide output + modest total size.
-        if (reduce_size <= 64 && output_elems >= 8192 && numel <= (1u << 20)) {
-            return false; // transpose class (measured)
-        }
-        return true; // strided_fast default for large-inner zone
-    }
-
     __global__ void strided_fast_sum_kernel(
         const float* __restrict__ input, float* __restrict__ output,
         size_t outer_size, size_t reduce_size, size_t inner_size) {

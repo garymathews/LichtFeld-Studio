@@ -18,11 +18,14 @@
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/pinned_memory_allocator.hpp"
+#endif
 #include "core/provenance.hpp"
 #include "core/scene.hpp"
 #include "core/session_breadcrumb.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor_backend.hpp"
 #include "core/user_paths.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "io/cache_image_loader.hpp"
@@ -32,6 +35,9 @@
 #include "tcp/include/tcp_publisher.hpp"
 #include "tcp/include/tcp_responder.hpp"
 #include "training/trainer.hpp"
+#if !LFS_TENSOR_CUDA
+#include "training/rasterization/vulkan_rasterizer.hpp"
+#endif
 #include "training/training_setup.hpp"
 #include "visualizer/training/training_manager.hpp"
 #include "visualizer/visualizer.hpp"
@@ -46,7 +52,9 @@
 #include "python/runner.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "sequencer/timeline.hpp"
+#if LFS_TENSOR_CUDA
 #include "training/rasterization/fast_rasterizer.hpp"
+#endif
 #include "visualizer/gui/layout_state.hpp"
 #include "visualizer/gui/panels/python_scripts_panel.hpp"
 #include "visualizer/gui/video_widget_interface.hpp"
@@ -55,13 +63,17 @@
 #include "visualizer/preferences.hpp"
 #include <cmath>
 #include <condition_variable>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
 #include <curand.h>
+#endif
 #include <format>
 #include <future>
 #include <mutex>
 #include <print>
+#if LFS_TENSOR_CUDA
 #include <rasterization_api.h>
+#endif
 #include <string>
 #include <string_view>
 
@@ -1078,14 +1090,11 @@ namespace lfs::app {
                 return 1;
             }
 
-            // Solid black background, matching Trainer's default bg_color init.
-            auto background = core::Tensor::empty({3}, core::Device::CPU, core::DataType::Float32);
-            {
-                auto* const bg_ptr = background.ptr<float>();
-                bg_ptr[0] = bg_ptr[1] = bg_ptr[2] = 0.0f;
-            }
-            background = background.to(core::Device::CUDA);
-
+#if LFS_TENSOR_CUDA
+            const auto background = core::Tensor::zeros({3}, core::Device::CUDA);
+#else
+            training::VulkanTrainingRasterizer renderer;
+#endif
             lfs::io::video::VideoEncoder encoder;
             lfs::io::video::VideoExportOptions options;
             options.preset = lfs::io::video::VideoPreset::CUSTOM;
@@ -1140,7 +1149,11 @@ namespace lfs::app {
                     cfg.width, cfg.height,
                     frame);
 
+#if LFS_TENSOR_CUDA
                 auto render_output = training::fast_rasterize(camera, *model, background);
+#else
+                auto render_output = renderer.forward(camera, *model);
+#endif
                 auto image = render_output.image;
                 if (image.dtype() != core::DataType::Float32) {
                     image = image.to(core::DataType::Float32);
@@ -1150,7 +1163,15 @@ namespace lfs::app {
                 }
                 auto image_hwc = image.permute({1, 2, 0}).contiguous();
 
+#if LFS_TENSOR_CUDA
                 const auto write_result = encoder.writeFrameGpu(image_hwc.data_ptr(), cfg.width, cfg.height, nullptr);
+#else
+                const auto rgb = (image_hwc.clamp(0.f, 1.f) * 255.f + .5f)
+                                     .to(core::DataType::UInt8)
+                                     .cpu()
+                                     .contiguous();
+                const auto write_result = encoder.writeFrame(std::span<const uint8_t>(rgb.ptr<uint8_t>(), rgb.numel()), cfg.width, cfg.height);
+#endif
                 if (!write_result) {
                     LOG_ERROR("Failed to encode frame {}: {}", frame, write_result.error());
                     if (const auto close_result = encoder.close(); !close_result)
@@ -1205,6 +1226,7 @@ namespace lfs::app {
     // user-facing message (#1540). show_dialog is false for CLI-only modes: a modal in a
     // non-interactive process blocks it forever.
     bool preflightGpu(const bool show_dialog) {
+#if LFS_TENSOR_CUDA
         const auto info = lfs::core::check_cuda_version();
         if (info.query_failed) {
             LOG_WARN("Failed to query CUDA driver version");
@@ -1246,6 +1268,20 @@ namespace lfs::app {
             return false;
         }
         return true;
+
+#else
+        if (!lfs::core::gpu_backend_available(lfs::core::GpuBackend::Vulkan)) {
+            reportFatalStartupError("LichtFeld Studio - No usable GPU", "No usable Vulkan device was found. On macOS install the supported MoltenVK runtime.", show_dialog);
+            return false;
+        }
+        auto selected = lfs::core::set_default_gpu_backend(lfs::core::GpuBackend::Vulkan);
+        if (!selected) {
+            reportFatalStartupError("LichtFeld Studio - GPU initialization failed", lfs::format_for_developer(selected.error()), show_dialog);
+            return false;
+        }
+        LOG_INFO("Using Vulkan for rendering and MCMC training (MoltenVK/Metal on macOS)");
+        return true;
+#endif
     }
 
     namespace {
@@ -1256,6 +1292,7 @@ namespace lfs::app {
         }
 
         void warmupCudaAsync() {
+#if LFS_TENSOR_CUDA
             LOG_INFO("Initializing CUDA (async)...");
             cudaWarmupFuture() = std::async(std::launch::async, [] {
                 auto& profiler = lfs::diagnostics::VramProfiler::instance();
@@ -1286,6 +1323,10 @@ namespace lfs::app {
                 fast_lfs::rasterization::warmup_kernels();
                 profiler.captureCudaWarmupDelta();
             });
+
+#else
+            throw std::logic_error("CUDA warmup requested in a Vulkan build");
+#endif
         }
 
         int runGui(std::unique_ptr<lfs::core::param::TrainingParameters> params) {
@@ -1354,7 +1395,9 @@ namespace lfs::app {
             // module memory (the cuda.modules row). Without it the modules land in the
             // unattributed NVML residual. The pre-flight gate in run_mode covers
             // hardware compatibility before this warmup starts.
-            warmupCudaAsync();
+            if (lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA)) {
+                warmupCudaAsync();
+            }
 
             lfs::event::CommandCenterBridge::instance().set(&lfs::training::CommandCenter::instance());
 

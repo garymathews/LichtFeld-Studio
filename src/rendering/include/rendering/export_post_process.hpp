@@ -9,7 +9,7 @@
 #pragma once
 
 #include "core/tensor.hpp"
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 #include <expected>
 #include <filesystem>
 #include <glm/glm.hpp>

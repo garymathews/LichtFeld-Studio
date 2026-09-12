@@ -74,6 +74,10 @@ namespace lfs::training {
         // Helper functions
         lfs::core::Tensor multinomial_sample(const lfs::core::Tensor& weights, int n, bool replacement = true);
         int relocate_gs();
+#if !LFS_TENSOR_CUDA
+        int prepare_topology_update(const std::function<int()>& update);
+        bool preparing_topology_ = false;
+#endif
         int add_new_gs();
         void inject_noise();
         void update_optimizer_for_relocate(const lfs::core::Tensor& sampled_indices,

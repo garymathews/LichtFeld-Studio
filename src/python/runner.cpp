@@ -385,6 +385,7 @@ _add_dll_dirs()
 
 #ifdef LFS_DEV_PYTHON_SOURCE_DIR
         void prepend_dev_python_source_path(PyObject* const sys_path) {
+            if (!lfs::core::usingDevelopmentResources()) return;
             const auto source_dir = lfs::core::utf8_to_path(LFS_DEV_PYTHON_SOURCE_DIR);
             std::error_code ec;
             if (!std::filesystem::exists(source_dir / "lfs_plugins", ec)) {
@@ -397,6 +398,7 @@ _add_dll_dirs()
         }
 
         void start_dev_python_watcher(PyObject* const lfs_plugins) {
+            if (!lfs::core::usingDevelopmentResources()) return;
             if (!lfs::core::environment::flag("LFS_DEV_HOT_RELOAD", true)) {
                 LOG_INFO("Python dev hot reload disabled by LFS_DEV_HOT_RELOAD");
                 return;
@@ -1534,10 +1536,7 @@ _add_dll_dirs()
     }
 
     void install_output_redirect() {
-        call_once_redirect([] {
-            const GilAcquire gil;
-            redirect_output();
-        });
+        call_once_redirect([] { redirect_output(); });
     }
 
     static std::thread g_repl_thread;

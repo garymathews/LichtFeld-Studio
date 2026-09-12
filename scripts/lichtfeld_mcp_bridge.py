@@ -95,6 +95,7 @@ def executable_candidates() -> list[Path]:
 
     search_roots = [
         REPO_ROOT / "build",
+        REPO_ROOT / "build-macos-app",
         REPO_ROOT / "cmake-build-release",
         REPO_ROOT / "cmake-build-debug",
         REPO_ROOT / "dist" / "bin",

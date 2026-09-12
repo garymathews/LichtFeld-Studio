@@ -4,7 +4,7 @@
 
 #include "core/export.hpp"
 
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 
 #include <cstddef>
 #include <memory>

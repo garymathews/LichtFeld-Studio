@@ -5,6 +5,7 @@
 #include "mask_loss.hpp"
 
 #include "core/assert.hpp"
+#include "core/tensor_backend.hpp"
 #include "training/kernels/mask_preprocess.hpp"
 
 #include <cmath>
@@ -31,6 +32,9 @@ namespace lfs::training::losses {
         allocated_h = H;
         allocated_w = W;
     }
+
+    using core::DataType;
+    using core::Tensor;
 
     namespace {
 
@@ -87,31 +91,45 @@ namespace lfs::training::losses {
             return user_mask;
         }
 
-        ws.ensure_size(H, W);
-        const auto mode = segment_and_ignore
-                              ? lfs::training::kernels::MaskPhotoMode::SegmentAndIgnore
-                              : lfs::training::kernels::MaskPhotoMode::BinaryGt0;
-        const float* roi = roi_ptr_or_null(roi_weight);
+#if LFS_TENSOR_CUDA
+        if (core::gpu_backend_of(user_mask) == core::GpuBackend::CUDA) {
+            ws.ensure_size(H, W);
+            const auto mode = segment_and_ignore
+                                  ? lfs::training::kernels::MaskPhotoMode::SegmentAndIgnore
+                                  : lfs::training::kernels::MaskPhotoMode::BinaryGt0;
+            const float* roi = roi_ptr_or_null(roi_weight);
 
-        if (user_mask.dtype() == lfs::core::DataType::Float32) {
-            lfs::training::kernels::launch_fuse_photometric_mask_weight_f32(
-                user_mask.ptr<float>(),
-                roi,
-                ws.photometric_weight.ptr<float>(),
-                static_cast<int>(H),
-                static_cast<int>(W),
-                mode);
-        } else {
-            // Bool is stored as uint8 in this codebase for dense masks.
-            lfs::training::kernels::launch_fuse_photometric_mask_weight_u8(
-                user_mask.ptr<uint8_t>(),
-                roi,
-                ws.photometric_weight.ptr<float>(),
-                static_cast<int>(H),
-                static_cast<int>(W),
-                mode);
+            if (user_mask.dtype() == lfs::core::DataType::Float32) {
+                lfs::training::kernels::launch_fuse_photometric_mask_weight_f32(
+                    user_mask.ptr<float>(),
+                    roi,
+                    ws.photometric_weight.ptr<float>(),
+                    static_cast<int>(H),
+                    static_cast<int>(W),
+                    mode);
+            } else {
+                // Bool is stored as uint8 in this codebase for dense masks.
+                lfs::training::kernels::launch_fuse_photometric_mask_weight_u8(
+                    user_mask.ptr<uint8_t>(),
+                    roi,
+                    ws.photometric_weight.ptr<float>(),
+                    static_cast<int>(H),
+                    static_cast<int>(W),
+                    mode);
+            }
+            return ws.photometric_weight;
         }
-        return ws.photometric_weight;
+#endif
+        auto normalized = user_mask.to(DataType::Float32);
+        if (user_mask.dtype() != DataType::Float32)
+            normalized = normalized / 255.f;
+        auto result = segment_and_ignore                       ? normalized.gt(kernels::kMaskKeepMin).to(DataType::Float32)
+                      : user_mask.dtype() == DataType::Float32 ? user_mask
+                                                               : user_mask.ne(0).to(DataType::Float32);
+        if (roi_weight.is_valid())
+            result = result * roi_weight;
+        ws.photometric_weight = result;
+        return result;
     }
 
     MaskOpacityPenalty fuse_mask_opacity_penalty(
@@ -137,47 +155,66 @@ namespace lfs::training::losses {
                 "ROI must match alpha");
         }
 
-        ws.ensure_size(H, W);
-        const auto mode = segment_and_ignore
-                              ? lfs::training::kernels::MaskOpacityMode::SegmentAndIgnore
-                              : lfs::training::kernels::MaskOpacityMode::BinaryGt0;
-        const float* roi = roi_ptr_or_null(roi_weight);
+        LFS_ASSERT_MSG(mask_raw.dtype() == DataType::Float32 || mask_raw.dtype() == DataType::UInt8 || mask_raw.dtype() == DataType::Bool, "mask dtype");
+#if LFS_TENSOR_CUDA
+        if (core::gpu_backend_of(alpha) == core::GpuBackend::CUDA) {
+            ws.ensure_size(H, W);
+            const auto mode = segment_and_ignore
+                                  ? lfs::training::kernels::MaskOpacityMode::SegmentAndIgnore
+                                  : lfs::training::kernels::MaskOpacityMode::BinaryGt0;
+            const float* roi = roi_ptr_or_null(roi_weight);
 
-        if (mask_raw.dtype() == lfs::core::DataType::Float32) {
-            lfs::training::kernels::launch_fuse_mask_opacity_penalty_f32(
-                alpha.ptr<float>(),
-                mask_raw.ptr<float>(),
-                roi,
-                ws.grad_alpha.ptr<float>(),
-                ws.reduce_temp.ptr<float>(),
-                ws.loss_scalar.ptr<float>(),
-                static_cast<int>(H),
-                static_cast<int>(W),
-                power,
-                scale,
-                mode);
-        } else {
-            LFS_ASSERT_MSG(
-                mask_raw.dtype() == lfs::core::DataType::UInt8 ||
-                    mask_raw.dtype() == lfs::core::DataType::Bool,
-                "mask dtype");
-            lfs::training::kernels::launch_fuse_mask_opacity_penalty_u8(
-                alpha.ptr<float>(),
-                mask_raw.ptr<uint8_t>(),
-                roi,
-                ws.grad_alpha.ptr<float>(),
-                ws.reduce_temp.ptr<float>(),
-                ws.loss_scalar.ptr<float>(),
-                static_cast<int>(H),
-                static_cast<int>(W),
-                power,
-                scale,
-                mode);
+            if (mask_raw.dtype() == lfs::core::DataType::Float32) {
+                lfs::training::kernels::launch_fuse_mask_opacity_penalty_f32(
+                    alpha.ptr<float>(),
+                    mask_raw.ptr<float>(),
+                    roi,
+                    ws.grad_alpha.ptr<float>(),
+                    ws.reduce_temp.ptr<float>(),
+                    ws.loss_scalar.ptr<float>(),
+                    static_cast<int>(H),
+                    static_cast<int>(W),
+                    power,
+                    scale,
+                    mode);
+            } else {
+                LFS_ASSERT_MSG(
+                    mask_raw.dtype() == lfs::core::DataType::UInt8 ||
+                        mask_raw.dtype() == lfs::core::DataType::Bool,
+                    "mask dtype");
+                lfs::training::kernels::launch_fuse_mask_opacity_penalty_u8(
+                    alpha.ptr<float>(),
+                    mask_raw.ptr<uint8_t>(),
+                    roi,
+                    ws.grad_alpha.ptr<float>(),
+                    ws.reduce_temp.ptr<float>(),
+                    ws.loss_scalar.ptr<float>(),
+                    static_cast<int>(H),
+                    static_cast<int>(W),
+                    power,
+                    scale,
+                    mode);
+            }
+
+            return MaskOpacityPenalty{
+                .loss = ws.loss_scalar,
+                .grad_alpha = ws.grad_alpha};
         }
-
-        return MaskOpacityPenalty{
-            .loss = ws.loss_scalar,
-            .grad_alpha = ws.grad_alpha};
+#endif
+        auto normalized = mask_raw.to(DataType::Float32);
+        if (mask_raw.dtype() != DataType::Float32)
+            normalized = normalized / 255.f;
+        const auto foreground = mask_raw.dtype() == DataType::Float32 ? mask_raw : mask_raw.ne(0).to(DataType::Float32);
+        const auto bg = segment_and_ignore
+                            ? normalized.ge(kernels::kMaskSegmentMin).logical_and(normalized.le(kernels::kMaskKeepMin)).to(DataType::Float32)
+                            : foreground.neg() + 1.f;
+        auto penalty = Tensor::where(bg.le(0.f), Tensor::zeros_like(bg),
+                                     (power > 0.f ? Tensor::where(bg.ge(1.f), Tensor::ones_like(bg), bg.clamp_min(0.f).pow(power)) : bg.clamp_min(0.f).pow(power)));
+        if (roi_weight.is_valid())
+            penalty = penalty * roi_weight;
+        ws.grad_alpha = penalty * (scale / static_cast<float>(alpha.numel()));
+        ws.loss_scalar = (alpha * penalty).mean().mul(scale).reshape({1});
+        return {.loss = ws.loss_scalar, .grad_alpha = ws.grad_alpha};
     }
 
     MaskOpacityPenalty fuse_alpha_consistent(
@@ -200,40 +237,56 @@ namespace lfs::training::losses {
                 "ROI must match alpha");
         }
 
-        ws.ensure_size(H, W);
-        const float* roi = roi_ptr_or_null(roi_weight);
+        LFS_ASSERT_MSG(mask.dtype() == DataType::Float32 || mask.dtype() == DataType::UInt8 || mask.dtype() == DataType::Bool, "mask dtype");
+#if LFS_TENSOR_CUDA
+        if (core::gpu_backend_of(alpha) == core::GpuBackend::CUDA) {
+            ws.ensure_size(H, W);
+            const float* roi = roi_ptr_or_null(roi_weight);
 
-        if (mask.dtype() == lfs::core::DataType::Float32) {
-            lfs::training::kernels::launch_fuse_alpha_consistent_f32(
-                alpha.ptr<float>(),
-                mask.ptr<float>(),
-                roi,
-                ws.grad_alpha.ptr<float>(),
-                ws.reduce_temp.ptr<float>(),
-                ws.loss_scalar.ptr<float>(),
-                static_cast<int>(H),
-                static_cast<int>(W),
-                weight);
-        } else {
-            LFS_ASSERT_MSG(
-                mask.dtype() == lfs::core::DataType::UInt8 ||
-                    mask.dtype() == lfs::core::DataType::Bool,
-                "mask dtype");
-            lfs::training::kernels::launch_fuse_alpha_consistent_u8(
-                alpha.ptr<float>(),
-                mask.ptr<uint8_t>(),
-                roi,
-                ws.grad_alpha.ptr<float>(),
-                ws.reduce_temp.ptr<float>(),
-                ws.loss_scalar.ptr<float>(),
-                static_cast<int>(H),
-                static_cast<int>(W),
-                weight);
+            if (mask.dtype() == lfs::core::DataType::Float32) {
+                lfs::training::kernels::launch_fuse_alpha_consistent_f32(
+                    alpha.ptr<float>(),
+                    mask.ptr<float>(),
+                    roi,
+                    ws.grad_alpha.ptr<float>(),
+                    ws.reduce_temp.ptr<float>(),
+                    ws.loss_scalar.ptr<float>(),
+                    static_cast<int>(H),
+                    static_cast<int>(W),
+                    weight);
+            } else {
+                LFS_ASSERT_MSG(
+                    mask.dtype() == lfs::core::DataType::UInt8 ||
+                        mask.dtype() == lfs::core::DataType::Bool,
+                    "mask dtype");
+                lfs::training::kernels::launch_fuse_alpha_consistent_u8(
+                    alpha.ptr<float>(),
+                    mask.ptr<uint8_t>(),
+                    roi,
+                    ws.grad_alpha.ptr<float>(),
+                    ws.reduce_temp.ptr<float>(),
+                    ws.loss_scalar.ptr<float>(),
+                    static_cast<int>(H),
+                    static_cast<int>(W),
+                    weight);
+            }
+
+            return MaskOpacityPenalty{
+                .loss = ws.loss_scalar,
+                .grad_alpha = ws.grad_alpha};
         }
-
-        return MaskOpacityPenalty{
-            .loss = ws.loss_scalar,
-            .grad_alpha = ws.grad_alpha};
+#endif
+        const auto foreground = mask.dtype() == DataType::Float32 ? mask : mask.ne(0).to(DataType::Float32);
+        const auto delta = alpha - foreground;
+        auto absolute = delta.abs();
+        auto sign = delta.gt(0.f).to(DataType::Float32) - delta.lt(0.f).to(DataType::Float32);
+        if (roi_weight.is_valid()) {
+            absolute = absolute * roi_weight;
+            sign = sign * roi_weight;
+        }
+        ws.grad_alpha = sign * (weight / static_cast<float>(alpha.numel()));
+        ws.loss_scalar = absolute.mean().mul(weight).reshape({1});
+        return {.loss = ws.loss_scalar, .grad_alpha = ws.grad_alpha};
     }
 
 } // namespace lfs::training::losses

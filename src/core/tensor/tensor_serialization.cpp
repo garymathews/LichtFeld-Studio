@@ -1,14 +1,20 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/cuda_stream_fwd.hpp"
+#include "core/float16.hpp"
+#include "core/cuda_safe_format.hpp"
 #include "internal/tensor_serialization.hpp"
 
 #include "core/contiguous_streambuf.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/path_utils.hpp"
 #include "core/tensor_serialization_sink.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <ios>
 #include <limits>
@@ -112,14 +118,16 @@ namespace lfs::core {
             throw std::runtime_error("Cannot serialize invalid tensor");
         }
 
-        const TensorFileHeader header{
-            TENSOR_FILE_MAGIC,
-            TENSOR_FILE_VERSION,
-            static_cast<uint8_t>(descriptor.dtype),
-            static_cast<uint8_t>(descriptor.serialized_device),
-            static_cast<uint16_t>(
-                descriptor.serialized_shape.rank()),
-            descriptor.serialized_shape.elements()};
+        TensorFileHeader header;
+        // The existing file format includes ABI padding. Keep it deterministic
+        // without changing the layout of already-written checkpoints.
+        std::memset(&header, 0, sizeof(header));
+        header.magic = TENSOR_FILE_MAGIC;
+        header.version = TENSOR_FILE_VERSION;
+        header.dtype = static_cast<uint8_t>(descriptor.dtype);
+        header.device = static_cast<uint8_t>(descriptor.serialized_device);
+        header.rank = static_cast<uint16_t>(descriptor.serialized_shape.rank());
+        header.numel = descriptor.serialized_shape.elements();
         os.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
         for (const size_t dim :
@@ -342,17 +350,16 @@ namespace lfs::core {
                 });
                 if (parsed.payload_bytes > 0) {
                     run_timed(&TensorLoadTiming::read_ms, [&] {
-                        LFS_CUDA_CHECK_MSG_STREAM_ARGS(
-                            cudaMemcpyAsync(
-                                loaded.data_ptr(), remaining.data(),
-                                static_cast<std::size_t>(parsed.payload_bytes),
-                                cudaMemcpyHostToDevice, stream),
-                            stream,
-                            reinterpret_cast<uintptr_t>(loaded.data_ptr()),
-                            reinterpret_cast<uintptr_t>(remaining.data()),
-                            static_cast<std::size_t>(parsed.payload_bytes),
-                            "while uploading serialized tensor payload shape={} dtype={} to CUDA",
-                            parsed.shape.str(), dtype_name(parsed.dtype));
+                        internal::backend_ops_for(loaded).copy_host_to_device(
+                            internal::CopyRequest{
+                                .src = internal::raw_storage_ref(
+                                    const_cast<void*>(static_cast<const void*>(remaining.data())),
+                                    parsed.dtype),
+                                .dst = internal::storage_ref(loaded),
+                                .bytes = static_cast<std::size_t>(parsed.payload_bytes),
+                                .synchronous = false,
+                                .context = internal::ExecContext{stream},
+                            });
                         loaded.record_stream(stream);
                     });
                 }

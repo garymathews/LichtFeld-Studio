@@ -85,6 +85,23 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
+    },
+    {
+      "name": "macos-arm64-app",
+      "displayName": "macOS arm64 MoltenVK application",
+      "inherits": "build",
+      "binaryDir": "${sourceDir}/build-macos-app",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "LFS_TENSOR_CUDA": "OFF",
+        "VCPKG_TARGET_TRIPLET": "arm64-osx",
+        "VCPKG_HOST_TRIPLET": "arm64-osx"
+      }
     }
   ],
   "buildPresets": [
@@ -136,6 +153,11 @@
         "lhs": "${hostSystemName}",
         "rhs": "Linux"
       },
+      "jobs": 6
+    },
+    {
+      "name": "macos-arm64-app",
+      "configurePreset": "macos-arm64-app",
       "jobs": 6
     }
   ]

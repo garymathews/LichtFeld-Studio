@@ -7,7 +7,9 @@
 
 #include "bilateral_grid.hpp"
 #include "config_serialization.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/logger.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
 #include <cassert>
@@ -235,6 +237,7 @@ namespace lfs::training {
           grid_guidance_(grid_L),
           channels_(bilateral_grid_channel_count(parameterization)),
           parameterization_(parameterization) {
+#if LFS_TENSOR_CUDA
 
         const size_t grid_elements = validated_grid_elements(
             num_images, grid_W, grid_H, grid_L, channels_, total_iterations, config);
@@ -270,9 +273,14 @@ namespace lfs::training {
 
         LOG_DEBUG("BilateralGrid: {}x{}x{} for {} images, C={}, lr={:.2e}",
                   grid_W, grid_H, grid_L, num_images, channels_, config.lr);
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor BilateralGrid::apply(const lfs::core::Tensor& rgb, int image_idx) {
+#if LFS_TENSOR_CUDA
         if (image_idx < 0 || image_idx >= num_images_) {
             throw std::out_of_range("BilateralGrid::apply: image_idx out of range");
         }
@@ -313,11 +321,16 @@ namespace lfs::training {
                 offset_ptr, nullptr);
         }
         return output;
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor BilateralGrid::backward(const lfs::core::Tensor& rgb,
                                               const lfs::core::Tensor& grad_output,
                                               int image_idx) {
+#if LFS_TENSOR_CUDA
         if (image_idx < 0 || image_idx >= num_images_) {
             throw std::out_of_range("BilateralGrid::backward: image_idx out of range");
         }
@@ -371,9 +384,14 @@ namespace lfs::training {
                 offset_ptr, nullptr);
         }
         return grad_rgb;
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor BilateralGrid::tv_loss_gpu() {
+#if LFS_TENSOR_CUDA
         assert(static_cast<int>(grids_.shape()[1]) == channels_);
         LFS_CUDA_CHECK(cudaMemsetAsync(
             tv_loss_scalar_.ptr<float>(), 0, sizeof(float), nullptr));
@@ -382,9 +400,14 @@ namespace lfs::training {
             num_images_, channels_, grid_guidance_, grid_height_, grid_width_,
             num_images_, nullptr);
         return tv_loss_scalar_;
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor BilateralGrid::tv_loss_gpu(int image_idx) {
+#if LFS_TENSOR_CUDA
         if (image_idx < 0 || image_idx >= num_images_) {
             throw std::out_of_range("BilateralGrid::tv_loss_gpu: image_idx out of range");
         }
@@ -395,17 +418,27 @@ namespace lfs::training {
             1, channels_, grid_guidance_, grid_height_, grid_width_,
             num_images_, nullptr);
         return tv_loss_scalar_;
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void BilateralGrid::tv_backward(float tv_weight) {
+#if LFS_TENSOR_CUDA
         for (int i = 0; i < num_images_; ++i) {
             LFS_CUDA_CHECK(cudaMemsetAsync(
                 slice_grad_.ptr<float>(), 0, slice_elements() * sizeof(float), nullptr));
             tv_backward(tv_weight, i);
         }
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void BilateralGrid::tv_backward(float tv_weight, int image_idx) {
+#if LFS_TENSOR_CUDA
         if (image_idx < 0 || image_idx >= num_images_) {
             throw std::out_of_range("BilateralGrid::tv_backward: image_idx out of range");
         }
@@ -413,6 +446,10 @@ namespace lfs::training {
             slice_ptr(grids_, image_idx), tv_weight, slice_grad_.ptr<float>(),
             1, channels_, grid_guidance_, grid_height_, grid_width_,
             num_images_, nullptr);
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void BilateralGrid::optimizer_step() {
@@ -422,6 +459,7 @@ namespace lfs::training {
     }
 
     void BilateralGrid::optimizer_step(int image_idx) {
+#if LFS_TENSOR_CUDA
         if (image_idx < 0 || image_idx >= num_images_) {
             throw std::out_of_range("BilateralGrid::optimizer_step: image_idx out of range");
         }
@@ -444,9 +482,14 @@ namespace lfs::training {
             static_cast<float>(config_.beta1), static_cast<float>(config_.beta2),
             bc1_rcp, bc2_sqrt_rcp, static_cast<float>(config_.eps), nullptr);
         last_step_[static_cast<size_t>(image_idx)] = step_;
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void BilateralGrid::step_image(int image_idx, float tv_weight) {
+#if LFS_TENSOR_CUDA
         nvtxRangePush("bilateral_grid_tv_backward");
         tv_backward(tv_weight, image_idx);
         nvtxRangePop();
@@ -474,11 +517,20 @@ namespace lfs::training {
 
         zero_grad();
         scheduler_step();
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void BilateralGrid::zero_grad() {
+#if LFS_TENSOR_CUDA
         LFS_CUDA_CHECK(cudaMemsetAsync(slice_grad_.ptr<float>(), 0,
                                        slice_grad_.numel() * sizeof(float), nullptr));
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void BilateralGrid::scheduler_step() {
@@ -541,6 +593,7 @@ namespace lfs::training {
     }
 
     void BilateralGrid::project_image(int image_idx) {
+#if LFS_TENSOR_CUDA
         if (image_idx < 0 || image_idx >= num_images_) {
             throw std::out_of_range("BilateralGrid::project_image: image_idx out of range");
         }
@@ -555,6 +608,10 @@ namespace lfs::training {
             channel_sum_.ptr<float>(), shared_offset_.ptr<float>(),
             identity_mean_.ptr<float>(), mean.ptr<float>(), zeros.ptr<float>(),
             channels_, spatial, inv_n_spatial, nullptr);
+
+#else
+        throw std::runtime_error("BilateralGrid compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void BilateralGrid::project_mean(bool per_image) {

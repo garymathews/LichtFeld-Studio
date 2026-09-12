@@ -4,8 +4,12 @@
 #include "core/nn/activation_arena.hpp"
 
 #include "core/assert.hpp"
+#include "core/tensor_backend.hpp"
+#include <stdexcept>
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
-#include "internal/memory_pool.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
+#endif
 
 namespace lfs::core::nn {
     namespace {
@@ -38,6 +42,7 @@ namespace lfs::core::nn {
     }
 
     void ActivationArena::end() {
+#if LFS_TENSOR_CUDA
         if (used_ > high_water_) {
             high_water_ = used_;
         }
@@ -45,9 +50,11 @@ namespace lfs::core::nn {
             lfs::core::CudaMemoryPool::instance().trim();
             commit();
         }
+#endif
     }
 
     void ActivationArena::commit() {
+#if LFS_TENSOR_CUDA
         std::size_t bytes = align_up(high_water_ < kAlign ? kAlign : high_water_);
         void* ptr = allocate_cuda_storage(bytes, stream_);
         LFS_ASSERT_MSG(ptr != nullptr, "activation arena failed to allocate");
@@ -56,6 +63,9 @@ namespace lfs::core::nn {
         base_ = static_cast<char*>(ptr);
         cap_ = bytes;
         used_ = 0;
+#else
+        throw std::logic_error("CUDA activation arena is unavailable in this build");
+#endif
     }
 
     void* ActivationArena::try_alloc(const std::size_t bytes) {

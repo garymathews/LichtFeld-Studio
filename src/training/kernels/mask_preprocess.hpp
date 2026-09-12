@@ -4,9 +4,9 @@
 
 #pragma once
 
+#include "core/cuda_stream_fwd.hpp"
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
 
 namespace lfs::training::kernels {
 

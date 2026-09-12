@@ -2,6 +2,10 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+add_library(lfs_training_kernels STATIC kernels/depth_anchor.cpp kernels/edge_weight_cpu.cpp kernels/loss_tensor_contract.cpp kernels/mcmc_tensor.cpp)
+target_include_directories(lfs_training_kernels PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include" PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(lfs_training_kernels PUBLIC lfs_core)
+if(LFS_TENSOR_CUDA)
 # Add fastlfs backend
 add_subdirectory(rasterization/fastgs)
 
@@ -10,7 +14,6 @@ add_subdirectory(rasterization/gsplat)
 
 # LibTorch-free CUDA kernels
 set(LFS_TRAINING_KERNEL_SOURCES
-    kernels/loss_tensor_contract.cpp
     kernels/camera_loss_heatmap.cu
     kernels/ssim.cu
     kernels/l1_loss.cu
@@ -36,7 +39,7 @@ set(LFS_TRAINING_KERNEL_SOURCES
 )
 
 # Create CUDA kernels library
-add_library(lfs_training_kernels STATIC ${LFS_TRAINING_KERNEL_SOURCES})
+target_sources(lfs_training_kernels PRIVATE ${LFS_TRAINING_KERNEL_SOURCES})
 
 target_include_directories(lfs_training_kernels
     PUBLIC
@@ -75,25 +78,33 @@ if(MSVC)
     )
 endif()
 
+endif()
+
 # Shared depth-anchor fit + sidecar cache (reused by the preprocess CLI)
 add_subdirectory(depth_anchor)
 
 # Optimizer sources
 set(TRAINING_NEW_SOURCES
     optimizer/adam_optimizer.cpp
+    optimizer/adam_optimizer_vulkan.cpp
+    optimizer/joint_adam_tensor.cpp
     sh_value_codec.cpp
-    sh_value_storage.cpp
-    morton_reorder.cpp
+    $<$<BOOL:${LFS_TENSOR_CUDA}>:sh_value_storage.cpp>
+    $<$<NOT:$<BOOL:${LFS_TENSOR_CUDA}>>:sh_value_storage_vulkan.cpp>
+    $<$<BOOL:${LFS_TENSOR_CUDA}>:morton_reorder.cpp>
+    $<$<NOT:$<BOOL:${LFS_TENSOR_CUDA}>>:morton_reorder_vulkan.cpp>
     live_model_mutation_guard.cpp
     optimizer/scheduler.cpp
     losses/regularization.cpp
     losses/photometric_loss.cpp
+    losses/photometric_loss_vulkan.cpp
     losses/mask_loss.cpp
     strategies/strategy_utils.cpp
     strategies/mcmc.cpp
     strategies/mrnf.cpp
     strategies/strategy_factory.cpp
     strategies/improved_gs_plus.cpp
+    rasterization/vulkan_rasterizer.cpp
     rasterization/fast_rasterizer.cpp
     rasterization/gsplat_rasterizer.cpp
     components/config_serialization.cpp
@@ -107,10 +118,13 @@ set(TRAINING_NEW_SOURCES
     metrics/metrics.cpp
         checkpoint.cpp
         project_snapshot_chapters.cpp
-        training_snapshot_service.cpp
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:training_snapshot_service.cpp>
+        $<$<NOT:$<BOOL:${LFS_TENSOR_CUDA}>>:training_snapshot_service_vulkan.cpp>
+        training_step_regression.cpp
         progress.cpp
         training_cropbox_mask.cpp
         trainer.cpp
+        $<$<NOT:$<BOOL:${LFS_TENSOR_CUDA}>>:trainer_vulkan.cpp>
         normal_auto_generate.cpp
         vram_ledger.cpp
         perf_bench.cpp
@@ -118,7 +132,14 @@ set(TRAINING_NEW_SOURCES
 )
 
 # lfs_training - Training module with optimizer
+if(NOT LFS_TENSOR_CUDA)
+    list(FILTER TRAINING_NEW_SOURCES EXCLUDE REGEX "\\.cu$")
+    list(REMOVE_ITEM TRAINING_NEW_SOURCES
+        strategies/mrnf.cpp strategies/improved_gs_plus.cpp
+        rasterization/fast_rasterizer.cpp rasterization/gsplat_rasterizer.cpp)
+endif()
 add_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
+target_compile_definitions(lfs_training PRIVATE LFS_TENSOR_VULKAN=$<BOOL:${LFS_TENSOR_VULKAN}>)
 
 target_include_directories(lfs_training
     PUBLIC
@@ -142,13 +163,14 @@ target_include_directories(lfs_training SYSTEM PRIVATE
 # Link dependencies
 target_link_libraries(lfs_training
     PUBLIC
+        lfs_vulkan_rasterizer
         lfs_core                # Depends on new core module (SplatData, Tensor)
         lfs_diagnostics         # Live VRAM diagnostic accounting
         lfs_io                  # For CacheLoader, exporter, pipelined loader
         lfs_event_bridge        # Shared event bridge for cross-module singletons
         lfs_training_kernels    # LibTorch-free SSIM kernels
-        fastlfs_backend         # LibTorch-free FastGS rasterization and optimizer kernels
-        gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:fastlfs_backend>         # LibTorch-free FastGS rasterization and optimizer kernels
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:gsplat_backend_lfs>      # LibTorch-free gsplat rasterization backend
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
         lfs_preprocessing       # MoGe-2 normal auto-generate

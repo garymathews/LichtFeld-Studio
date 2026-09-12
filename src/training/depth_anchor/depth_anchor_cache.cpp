@@ -8,7 +8,6 @@
 #include "core/tensor.hpp"
 #include "io/atomic_output.hpp"
 
-#include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -16,6 +15,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -101,9 +101,7 @@ namespace lfs::training {
         if (!means_in.is_valid() || means_in.ndim() != 2 || means_in.shape()[0] == 0) {
             return anchors;
         }
-        const auto means = means_in.device() == lfs::core::Device::CUDA
-                               ? means_in
-                               : means_in.to(lfs::core::Device::CUDA);
+        const auto means = means_in.contiguous();
         const auto num_points = static_cast<std::size_t>(means.shape()[0]);
 
         // Robust world-space bounds of the anchor cloud: sparse reconstructions
@@ -148,18 +146,19 @@ namespace lfs::training {
         }
 
         // The per-camera GPU projection (collect) runs serially on this thread to
-        // keep all CUDA on one thread; the expensive robust affine fits are pure
+        // keep projection submissions on one thread; the expensive robust affine fits are pure
         // host work, so they drain on a worker pool in parallel and overlap the
         // next camera's depth decode.
         struct AnchorJob {
             std::string image_name;
-            std::vector<float2> samples;
+            std::vector<lfs::training::kernels::DepthAnchorSample> samples;
         };
 
         std::mutex queue_mutex;
-        std::condition_variable queue_cv;
+        std::condition_variable_any queue_cv;
         std::deque<AnchorJob> job_queue;
         bool producing = true;
+        std::exception_ptr worker_error;
 
         std::mutex results_mutex;
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
@@ -167,33 +166,43 @@ namespace lfs::training {
             hw > 1 ? hw - 1 : 1, 1, std::max<std::size_t>(cameras.size(), 1));
         const std::size_t queue_capacity = std::max<std::size_t>(worker_count * 2, 2);
 
-        const auto worker = [&]() {
-            while (true) {
-                AnchorJob job;
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex);
-                    queue_cv.wait(lock, [&] { return !job_queue.empty() || !producing; });
-                    if (job_queue.empty()) {
-                        return;
+        const auto worker = [&](std::stop_token stop) {
+            try {
+                while (true) {
+                    AnchorJob job;
+                    {
+                        std::unique_lock lock(queue_mutex);
+                        if (!queue_cv.wait(lock, stop, [&] {
+                                return !job_queue.empty() || !producing || worker_error;
+                            }) ||
+                            worker_error || job_queue.empty())
+                            return;
+                        job = std::move(job_queue.front());
+                        job_queue.pop_front();
                     }
-                    job = std::move(job_queue.front());
-                    job_queue.pop_front();
+                    queue_cv.notify_all();
+                    const auto anchor = kernels::fit_depth_anchor_from_samples(job.samples);
+                    if (anchor.disparity.valid || anchor.depth.valid) {
+                        std::lock_guard lock(results_mutex);
+                        anchors[job.image_name] = anchor;
+                    }
+                }
+            } catch (...) {
+                {
+                    std::lock_guard lock(queue_mutex);
+                    if (!worker_error)
+                        worker_error = std::current_exception();
                 }
                 queue_cv.notify_all();
-
-                const auto anchor = lfs::training::kernels::fit_depth_anchor_from_samples(job.samples);
-                if (anchor.disparity.valid || anchor.depth.valid) {
-                    std::lock_guard<std::mutex> lock(results_mutex);
-                    anchors[job.image_name] = anchor;
-                }
             }
         };
 
-        std::vector<std::thread> workers;
+        // stop-aware waits let jthread unwind safely if camera loading, progress
+        // callbacks, or creation of another worker throws before producer shutdown.
+        std::vector<std::jthread> workers;
         workers.reserve(worker_count);
-        for (std::size_t i = 0; i < worker_count; ++i) {
+        for (std::size_t i = 0; i < worker_count; ++i)
             workers.emplace_back(worker);
-        }
 
         std::size_t total_depth_cameras = 0;
         for (const auto& cam : cameras) {
@@ -230,22 +239,14 @@ namespace lfs::training {
             const float sx = static_cast<float>(prior_w) / static_cast<float>(cam->camera_width());
             const float sy = static_cast<float>(prior_h) / static_cast<float>(cam->camera_height());
 
-            // The prior's lazy ops materialize on their own stream; the collect
-            // kernel reads raw pointers, so settle the device first (startup only).
-            prior.ptr<float>();
-            cudaDeviceSynchronize();
-
             auto samples = lfs::training::kernels::collect_depth_anchor_samples(
-                means.ptr<float>(),
-                num_points,
-                cam->world_view_transform_ptr(),
+                means,
+                cam->world_view_transform(),
                 cam->focal_x() * sx,
                 cam->focal_y() * sy,
                 cam->center_x() * sx,
                 cam->center_y() * sy,
-                prior.ptr<float>(),
-                prior_w,
-                prior_h,
+                prior,
                 0.01f,
                 aabb_lo,
                 aabb_hi);
@@ -256,7 +257,9 @@ namespace lfs::training {
             }
             {
                 std::unique_lock<std::mutex> lock(queue_mutex);
-                queue_cv.wait(lock, [&] { return job_queue.size() < queue_capacity; });
+                queue_cv.wait(lock, [&] { return job_queue.size() < queue_capacity || worker_error; });
+                if (worker_error)
+                    std::rethrow_exception(worker_error);
                 job_queue.push_back({cam->image_name(), std::move(samples)});
             }
             queue_cv.notify_one();
@@ -271,6 +274,8 @@ namespace lfs::training {
             t.join();
         }
 
+        if (worker_error)
+            std::rethrow_exception(worker_error);
         return anchors;
     }
 

@@ -1,0 +1,26 @@
+uint loadByte(uint64_t address, uint64_t index)
+{
+    const uint64_t byteAddress = address + index;
+    const uint shift = uint(byteAddress & uint64_t(3)) * 8u;
+    const uint64_t wordAddress = byteAddress & ~uint64_t(3);
+    return (((Ptr<uint, Access.Read>)wordAddress)[0] >> shift) & 255u;
+}
+
+void storeByte(uint64_t address, uint64_t index, uint value)
+{
+    const uint64_t byteAddress = address + index;
+    const uint shift = uint(byteAddress & uint64_t(3)) * 8u;
+    const uint mask = 255u << shift;
+    Ptr<uint, Access.ReadWrite> word =
+        (Ptr<uint, Access.ReadWrite>)(byteAddress & ~uint64_t(3));
+    uint assumed = word[0];
+    uint observed;
+    do
+    {
+        const uint replacement = (assumed & ~mask) | ((value & 255u) << shift);
+        InterlockedCompareExchange(word[0], assumed, replacement, observed);
+        if (observed == assumed)
+            return;
+        assumed = observed;
+    } while (true);
+}

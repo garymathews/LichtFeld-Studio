@@ -4,12 +4,17 @@
 #include "selection_service.hpp"
 #include "core/camera.hpp"
 #include "core/cuda/selection_ops.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error_typed.hpp"
+#endif
 #include "core/logger.hpp"
 #include "core/services.hpp"
 #include "core/splat_data.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/cuda_event_pool.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#endif
+#include "core/tensor_backend.hpp"
 #include "gui/gui_manager.hpp"
 #include "internal/viewport.hpp"
 #include "operation/undo_entry.hpp"
@@ -28,7 +33,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <exception>
 #include <functional>
 #include <glm/geometric.hpp>
@@ -291,8 +298,15 @@ namespace lfs::vis {
             if (!source.is_valid() || !output.is_valid() || source.numel() != output.numel()) {
                 return false;
             }
+            const auto src_backend = lfs::core::gpu_backend_of(source);
+            const auto dst_backend = lfs::core::gpu_backend_of(output);
+            const bool same_backend = src_backend == dst_backend;
+
+#if LFS_TENSOR_CUDA
             if (source.device() == core::Device::CUDA &&
                 output.device() == core::Device::CUDA &&
+                same_backend &&
+                src_backend != lfs::core::GpuBackend::Vulkan &&
                 source.dtype() == output.dtype() &&
                 source.is_contiguous() &&
                 output.is_contiguous()) {
@@ -321,7 +335,15 @@ namespace lfs::vis {
                 lfs::core::bridgeStreams(source_stream, output_stream);
                 return true;
             }
-            output.copy_from(source);
+#endif
+
+            if (same_backend ||
+                source.device() == core::Device::CPU ||
+                output.device() == core::Device::CPU) {
+                output.copy_from(source);
+                return true;
+            }
+            output.copy_from(source.cpu());
             return true;
         }
 
@@ -661,7 +683,9 @@ namespace lfs::vis {
                 if (means.dtype() != core::DataType::Float32) {
                     means = means.to(core::DataType::Float32);
                 }
-                if (means.device() == core::Device::CUDA) {
+                if (means.device() == core::Device::CUDA &&
+                    lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA) &&
+                    lfs::core::gpu_backend_of(means) != lfs::core::GpuBackend::Vulkan) {
                     try {
                         if (!means.is_valid() || means.numel() == 0 ||
                             means.storage_ptr() == nullptr) {
@@ -867,6 +891,7 @@ namespace lfs::vis {
           rendering_manager_(rendering_manager) {
         assert(scene_manager_);
         assert(rendering_manager_);
+#if LFS_TENSOR_CUDA
         for (auto& pending : pending_selection_counts_) {
             if (cudaHostAlloc(reinterpret_cast<void**>(&pending.host_counts),
                               (selection::kSelectionGroupCount + 1) * sizeof(int),
@@ -881,9 +906,11 @@ namespace lfs::vis {
             cudaEventCreateWithFlags(&pending_passive_ring_count_.ready_event, cudaEventDisableTiming) != cudaSuccess) {
             throw std::runtime_error("SelectionService: failed to allocate passive ring staging");
         }
+#endif
     }
 
     SelectionService::~SelectionService() {
+#if LFS_TENSOR_CUDA
         for (auto& pending : pending_selection_counts_) {
             if (pending.ready_event) {
                 if (pending.pending) {
@@ -910,6 +937,7 @@ namespace lfs::vis {
             LFS_CUDA_LOG_TEARDOWN(cudaFreeHost(pending_passive_ring_count_.host_counts), nullptr,
                                   "passive ring teardown: free pinned counts");
         }
+#endif
     }
 
     void SelectionService::completePendingSelectionCount(
@@ -918,6 +946,7 @@ namespace lfs::vis {
             return;
         }
 
+#if LFS_TENSOR_CUDA
         const cudaError_t status = wait ? cudaEventSynchronize(pending.ready_event)
                                         : cudaEventQuery(pending.ready_event);
         if (status == cudaErrorNotReady) {
@@ -931,6 +960,7 @@ namespace lfs::vis {
             pending.undo_entry.reset();
             return;
         }
+#endif
 
         auto completed_mask = std::move(pending.mask);
         auto completed_undo_entry = std::move(pending.undo_entry);
@@ -1212,7 +1242,7 @@ namespace lfs::vis {
         const auto hovered_id = resolveCommandHoveredGaussianId(x, y, camera_index, filters);
         if (hovered_id && *hovered_id >= 0 && static_cast<size_t>(*hovered_id) < total) {
             auto& selection = resetBoolScratchBuffer(command_selection_buffer_, total);
-            rendering::set_selection_element(selection.ptr<bool>(), *hovered_id, true);
+            rendering::set_selection_element(selection, *hovered_id, true);
             return commitSelection(selection, mode, effectiveNodeMask(true), filters, "selection.ring");
         }
 
@@ -2010,7 +2040,7 @@ namespace lfs::vis {
         if (!exact_hit.has_value()) {
             const auto hovered_id = renderHoveredGaussianIdForViewerContext(*context, cursor_pos, filters);
             if (hovered_id && *hovered_id >= 0 && static_cast<size_t>(*hovered_id) < selection.numel()) {
-                rendering::set_selection_element(selection.ptr<bool>(), *hovered_id, true);
+                rendering::set_selection_element(selection, *hovered_id, true);
                 picked_ring_id = *hovered_id;
                 hit = true;
             }
@@ -2197,7 +2227,11 @@ namespace lfs::vis {
         if (selection_mask.device() == core::Device::CUDA) {
             LOG_TIMER_THRESHOLD("SelectionService::commitSelection.sync_selection_stream", 1.0);
             try {
+#if LFS_TENSOR_CUDA
                 selection_mask.sync_to_stream(core::getCurrentCUDAStream());
+#else
+                lfs::core::with_idle_vulkan_device([](const auto&) {});
+#endif
             } catch (const std::exception& e) {
                 return {false, 0, e.what()};
             }
@@ -2528,7 +2562,7 @@ namespace lfs::vis {
                 {activeSelectionGaussianCount(scene_manager_)},
                 core::Device::CUDA,
                 core::DataType::Bool);
-            rendering::set_selection_element(candidate.ptr<bool>(), hovered_id, true);
+            rendering::set_selection_element(candidate, hovered_id, true);
             applyFilters(candidate, filters, effectiveNodeMask(filters.restrict_to_selected_nodes));
             const auto candidate_value = candidate.slice(0, hovered_id, hovered_id + 1).cpu().contiguous();
             if (!candidate_value.ptr<bool>()[0]) {
@@ -2938,7 +2972,7 @@ namespace lfs::vis {
         const auto& session = interactive_selection_;
         int hovered_id = testing_hovered_gaussian_id_.value_or(-1);
         if (hovered_id >= 0 && static_cast<size_t>(hovered_id) < selection_out.numel()) {
-            rendering::set_selection_element(selection_out.ptr<bool>(), hovered_id, true);
+            rendering::set_selection_element(selection_out, hovered_id, true);
             if (picked_ring_id_out) {
                 *picked_ring_id_out = hovered_id;
             }
@@ -2968,7 +3002,7 @@ namespace lfs::vis {
             return !require_exact_ring_hit;
         }
 
-        rendering::set_selection_element(selection_out.ptr<bool>(), hovered_id, true);
+        rendering::set_selection_element(selection_out, hovered_id, true);
         if (picked_ring_id_out) {
             *picked_ring_id_out = hovered_id;
         }

@@ -2,10 +2,9 @@
 
 from collections.abc import Sequence
 import enum
-from typing import Annotated, overload
-
 import numpy
 from numpy.typing import NDArray
+from typing import Annotated, overload
 
 import lichtfeld
 

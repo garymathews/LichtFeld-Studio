@@ -1,0 +1,68 @@
+/* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
+ * SPDX-License-Identifier: GPL-3.0-or-later */
+#pragma once
+
+#include "../descriptors.hpp"
+
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <unordered_map>
+#include <vulkan/vulkan.h>
+
+namespace lfs::core::internal {
+
+    class VulkanContext;
+
+    class VulkanRecorderRegistry final {
+    public:
+        explicit VulkanRecorderRegistry(VulkanContext& context);
+        ~VulkanRecorderRegistry();
+
+        VulkanRecorderRegistry(const VulkanRecorderRegistry&) = delete;
+        VulkanRecorderRegistry& operator=(const VulkanRecorderRegistry&) = delete;
+
+        uint64_t record(std::span<const StorageRef> reads,
+                        std::span<const StorageRef> writes,
+                        const std::function<void(VkCommandBuffer)>& command,
+                        bool writes_fault = false);
+        void flush_storage(StorageRef storage);
+        uint64_t flush_current();
+        uint64_t flush_all();
+        void wait_all();
+        void check_fault_buffer();
+        void trim_memory();
+        void retire_resources(const std::function<void()>& work);
+        void run_external(const std::function<void()>& work);
+        void release_thread(uint64_t recorder_id);
+        void shutdown();
+
+
+    private:
+        struct Recorder;
+
+        Recorder& current_locked();
+        void ensure_submitted_locked(StorageRef storage);
+        uint64_t flush_through_locked(uint64_t value);
+        void submit_locked(Recorder& recorder);
+        void begin_locked(Recorder& recorder);
+        void retire_completed_locked(Recorder& recorder, uint64_t completed);
+        void collect_completed_locked(uint64_t completed);
+        static void stamp(StorageRef storage, uint64_t recorder_id, uint64_t value);
+
+        VulkanContext& context_;
+        // Lock order: VulkanMemory::staging_mutex_, mutex_, then
+        // VulkanMemory::allocations_mutex_. Allocator paths must release the
+        // allocation lock before entering this registry.
+        mutable std::mutex mutex_;
+        std::unordered_map<uint64_t, std::unique_ptr<Recorder>> recorders_;
+        uint64_t next_recorder_id_ = 1;
+        uint64_t fault_value_ = 0;
+        bool shutting_down_ = false;
+        std::exception_ptr submission_failure_;
+    };
+
+} // namespace lfs::core::internal

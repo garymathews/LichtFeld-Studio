@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/tensor_backend.hpp"
 #include "gui/async_task_manager.hpp"
 #include "core/data_loading_service.hpp"
 #include "core/error_bus.hpp"
@@ -1545,6 +1546,11 @@ namespace lfs::vis::gui {
                                             int spz_version,
                                             core::ProvenanceStamp provenance,
                                             int lod_levels, float lod_ratio, int chunk_count_k, float chunk_extent, int chunk_min_k, int kmeans_iterations) {
+        if (lfs::core::default_gpu_backend() != lfs::core::GpuBackend::CUDA &&
+            (format == ExportFormat::SOG || format == ExportFormat::SSOG || format == ExportFormat::HTML_VIEWER)) {
+            publishExportFailureState(format, path, "This export format requires CUDA. Use PLY, SPZ, USD or RAD instead.");
+            return;
+        }
         if (splats.empty()) {
             LOG_ERROR("No splat data to export");
             publishExportFailureState(format, path, LOC(lichtfeld::Strings::Runtime::NO_SPLAT_DATA));
@@ -2653,8 +2659,15 @@ namespace lfs::vis::gui {
                                  image_hwc.shape()[0], image_hwc.shape()[1], image_hwc.shape()[2]);
                     }
 
-                    const auto* const gpu_ptr = image_hwc.data_ptr();
-                    auto write_result = encoder->writeFrameGpu(gpu_ptr, width, height, nullptr);
+                    std::expected<void, std::string> write_result;
+                    if (lfs::core::gpu_backend_of(image_hwc) == lfs::core::GpuBackend::CUDA) {
+                        write_result = encoder->writeFrameGpu(image_hwc.data_ptr(), width, height, nullptr);
+                    } else {
+                        auto rgb = (image_hwc.clamp(0.0f, 1.0f) * 255.0f + 0.5f)
+                                       .to(lfs::core::DataType::UInt8).cpu().contiguous();
+                        write_result = encoder->writeFrame(
+                            std::span<const uint8_t>(rgb.ptr<uint8_t>(), rgb.numel()), width, height);
+                    }
                     if (!write_result) {
                         error_msg =
                             write_result.error();

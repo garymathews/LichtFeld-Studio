@@ -37,6 +37,7 @@ if(LFS_TENSOR_CUDA_SOURCES)
             ${CMAKE_BINARY_DIR}/include
             PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
             ${CUDAToolkit_INCLUDE_DIRS}
     )
 

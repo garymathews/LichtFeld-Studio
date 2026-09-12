@@ -677,7 +677,7 @@ namespace lfs::io::project::detail {
     }
 
     lfs::Result<void> NativeFile::sync_data() {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         return sync_all();
 #else
         if (::fdatasync(fd_) != 0) {

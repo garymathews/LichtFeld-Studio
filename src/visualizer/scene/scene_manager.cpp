@@ -45,7 +45,6 @@
 #include "window/window_manager.hpp"
 #include <algorithm>
 #include <cctype>
-#include <cuda_runtime.h>
 #include <format>
 #include <glm/gtc/quaternion.hpp>
 #include <limits>
@@ -1071,6 +1070,7 @@ namespace lfs::vis {
     }
 
     void SceneManager::loadPPISPCompanion(const std::filesystem::path& ppisp_path) {
+#if LFS_TENSOR_CUDA
         try {
             // Read header to get dimensions
             std::ifstream file;
@@ -1126,7 +1126,11 @@ namespace lfs::vis {
         } catch (const std::exception& e) {
             LOG_ERROR("Failed to load PPISP companion: {}", e.what());
         }
-    }
+
+#else
+        LOG_WARN("PPISP sidecars are unavailable on Vulkan: {}", ppisp_path.string());
+#endif
+}
 
     std::string SceneManager::attachLoadedSplatNode(const std::filesystem::path& path,
                                                     const std::string& name_hint,

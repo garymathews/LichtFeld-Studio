@@ -3,13 +3,19 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "py_tensor.hpp"
+#include "core/gpu_backend_fwd.hpp"
 #include "core/logger.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/cuda_event_pool.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#endif
 #include "python/python_runtime.hpp"
 
 #include <cstring>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <dlpack/dlpack.h>
 #include <nanobind/stl/optional.h>
 #include <sstream>
@@ -218,7 +224,14 @@ namespace lfs::python {
     }
 
     std::string PyTensor::device() const {
-        return tensor_.device() == Device::CUDA ? "cuda" : "cpu";
+        if (tensor_.device() != Device::GPU) {
+            return "cpu";
+        }
+        const auto backend = lfs::core::gpu_backend_of(tensor_);
+        if (backend == lfs::core::GpuBackend::Vulkan) {
+            return "vulkan";
+        }
+        return "cuda";
     }
 
     std::string PyTensor::dtype() const {
@@ -238,7 +251,7 @@ namespace lfs::python {
     }
 
     bool PyTensor::is_cuda() const {
-        return tensor_.device() == Device::CUDA;
+        return tensor_.is_gpu() && lfs::core::gpu_backend_of(tensor_) == lfs::core::GpuBackend::CUDA;
     }
 
     size_t PyTensor::size(int dim) const {
@@ -262,10 +275,14 @@ namespace lfs::python {
     }
 
     PyTensor PyTensor::cuda() const {
-        if (tensor_.device() == Device::CUDA) {
+        return gpu();
+    }
+
+    PyTensor PyTensor::gpu() const {
+        if (tensor_.device() == Device::GPU) {
             return PyTensor(tensor_);
         }
-        return PyTensor(tensor_.cuda());
+        return PyTensor(tensor_.gpu());
     }
 
     PyTensor PyTensor::contiguous() const {
@@ -276,9 +293,15 @@ namespace lfs::python {
     }
 
     void PyTensor::sync() const {
-        if (tensor_.device() == Device::CUDA) {
-            cudaDeviceSynchronize();
+        if (!tensor_.is_gpu())
+            return;
+        if (lfs::core::gpu_backend_of(tensor_) == lfs::core::GpuBackend::Vulkan) {
+            lfs::core::with_idle_vulkan_device([](const auto&) {});
+            return;
         }
+#if LFS_TENSOR_CUDA
+        cudaDeviceSynchronize();
+#endif
     }
 
     float PyTensor::item() const {
@@ -1345,6 +1368,8 @@ namespace lfs::python {
     }
 
     nb::tuple PyTensor::dlpack_device() const {
+        if (lfs::core::gpu_backend_of(tensor_) == lfs::core::GpuBackend::Vulkan)
+            throw std::runtime_error("Vulkan tensor DLPack export is unsupported; transfer to CPU first");
         const int32_t device_type = tensor_.device() == Device::CUDA ? kDLCUDA : kDLCPU;
         return nb::make_tuple(device_type, 0);
     }
@@ -1354,6 +1379,7 @@ namespace lfs::python {
         constexpr int64_t kDLPackLegacyDefault = 1;
         constexpr int64_t kDLPackPerThreadDefault = 2;
 
+#if LFS_TENSOR_CUDA
         cudaStream_t dlpack_stream_to_cuda(int64_t s) {
             switch (s) {
             case 0:
@@ -1371,6 +1397,7 @@ namespace lfs::python {
             return v == 0 ? kDLPackLegacyDefault : static_cast<int64_t>(v);
         }
 
+#endif
         // Query __dlpack_device__ so CPU producers (e.g. NumPy) are not
         // given a CUDA stream. Matches from_dl_device for CUDA types.
         bool dlpack_producer_is_cuda_ordered(const nb::object& obj) {
@@ -1410,6 +1437,10 @@ namespace lfs::python {
     } // namespace
 
     nb::capsule PyTensor::dlpack(nb::object stream) const {
+        if (lfs::core::gpu_backend_of(tensor_) == lfs::core::GpuBackend::Vulkan)
+            throw std::runtime_error("Vulkan tensor DLPack export is unsupported; transfer to CPU first");
+
+#if LFS_TENSOR_CUDA
         if (tensor_.device() == Device::CUDA) {
             const cudaStream_t home = tensor_.stream();
             if (stream.is_none()) {
@@ -1421,6 +1452,7 @@ namespace lfs::python {
                 }
             }
         }
+#endif
 
         auto* ctx = new DLPackContext(tensor_);
         auto* managed = new DLManagedTensor{};
@@ -1452,6 +1484,7 @@ namespace lfs::python {
         if (nb::hasattr(obj, "__dlpack__")) {
             nb::object dlpack_fn = obj.attr("__dlpack__");
             if (dlpack_producer_is_cuda_ordered(obj)) {
+#if LFS_TENSOR_CUDA
                 const int64_t consumer = cuda_stream_to_dlpack(lfs::core::getCurrentCUDAStream());
                 try {
                     capsule = nb::cast<nb::capsule>(dlpack_fn(nb::arg("stream") = consumer));
@@ -1465,6 +1498,10 @@ namespace lfs::python {
                         throw;
                     capsule = nb::cast<nb::capsule>(dlpack_fn());
                 }
+
+#else
+                throw std::runtime_error("CUDA DLPack import is unavailable on Vulkan; transfer the source to CPU first");
+#endif
             } else {
                 capsule = nb::cast<nb::capsule>(dlpack_fn());
             }
@@ -1494,6 +1531,10 @@ namespace lfs::python {
                 "call .contiguous() on the source first");
         }
 
+        if ((dl.device.device_type == kDLCUDA || dl.device.device_type == kDLCUDAManaged) &&
+            lfs::core::default_gpu_backend() != lfs::core::GpuBackend::CUDA)
+            throw std::runtime_error("CUDA DLPack storage cannot be imported into the Vulkan tensor backend");
+
         // "Consume" the capsule per DLPack spec:
         // 1. Rename to "used_dltensor" so producer knows we took ownership
         // 2. Disable the capsule's destructor - we'll call the deleter ourselves
@@ -1512,12 +1553,15 @@ namespace lfs::python {
         const DataType dtype = from_dl_dtype(dl.dtype);
 
         Tensor tensor(data, TensorShape(shape_vec), device, dtype);
+
+#if LFS_TENSOR_CUDA
         if (stream_handshake && device == Device::CUDA) {
             // The producer ordered the data onto our current stream via the
             // __dlpack__(stream=) handshake; home the tensor there so a later
             // cross-stream op bridges from the consumer stream, not legacy.
             tensor.set_stream(lfs::core::getCurrentCUDAStream());
         }
+#endif
 
         // Store the DLManagedTensor with a custom deleter that calls the DLPack deleter
         auto result = PyTensor(std::move(tensor), false);
@@ -1533,8 +1577,10 @@ namespace lfs::python {
 
     namespace {
         Device parse_device(const std::string& device) {
+            if (device == "vulkan" && lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan)
+                return Device::GPU;
             if (device == "cuda" || device == "gpu")
-                return Device::CUDA;
+                return Device::GPU;
             if (device == "cpu")
                 return Device::CPU;
             throw std::runtime_error("Unknown device: " + device);
@@ -1597,7 +1643,7 @@ namespace lfs::python {
                               const std::string& device,
                               const std::string& dtype) {
         auto t = Tensor::arange(start, end, step);
-        if (device != "cuda") {
+        if (device != "cuda" && device != "gpu") {
             t = t.to(parse_device(device));
         }
         if (dtype != "float32") {
@@ -1716,7 +1762,10 @@ namespace lfs::python {
             .def_prop_ro("shape", &PyTensor::shape, "Tensor shape as tuple")
             .def_prop_ro("ndim", &PyTensor::ndim, "Number of dimensions")
             .def_prop_ro("numel", &PyTensor::numel, "Total number of elements")
-            .def_prop_ro("device", &PyTensor::device, "Device: 'cpu' or 'cuda'")
+            .def_prop_ro("device", &PyTensor::device,
+                         "Device: 'cpu', 'cuda', or 'vulkan', matching the tensor's storage backend")
+            .def_prop_ro("backend", &PyTensor::device,
+                         "Backend: 'cpu' for CPU tensors, 'cuda' or 'vulkan' for GPU tensors")
             .def_prop_ro("dtype", &PyTensor::dtype, "Data type")
             .def_prop_ro("is_contiguous", &PyTensor::is_contiguous, "Whether memory is contiguous")
             .def_prop_ro("is_cuda", &PyTensor::is_cuda, "Whether tensor is on CUDA")
@@ -1725,6 +1774,7 @@ namespace lfs::python {
             .def("clone", &PyTensor::clone, "Deep copy of tensor")
             .def("cpu", &PyTensor::cpu, "Move tensor to CPU")
             .def("cuda", &PyTensor::cuda, "Move tensor to CUDA")
+            .def("gpu", &PyTensor::gpu, "Move tensor to GPU")
             .def("contiguous", &PyTensor::contiguous, "Make tensor contiguous")
             .def("sync", &PyTensor::sync, "Synchronize CUDA stream")
             .def("size", &PyTensor::size, nb::arg("dim"), "Size of dimension")

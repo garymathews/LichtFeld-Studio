@@ -8,7 +8,7 @@ add_library(lfs_vulkan_rasterizer STATIC
         src/gs_pipeline.cpp
         src/gs_renderer.cpp
         src/perf_timer.cpp
-        src/vma_implementation.cpp
+        $<$<NOT:$<BOOL:${LFS_TENSOR_VULKAN}>>:src/vma_implementation.cpp>
         # Phase 7A: shared bounded-wait + SubmissionState + VulkanDispatch seam.
         # Lives under src/rendering/ so visualizer and tests include it without
         # depending on the visualizer module.
@@ -18,6 +18,7 @@ add_library(lfs_vulkan_rasterizer STATIC
 target_include_directories(lfs_vulkan_rasterizer
         PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/core/include>
@@ -179,7 +180,12 @@ function(_vulkan_add_glsl_shader OUT_NAME SRC_FILE)
         set(VULKAN_RASTERIZER_SHADER_OUTPUTS ${VULKAN_RASTERIZER_SHADER_OUTPUTS} ${_out} PARENT_SCOPE)
 endfunction()
 
-# Forward path only: trainer / backward shaders are not compiled here.
+# The fp32 projection derivative is built alongside the forward path.
+_vulkan_add_slang_shader(projection_backward vertex_shader.slang EXPORT_MODE=1)
+_vulkan_add_slang_shader(rasterize_backward alphablend_shader.slang
+        EXPORT_MODE=1 BACKWARD_MODE=0 USE_EMULATED_F32_ATOMIC=1)
+_vulkan_add_slang_shader(rasterize_backward_mcmc alphablend_shader.slang
+        EXPORT_MODE=1 BACKWARD_MODE=0 USE_EMULATED_F32_ATOMIC=1 DENSIFICATION_MCMC=1)
 
 # cumsum.slang → 4 phases
 _vulkan_add_slang_shader(cumsum_block_scan         cumsum.slang CUMSUM_PHASE=1)
@@ -276,3 +282,12 @@ _vulkan_add_glsl_shader(downsweep_indirect  downsweep.comp)
 
 add_custom_target(lfs_vulkan_rasterizer_shaders DEPENDS ${VULKAN_RASTERIZER_SHADER_OUTPUTS})
 add_dependencies(lfs_vulkan_rasterizer lfs_vulkan_rasterizer_shaders)
+
+# Derive runtime completeness checks from the same shader output list as the build.
+set(_lfs_shader_manifest "#pragma once\n#include <array>\n#include <string_view>\nnamespace lfs::rendering::vulkan { inline constexpr auto required_shaders = std::to_array<std::string_view>({\n")
+foreach(_shader IN LISTS VULKAN_RASTERIZER_SHADER_OUTPUTS)
+    file(RELATIVE_PATH _relative "${LFS_VULKAN_RASTERIZER_SPV_DIR}" "${_shader}")
+    string(APPEND _lfs_shader_manifest "\"${_relative}\",\n")
+endforeach()
+string(APPEND _lfs_shader_manifest "}); }\n")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shader_manifest.hpp" CONTENT "${_lfs_shader_manifest}")

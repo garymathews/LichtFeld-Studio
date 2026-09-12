@@ -15,13 +15,15 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_cuda.h>
+
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <stb_image_write.h>
 
 #include <nlohmann/json.hpp>
@@ -49,6 +51,7 @@ namespace lfs::io {
         // HEVC decoding than the latency-sensitive preview path.
         constexpr int MAX_SW_DECODE_THREADS = 8;
 
+#if LFS_TENSOR_CUDA
         void requireCudaSuccess(const cudaError_t result, const char* const operation) {
             if (result != cudaSuccess) {
                 throw std::runtime_error(std::string(operation) + ": " +
@@ -67,6 +70,7 @@ namespace lfs::io {
             buffer = nullptr;
         }
 
+#endif
         [[nodiscard]] double elapsedSeconds(const std::chrono::steady_clock::time_point started) {
             return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         }
@@ -786,7 +790,9 @@ namespace lfs::io {
             uint8_t* gpu_rotated_buffer = nullptr;
             uint8_t* cpu_contiguous_buffer = nullptr;
             std::vector<uint8_t> rot_buf;
+#if LFS_TENSOR_CUDA
             std::unique_ptr<NvCodecImageLoader> nvcodec;
+#endif
             bool using_hw_decode = false;
 
             try {
@@ -875,7 +881,7 @@ namespace lfs::io {
                 }
 
                 // Decode Dolby Vision in software to preserve per-frame RPU metadata.
-                const char* hw_decoder_name = dv_profile > 0 ? nullptr : get_hw_decoder_name(codec_id);
+                const char* hw_decoder_name = (LFS_TENSOR_CUDA && dv_profile == 0) ? get_hw_decoder_name(codec_id) : nullptr;
                 const AVCodec* codec = nullptr;
 
                 if (hw_decoder_name) {
@@ -1131,6 +1137,7 @@ namespace lfs::io {
                     params.format == ImageFormat::JPG && NvCodecImageLoader::is_available();
                 std::size_t jpeg_batch_size = 0;
 
+#if LFS_TENSOR_CUDA
                 if (use_gpu_jpeg) {
                     std::size_t cuda_free_bytes = 0;
                     std::size_t cuda_total_bytes = 0;
@@ -1218,6 +1225,7 @@ namespace lfs::io {
                     }
                 }
 
+#endif
                 const bool gpu_encoding_enabled = use_gpu_jpeg && gpu_batch_buffer != nullptr;
                 const bool full_gpu_pipeline_available =
                     using_hw_decode && gpu_encoding_enabled && gpu_rgb_buffer && !needs_scale &&
@@ -1366,6 +1374,7 @@ namespace lfs::io {
                              frame_selection_reason, video_fps, target_fps, estimated_total, total_frames);
                 }
 
+#if LFS_TENSOR_CUDA
                 auto flush_jpeg_batch = [&]() {
                     if (batch_gpu_ptrs.empty())
                         return;
@@ -1408,6 +1417,7 @@ namespace lfs::io {
                     batch_idx = 0;
                     throw_if_cancelled();
                 };
+#endif
 
                 auto generate_filename = [&](int frame_num) {
                     std::string ext = params.format == ImageFormat::PNG ? ".png" : ".jpg";
@@ -1539,6 +1549,7 @@ namespace lfs::io {
                         logged_hw_format_fallback = true;
                     }
 
+#if LFS_TENSOR_CUDA
                     if (use_full_gpu_pipeline) {
                         const uint8_t* y_plane = hw_frame->data[0];
                         const uint8_t* uv_plane = hw_frame->data[1];
@@ -1618,7 +1629,9 @@ namespace lfs::io {
                         if (batch_idx >= jpeg_batch_size) {
                             flush_jpeg_batch();
                         }
-                    } else {
+                    } else
+#endif
+                    {
                         av_frame_unref(sw_frame);
                         const int transfer_result =
                             av_hwframe_transfer_data(sw_frame, hw_frame, 0);
@@ -1705,6 +1718,7 @@ namespace lfs::io {
                         }
                         // --- End rotation ---
 
+#if LFS_TENSOR_CUDA
                         if (gpu_encoding_enabled) {
                             if (batch_encode_w == 0) {
                                 batch_encode_w = (hw_rot_w > 0) ? hw_rot_w : out_width;
@@ -1726,9 +1740,11 @@ namespace lfs::io {
                             if (batch_idx >= jpeg_batch_size) {
                                 flush_jpeg_batch();
                             }
-                        } else if (write_image_file(filename, hw_rot_w, hw_rot_h,
-                                                    cpu_contiguous_buffer, params.format,
-                                                    params.jpg_quality)) {
+                        } else
+#endif
+                            if (write_image_file(filename, hw_rot_w, hw_rot_h,
+                                                 cpu_contiguous_buffer, params.format,
+                                                 params.jpg_quality)) {
                             ++written_count;
                             if (params.generate_metadata) {
                                 saved_frames.push_back({lfs::core::path_to_utf8(filename.filename()),
@@ -1825,6 +1841,7 @@ namespace lfs::io {
                     }
                     // --- End rotation ---
 
+#if LFS_TENSOR_CUDA
                     if (gpu_encoding_enabled) {
                         if (batch_encode_w == 0) {
                             batch_encode_w = (sw_rot_w > 0) ? sw_rot_w : out_width;
@@ -1846,9 +1863,11 @@ namespace lfs::io {
                         if (batch_idx >= jpeg_batch_size) {
                             flush_jpeg_batch();
                         }
-                    } else if (write_image_file(filename, sw_rot_w, sw_rot_h,
-                                                cpu_contiguous_buffer, params.format,
-                                                params.jpg_quality)) {
+                    } else
+#endif
+                        if (write_image_file(filename, sw_rot_w, sw_rot_h,
+                                             cpu_contiguous_buffer, params.format,
+                                             params.jpg_quality)) {
                         ++written_count;
                         if (params.generate_metadata) {
                             saved_frames.push_back({lfs::core::path_to_utf8(filename.filename()),
@@ -2108,7 +2127,9 @@ namespace lfs::io {
                 }
 
                 if (gpu_encoding_enabled) {
+#if LFS_TENSOR_CUDA
                     flush_jpeg_batch();
+#endif
                 }
 
                 // Flush remaining window candidates at end of video
@@ -2327,9 +2348,11 @@ namespace lfs::io {
                     av_buffer_unref(&hw_device_ctx);
                 avformat_close_input(&fmt_ctx);
                 delete[] cpu_contiguous_buffer;
+#if LFS_TENSOR_CUDA
                 freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
                 freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
                 freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
+#endif
 
                 return true;
 
@@ -2351,9 +2374,11 @@ namespace lfs::io {
                 if (fmt_ctx)
                     avformat_close_input(&fmt_ctx);
                 delete[] cpu_contiguous_buffer;
+#if LFS_TENSOR_CUDA
                 freeCudaBuffer(gpu_rgb_buffer, "CUDA RGB buffer");
                 freeCudaBuffer(gpu_batch_buffer, "CUDA JPEG batch buffer");
                 freeCudaBuffer(gpu_rotated_buffer, "CUDA rotation buffer");
+#endif
 
                 error = e.what();
                 return false;

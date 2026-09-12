@@ -13,6 +13,13 @@
 #include <thread>
 #include <vector>
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/processor_info.h>
+#include <sys/resource.h>
+#include <sys/sysctl.h>
+#endif
+
 #ifdef _WIN32
 // clang-format off: windows.h must precede psapi.h.
 #include <windows.h>
@@ -41,7 +48,66 @@ namespace lfs::core::host_metrics {
 
         thread_local Previous previous;
 
-#ifndef _WIN32
+#if defined(__APPLE__)
+        bool read_cpu(std::uint64_t& process_ticks,
+                      CpuState& sys_ticks,
+                      std::vector<CpuState>& cores) {
+            rusage usage{};
+            if (getrusage(RUSAGE_SELF, &usage) != 0)
+                return false;
+            const auto micros = static_cast<std::uint64_t>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000000u +
+                                usage.ru_utime.tv_usec + usage.ru_stime.tv_usec;
+            process_ticks = micros * static_cast<std::uint64_t>(sysconf(_SC_CLK_TCK)) / 1000000u;
+            natural_t count = 0;
+            processor_info_array_t data = nullptr;
+            mach_msg_type_number_t words = 0;
+            const auto host = mach_host_self();
+            const auto status = host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &count, &data, &words);
+            mach_port_deallocate(mach_task_self(), host);
+            if (status != KERN_SUCCESS)
+                return false;
+            const auto* loads = reinterpret_cast<processor_cpu_load_info_t>(data);
+            cores.resize(count);
+            for (natural_t i = 0; i < count; ++i) {
+                auto& core = cores[i];
+                core.idle = loads[i].cpu_ticks[CPU_STATE_IDLE];
+                core.total = core.idle + loads[i].cpu_ticks[CPU_STATE_USER] +
+                             loads[i].cpu_ticks[CPU_STATE_SYSTEM] + loads[i].cpu_ticks[CPU_STATE_NICE];
+                sys_ticks.idle += core.idle;
+                sys_ticks.total += core.total;
+            }
+            vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(data), words * sizeof(integer_t));
+            return sys_ticks.total != 0;
+        }
+
+        void read_memory(Sample& result) {
+            mach_task_basic_info_data_t task{};
+            mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+            if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                          reinterpret_cast<task_info_t>(&task), &count) == KERN_SUCCESS)
+                result.process_rss_bytes = task.resident_size;
+            std::uint64_t total = 0;
+            size_t size = sizeof(total);
+            if (sysctlbyname("hw.memsize", &total, &size, nullptr, 0) != 0)
+                return;
+            vm_statistics64_data_t memory{};
+            count = HOST_VM_INFO64_COUNT;
+            vm_size_t page_size = 0;
+            const auto host = mach_host_self();
+            const auto status = host_statistics64(host, HOST_VM_INFO64,
+                                                   reinterpret_cast<host_info64_t>(&memory), &count);
+            const auto page_status = host_page_size(host, &page_size);
+            mach_port_deallocate(mach_task_self(), host);
+            if (status != KERN_SUCCESS || page_status != KERN_SUCCESS)
+                return;
+            // Free plus inactive pages are an estimate of reclaimable RAM,
+            // not a promise that the GPU can allocate this many bytes.
+            const auto available = (static_cast<std::uint64_t>(memory.free_count) + memory.inactive_count) * page_size;
+            result.system_total_bytes = total;
+            result.system_used_bytes = total - std::min(total, available);
+            result.ram_valid = true;
+        }
+#elif !defined(_WIN32)
         std::uint64_t parse_u64(const std::string& value) {
             try {
                 return static_cast<std::uint64_t>(std::stoull(value));

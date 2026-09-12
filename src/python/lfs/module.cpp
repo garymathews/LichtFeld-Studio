@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "preferences.hpp"
+#include <core/tensor_backend.hpp>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
@@ -2589,6 +2590,9 @@ NB_MODULE(lichtfeld, m) {
             return wm ? wm->isFullscreen() : false;
         },
         "Check if the window is in fullscreen mode");
+    m.def("get_gpu_backend", []() {
+        return lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan ? "vulkan" : "cuda";
+    }, "Return the active tensor GPU backend (cuda or vulkan)");
     m.def(
         "get_vulkan_capabilities", []() {
             nb::dict capabilities;

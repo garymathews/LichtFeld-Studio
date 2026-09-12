@@ -27,7 +27,7 @@ namespace lfs::training {
         void update(int current_iteration, float loss, int splat_count, Phase phase = Phase::Train);
         void pause();
         void resume(int current_iteration, float loss, int splat_count, Phase phase = Phase::Train);
-        void complete(bool user_stopped = false, int actual_iterations = -1);
+        void complete(bool user_stopped = false, int actual_iterations = -1, bool failed = false);
         void print_final_summary(int final_splats, int actual_iterations = -1,
                                  bool user_stopped = false);
 

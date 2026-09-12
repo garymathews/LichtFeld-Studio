@@ -461,6 +461,7 @@ void unwrap_image_points_x(inout float2 image_points[7], Camera cam) {
 }
 
 [ForceInline]
+[Differentiable]
 float3 safe_normalize(float3 v) {
     float l2 = dot(v, v);
     return l2 > 0.0f ? v * rsqrt(l2) : v;
@@ -526,6 +527,7 @@ float3 camera_origin_ws(Camera cam) {
 }
 
 [ForceInline]
+[Differentiable]
 float3 view_direction_to_point(float3 world_point, Camera cam) {
     float4x3 world_view_t = transpose(cam.world_view_transform);
     float3x3 view_to_world_rotation = float3x3(world_view_t);
@@ -540,10 +542,10 @@ float3 view_direction_to_point(float3 world_point, Camera cam) {
 // eigenvalues so the splat extent never exceeds MAX_PIXEL_RADIUS. Without
 // this, splats viewed at oblique angles can collapse into needle-like spikes
 // that streak across many tiles.
-// Forward-only (not [Differentiable]); the backward path reconstructs cov
-// from buffers and uses analytic gradients.
+// Shared by forward projection and its generated reverse derivative.
 static const float MAX_PIXEL_RADIUS = 512.0f;
 
+[Differentiable]
 float3 clamp_covariance_2d_extent(float3 cov_vs, float opacity_after_compensation) {
     const float opac_safe = max(opacity_after_compensation, ALPHA_THRESHOLD + 1e-8f);
     const float power_threshold = max(MAX_POWER_THRESHOLD, log(opac_safe / ALPHA_THRESHOLD));
@@ -1075,30 +1077,9 @@ static const uint SELECTION_SELECTED_HOVER_COLOR_INDEX = 257;
 static const float SELECTION_PREVIEW_BLEND = 0.9f;
 static const float SELECTION_COMMITTED_BLEND = 0.8f;
 
-static const uint OVERLAY_PARAM_CROP_FLAGS = 0;
-static const uint OVERLAY_PARAM_CROP_MIN = 1;
-static const uint OVERLAY_PARAM_CROP_MAX = 2;
-static const uint OVERLAY_PARAM_CROP_TRANSFORM = 3;
-static const uint OVERLAY_PARAM_ELLIPSOID_FLAGS = 7;
-static const uint OVERLAY_PARAM_ELLIPSOID_RADII = 8;
-static const uint OVERLAY_PARAM_ELLIPSOID_TRANSFORM = 9;
-static const uint OVERLAY_PARAM_VIEW_FLAGS = 13;
-static const uint OVERLAY_PARAM_VIEW_MIN = 14;
-static const uint OVERLAY_PARAM_VIEW_MAX = 15;
-static const uint OVERLAY_PARAM_VIEW_TRANSFORM = 16;
-static const uint OVERLAY_PARAM_EMPHASIS_FLAGS = 20;
-static const uint OVERLAY_PARAM_CURSOR_FLAGS = 21;
-static const uint OVERLAY_PARAM_MARKER_FLAGS = 22;
-static const uint OVERLAY_PARAM_SELECTION_CURSOR = 23;
-static const uint OVERLAY_PARAM_SELECTION_FLAGS = 24;
-static const uint OVERLAY_PARAM_VISIBILITY_FLAGS = 25;
-static const uint OVERLAY_PARAM_CROP_EXTRA_BASE = 26;
-static const uint OVERLAY_PARAM_CROP_STRIDE = 7;
-static const uint OVERLAY_PARAM_CROP_EXTRA_COUNT = 15;
-static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE = OVERLAY_PARAM_CROP_EXTRA_BASE + OVERLAY_PARAM_CROP_STRIDE * OVERLAY_PARAM_CROP_EXTRA_COUNT;
-static const uint OVERLAY_PARAM_ELLIPSOID_STRIDE = 5;
-static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT = 15;
-static const uint OVERLAY_PARAM_COUNT = OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE + OVERLAY_PARAM_ELLIPSOID_STRIDE * OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT;
+#define LFS_OVERLAY_PARAM(host, shader, value) static const uint shader = value;
+#include "overlay_layout.inc"
+#undef LFS_OVERLAY_PARAM
 
 [ForceInline]
 bool overlay_enabled(float value)

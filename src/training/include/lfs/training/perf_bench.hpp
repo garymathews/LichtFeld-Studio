@@ -20,7 +20,7 @@
 
 #include "diagnostics/vram_profiler.hpp"
 
-#include <cuda_runtime_api.h>
+#include "core/cuda_stream_fwd.hpp"
 
 #include <cstdint>
 #include <filesystem>

@@ -16,10 +16,9 @@ target_include_directories(lfs_diagnostics
         ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-target_link_libraries(lfs_diagnostics
-    PUBLIC
-        CUDA::cudart
-)
+if(LFS_TENSOR_CUDA)
+    target_link_libraries(lfs_diagnostics PUBLIC CUDA::cudart)
+endif()
 
 target_compile_features(lfs_diagnostics PUBLIC cxx_std_23)
 

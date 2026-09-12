@@ -46,26 +46,6 @@ struct Gaussian_3D : IDifferentiable
     float opacities;
 };
 
-Gaussian_3D load_gaussian(
-    int32_t g_idx,
-    StructuredBuffer<float> xyz_ws,
-    StructuredBuffer<float4> sh_coeffs,
-    StructuredBuffer<float4> rotations,
-    StructuredBuffer<float4> scales_opacs,
-    uint active_sh
-) {
-    float3 g_xyz_ws = read_t3_float3(g_idx, xyz_ws);
-
-    SpherHarmCoeffs g_sh_coeffs = read_spherical_harmonics_coeffs(g_idx, sh_coeffs, active_sh);
-
-    float4 g_rotations = rotations[g_idx];
-    float4 g_scales_opacs = scales_opacs[g_idx];
-    float3 g_scales = g_scales_opacs.xyz;
-    float g_opacities = g_scales_opacs.w;
-
-    return { g_xyz_ws, g_sh_coeffs, g_rotations, g_scales, g_opacities };
-}
-
 Gaussian_3D load_gaussian_split(
     int32_t g_idx,
     StructuredBuffer<float> xyz_ws,
@@ -167,16 +147,6 @@ Gaussian_3D load_gaussian_split_quant(
 }
 
 [ForceInline]
-Gaussian_3D load_zero_gaussian() {
-    float3 g_xyz_ws = float3(0);
-    float4 g_rotations = float4(1, 0, 0, 0);
-    float3 g_scales = float3(1, 1, 1);
-    float g_opacities = 0.0;
-    float3 z = float3(0);
-    SpherHarmCoeffs g_sh_coeffs = { z, z,z,z, z,z,z,z,z, z,z,z,z,z,z,z };
-    return { g_xyz_ws, g_sh_coeffs, g_rotations, g_scales, g_opacities };
-}
-
 [ForceInline]
 float3 lod_debug_color(uint lod_level) {
     const uint palette_index = lod_level % 5u;
@@ -398,28 +368,29 @@ bool splat_center_potentially_visible_gut(float3 mean_ws, Camera cam) {
 }
 
 [Differentiable]
-Splat_2D_Vertex project_gaussian_to_camera(Gaussian_3D g, Camera cam, uint active_sh) {
+Splat_2D_Vertex project_gaussian_to_camera(Gaussian_3D g, Camera cam, uint active_sh,
+    no_diff bool mip_filter, no_diff bool spark_rad_opacity_path) {
     float3 xyz_vs = project_point(g.xyz_ws, cam);
-    if (xyz_vs.z <= NEAR_CLIP) {
+    if (xyz_vs.z <= NEAR_CLIP ||
+        !isfinite(dot(xyz_vs, xyz_vs)) ||
+        !image_point_in_image_bounds_margin(xyz_vs.xy, cam, 0.2f)) {
         return { float3(0.0), float3(0.0), float3(0.0), float4(0.0), 0.0 };
     }
     xyz_vs.xy -= 0.5;  // pixel offset
 
-    float4x3 mat = transpose(cam.world_view_transform);
-    float3 cam_pos = -mul(float3x3(mat), mat[3]);
-    float3 dir = float3(normalize(g.xyz_ws - cam_pos));
+    float3 dir = view_direction_to_point(g.xyz_ws, cam);
     float3 rgb = compute_color_from_sh_coeffs(g.sh_coeffs, dir, active_sh);
 
     float3x3 cov_ws = get_covariance_from_quat_scales(
         safe_quat_normalize(g.rotations), g.scales
     );
-    float4 cov_vs = covariance_3d_to_2d(cam, g.xyz_ws, cov_ws, false, false);
-
-    float det = compute_det(cov_vs.xyz);
-    float3 inv_cov_vs = compute_inverse(cov_vs.xyz);
+    float4 cov_vs = covariance_3d_to_2d(cam, g.xyz_ws, cov_ws, mip_filter, spark_rad_opacity_path);
     float opac = g.opacities * cov_vs.w;
+    float3 cov_projected = clamp_covariance_2d_extent(cov_vs.xyz, opac);
+    float det = compute_det(cov_projected);
+    float3 inv_cov_vs = compute_inverse(cov_projected);
 
-    return { xyz_vs, rgb, cov_vs.xyz, float4(inv_cov_vs, opac), det };
+    return { xyz_vs, rgb, cov_projected, float4(inv_cov_vs, opac), det };
 }
 
 Splat_2D_Vertex project_gaussian_to_camera_model(
@@ -432,6 +403,9 @@ Splat_2D_Vertex project_gaussian_to_camera_model(
     bool model_transform_enabled,
     bool mip_filter,
     bool spark_rad_opacity_path) {
+    // Training and the untransformed viewer share the exact projection.
+    if (!model_transform_enabled)
+        return project_gaussian_to_camera(g, cam, active_sh, mip_filter, spark_rad_opacity_path);
     float3 xyz_vs = project_point(mean_ws, cam);
     // Reject behind-camera, non-finite, and far off-screen means. The EWA
     // projection Jacobian degenerates as the mean moves outside the frustum
@@ -633,8 +607,6 @@ rectangle get_wrapped_rectangle_tile_space(
 }
 
 
-// #define EARLY_RETURN_ON_ZERO_GRAD 0
-#define EARLY_RETURN_ON_ZERO_GRAD 0
 
 
 #ifndef NO_MAIN
@@ -759,29 +731,23 @@ void clear_forward_projection_output(uint out_idx, uint overlay_flags, uint lod_
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 
-// Input buffers
-layout(binding=0) StructuredBuffer<float> xyz_ws;  // 3
-layout(binding=1) StructuredBuffer<float4> sh_coeffs;  // 16*3
-layout(binding=2) StructuredBuffer<float4> rotations;  // 4
-layout(binding=3) StructuredBuffer<float4> scales_opacs;  // 4
-
-layout(binding=4) StructuredBuffer<int> out_tiles_touched;
-
-layout(binding=5) StructuredBuffer<float2> v_output_xy_vs;
-// layout(binding=6) StructuredBuffer<float> v_output_depths;
-layout(binding=7) StructuredBuffer<float4> v_output_inv_cov_vs;
-layout(binding=8) StructuredBuffer<float> v_output_rgb;
-
-// Output buffers
-layout(binding=9) RWStructuredBuffer<float> v_xyz_ws;  // 3
-layout(binding=10) RWStructuredBuffer<float4> v_sh_coeffs;  // 16*3
-layout(binding=11) RWStructuredBuffer<float4> v_rotations;  // 4
-layout(binding=12) RWStructuredBuffer<float4> v_scales_opacs;  // 4
-
-[ForceInline]
-void write_v_xyz_ws(uint32_t g_idx, float3 value) {
-    write_t3_float3(value, g_idx, v_xyz_ws);
-}
+// Training uses the same fp32 split parameter layout as forward projection.
+layout(binding=0) StructuredBuffer<float> xyz_ws;
+layout(binding=1) StructuredBuffer<float> sh0;
+layout(binding=2) StructuredBuffer<float4> shN;
+layout(binding=3) StructuredBuffer<float4> rotations;
+layout(binding=4) StructuredBuffer<float> scaling_raw;
+layout(binding=5) StructuredBuffer<float> opacity_raw;
+layout(binding=6) StructuredBuffer<int> out_tiles_touched;
+layout(binding=7) StructuredBuffer<float2> v_output_xy_vs;
+layout(binding=8) StructuredBuffer<float4> v_output_inv_cov_vs;
+layout(binding=9) StructuredBuffer<float> v_output_rgb;
+layout(binding=10) RWStructuredBuffer<float> v_xyz_ws;
+layout(binding=11) RWStructuredBuffer<float> v_sh0;
+layout(binding=12) RWStructuredBuffer<float4> v_shN;
+layout(binding=13) RWStructuredBuffer<float4> v_rotations;
+layout(binding=14) RWStructuredBuffer<float> v_scaling_raw;
+layout(binding=15) RWStructuredBuffer<float> v_opacity_raw;
 
 #endif  // EXPORT_MODE == EXPORT_MODE_VULKAN_XWARD
 
@@ -822,6 +788,7 @@ void main(
         return;
 #endif
 
+  #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
     // LOD indirection
     const bool lod_active = (uniforms.lod_enabled & 1u) != 0u;
     uint logical_idx = g_idx;
@@ -847,28 +814,11 @@ void main(
             : g_idx;
     }
 
+  #endif  // Forward-only LOD indirection
+
   #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
-    // no overlap
-    bool is_zero_grad = (out_tiles_touched[g_idx] == 0);
-  #if EARLY_RETURN_ON_ZERO_GRAD
-    // set gradient to zero and early return
-    if (is_zero_grad) {
-        write_v_xyz_ws(g_idx, float3(0.0));
-        #if SH_REORDER_SIZE <= 1
-          for (int i = 0; i < 12; i++)
-              v_sh_coeffs[12*g_idx+i] = float4(0.0);
-        #else
-          uint32_t base = (g_idx/SH_REORDER_SIZE) * (12*SH_REORDER_SIZE);
-          uint32_t offset = g_idx%SH_REORDER_SIZE;
-          for (int i = 0; i < 12; i++)
-              v_sh_coeffs[base+SH_REORDER_SIZE*i+offset] = float4(0.0);
-        #endif  // SH_REORDER_SIZE
-        v_rotations[g_idx] = float4(0.0);
-        v_scales_opacs[g_idx] = float4(0.0);
-        return;
-    }
-  #endif  // EARLY_RETURN_ON_ZERO_GRAD
-  #endif  // EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
+    const bool is_zero_grad = out_tiles_touched[g_idx] == 0;
+  #endif
 
     // load stuff
     Camera cam = no_diff load_camera(world_view_transform,
@@ -915,16 +865,10 @@ void main(
         gauss.opacities *= clamp(lod_weights[render_idx], 0.0f, 1.0f);
     }
   #else
-    #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD && !EARLY_RETURN_ON_ZERO_GRAD
-    Gaussian_3D gauss = load_zero_gaussian();
-    if (!is_zero_grad) gauss = load_gaussian(
-    #else
-    Gaussian_3D gauss = load_gaussian(
-    #endif
-        g_idx, xyz_ws, sh_coeffs, rotations,
-        scales_opacs,
-        active_sh
-      );
+    Gaussian_3D gauss = load_gaussian_split(
+        g_idx, xyz_ws, sh0, shN, rotations, scaling_raw, opacity_raw,
+        0u, active_sh, uniforms.shN_layout_slots);
+
   #endif
 
 #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
@@ -991,7 +935,8 @@ void main(
     };
     DifferentialPair<Gaussian_3D> v_gauss = diffPair(gauss);
     DifferentialPair<Camera> v_cam = diffPair(cam);
-    bwd_diff(project_gaussian_to_camera)(v_gauss, v_cam, active_sh, v_splat);
+    bwd_diff(project_gaussian_to_camera)(v_gauss, v_cam, active_sh,
+        (uniforms.mip_filter & 1u) != 0u, false, v_splat);
   #endif
 
     // radii, bounds, number of tiles
@@ -1123,11 +1068,19 @@ void main(
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 
-    write_v_xyz_ws(g_idx, v_gauss.d.xyz_ws);
-    write_spherical_harmonics_coeffs_grads(
-      v_gauss.d.sh_coeffs, g_idx, v_sh_coeffs, active_sh, step);
-    v_rotations[g_idx] = v_gauss.d.rotations;
-    v_scales_opacs[g_idx] = float4(v_gauss.d.scales, v_gauss.d.opacities);
+    // Return gradients of the stored raw parameters, including activation
+    // Jacobians. Every lane is overwritten, including inactive SH bands.
+    Gaussian_3D grad = {};
+    if (!is_zero_grad) grad = v_gauss.d;
+    write_t3_float3(grad.xyz_ws, g_idx, v_xyz_ws);
+    write_spherical_harmonics_coeffs_split_grads(
+        grad.sh_coeffs, g_idx, v_sh0, v_shN, uniforms.shN_layout_slots);
+    v_rotations[g_idx] = grad.rotations;
+    float3 raw_scale = read_t3_float3(g_idx, scaling_raw);
+    float3 scale_grad = grad.scales * gauss.scales;
+    scale_grad = select(raw_scale > float3(MAX_RAW_SCALE), float3(0.0), scale_grad);
+    write_t3_float3(scale_grad, g_idx, v_scaling_raw);
+    v_opacity_raw[g_idx] = grad.opacities * gauss.opacities * (1.0f - gauss.opacities);
 
 #endif
 }

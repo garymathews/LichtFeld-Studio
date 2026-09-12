@@ -165,7 +165,13 @@ namespace lfs::vis::gui::rml_paths {
         }
 
         if (isAbsoluteFilePath(reference)) {
-            return lfs::core::utf8_to_path(std::string(reference));
+            const auto literal = lfs::core::utf8_to_path(std::string(reference));
+            std::error_code ec;
+            if (reference.find('%') == std::string_view::npos || std::filesystem::exists(literal, ec))
+                return literal;
+            // RmlUI also percent-encodes POSIX absolute texture paths. Preserve
+            // actual literal-percent filenames, otherwise decode exactly once.
+            return lfs::core::utf8_to_path(percentDecode(reference));
         }
 
         // Decorator/style references reach RmlUI percent-encoded (e.g. an absolute

@@ -3,14 +3,20 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/camera.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda/memory_arena.hpp"
+#endif
 #include "core/cuda/undistort/undistort.hpp"
+#include "core/guarded_task.hpp"
 #include "core/image_loader.hpp"
 #include "core/logger.hpp"
 #include "core/memory_pressure.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/memory_pool.hpp"
+#endif
+#include "core/tensor_backend.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gt_comparison_cache_utils.hpp"
 #include "io/pipelined_image_loader.hpp"
@@ -1352,6 +1358,11 @@ namespace lfs::vis {
     }
 
     void RenderingManager::gtComparisonImageWorkerLoop(const std::stop_token stop_token) {
+
+#if LFS_TENSOR_CUDA
+        if (!lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA)) {
+            return;
+        }
         if (const cudaError_t err = cudaStreamCreateWithFlags(
                 &gt_comparison_worker_stream_, cudaStreamNonBlocking);
             err != cudaSuccess) {
@@ -1372,6 +1383,11 @@ namespace lfs::vis {
                 gt_comparison_worker_stream_ = nullptr;
             }
         };
+
+#else
+        const cudaStream_t worker_stream = nullptr;
+        const auto release_worker_stream = [] {};
+#endif
         while (true) {
             GTComparisonImageJobRequest request;
             bool is_prefetch = false;
@@ -1386,7 +1402,9 @@ namespace lfs::vis {
                     prefetch_gt_comparison_image_requests_.clear();
                     active_gt_comparison_image_request_.reset();
                     active_gt_comparison_image_is_prefetch_ = false;
+#if LFS_TENSOR_CUDA
                     worker_stream_guard.reset();
+#endif
                     release_worker_stream();
                     return;
                 }
@@ -1441,9 +1459,13 @@ namespace lfs::vis {
                                 }
                                 if (gt_tensor.dtype() == lfs::core::DataType::UInt8) {
                                     gt_tensor = gt_tensor.to(lfs::core::DataType::Float32) / 255.0f;
+
+#if LFS_TENSOR_CUDA
                                     if (worker_stream) {
                                         gt_tensor.set_stream(worker_stream);
                                     }
+#endif
+
                                 }
                                 const auto scaled = lfs::core::scale_undistort_params(
                                     request.undistort_params,
@@ -1503,6 +1525,7 @@ namespace lfs::vis {
                         }
                     }
                 }
+#if LFS_TENSOR_CUDA
                 if (worker_stream) {
                     if (const cudaError_t err = cudaStreamSynchronize(worker_stream);
                         err != cudaSuccess) {
@@ -1511,6 +1534,8 @@ namespace lfs::vis {
                             cudaGetErrorString(err));
                     }
                 }
+#endif
+
                 image = gt_comparison_detail::convertDisplayTensorToUInt8(image);
                 if (!image || !image->is_valid()) {
                     image.reset();
@@ -1585,7 +1610,8 @@ namespace lfs::vis {
         if (!last_vulkan_context_) {
             return std::unexpected("VkSplat selection query requires an active Vulkan context");
         }
-        if (!last_vulkan_context_->externalMemoryInteropEnabled()) {
+        if (lfs::core::default_gpu_backend() != lfs::core::GpuBackend::Vulkan &&
+            !last_vulkan_context_->externalMemoryInteropEnabled()) {
             return std::unexpected("VkSplat selection query requires CUDA/Vulkan external-memory interop");
         }
         // Point-cloud mode renders with a separate graphics pipeline, but selection
@@ -1655,7 +1681,9 @@ namespace lfs::vis {
             // publisher has run, so training can finish its active frame. Detach
             // first, outside releaseScratchOnIdle's readback mutex: the arena's
             // shrink callback takes that mutex while holding the arena gate.
+#if LFS_TENSOR_CUDA
             lfs::core::GlobalArenaManager::instance().clear_external_backing();
+#endif
             vksplat_viewport_renderer_->releaseScratchOnIdle(true);
         }
         const RenderSettings frame_settings = [this] {
@@ -1716,7 +1744,9 @@ namespace lfs::vis {
         }
         initialized_ = true;
 
+#if LFS_TENSOR_CUDA
         std::optional<lfs::core::CUDAStreamGuard> frame_stream_guard;
+#endif
         const auto cached_frame_result = [this, current_size]() -> VulkanFrameResult {
             if (!vksplat_stale_frame_guard_.canUseCachedFrame()) {
                 return {};
@@ -1989,13 +2019,17 @@ namespace lfs::vis {
                         // the CUDA import it points at.
                         if (trainer_manager) {
                             if (auto* trainer = trainer_manager->getTrainer()) {
+#if LFS_TENSOR_CUDA
                                 trainer->setViewerReleaseFence(nullptr);
+#endif
                             }
                         }
                         // reset() destroys render_stream_; drop it from the TLS current
                         // stream first so the rest of the frame doesn't enqueue work on a
                         // stale handle. Re-installed after the handshake re-init below.
+#if LFS_TENSOR_CUDA
                         frame_stream_guard.reset();
+#endif
                         vksplat_viewport_renderer_->reset();
                         // Clear GT async ticket host state after ring teardown.
                         gt_async_depth_ticket_ = 0;
@@ -2174,6 +2208,8 @@ namespace lfs::vis {
             }
             // Drain in-flight viewer CUDA work before output-ring recreate so
             // the trainer's waitForModelReaders has at most one residual frame.
+
+#if LFS_TENSOR_CUDA
             if (vksplat_viewport_renderer_ && vksplat_viewport_renderer_->renderStream()) {
                 const cudaError_t drain =
                     cudaStreamSynchronize(vksplat_viewport_renderer_->renderStream());
@@ -2183,6 +2219,8 @@ namespace lfs::vis {
                              cudaGetErrorString(drain));
                 }
             }
+#endif
+
             LOG_DEBUG("VkSplat output resize to {}x{} (viewer-side quiesce; training continues)",
                       render_size.x,
                       render_size.y);
@@ -2213,6 +2251,7 @@ namespace lfs::vis {
         }
         // ensureHandshakeReady() may recreate render_stream_. Install the current
         // stream before any frame preparation can enqueue CUDA work.
+#if LFS_TENSOR_CUDA
         frame_stream_guard.reset();
         if (vksplat_viewport_renderer_ && vksplat_viewport_renderer_->renderStream()) {
             frame_stream_guard.emplace(vksplat_viewport_renderer_->renderStream());
@@ -2226,6 +2265,11 @@ namespace lfs::vis {
             // trainer's reverse dependency.
             live_trainer = trainer_manager->getTrainer();
         }
+
+#else
+        lfs::training::Trainer* live_trainer = is_training && trainer_manager ? trainer_manager->getTrainer() : nullptr;
+
+#endif
         // Held shared until all CPU/GPU frame preparation and readback paths exit.
         // Passive preview: try_to_lock so a mid-step optimizer exclusive does not stall
         // the UI; retain last splat image and retry on the next cadence tick.
@@ -2248,7 +2292,9 @@ namespace lfs::vis {
             model_read_lock.emplace(std::move(candidate));
         }
         if (live_trainer) {
+#if LFS_TENSOR_CUDA
             live_trainer->setViewerReleaseFence(vksplat_viewport_renderer_->renderCompleteFence());
+#endif
             live_trainer->beginModelRead(vksplat_viewport_renderer_->renderStream());
             lfs::training::Trainer* const trainer = live_trainer;
             vksplat_viewport_renderer_->setLiveSubmitCallback(
@@ -2262,19 +2308,26 @@ namespace lfs::vis {
             lfs::training::Trainer* trainer;
             VksplatViewportRenderer* renderer;
             ~ViewerBorrowPublisher() {
-                if (trainer && renderer) {
-                    try {
-                        trainer->endModelRead(renderer->renderStream());
-                        trainer->publishViewerBorrow(renderer->renderCompleteValue());
-                    } catch (const std::exception& e) {
-                        LOG_ERROR("ViewerBorrowPublisher: endModelRead/publishViewerBorrow failed "
-                                  "during frame teardown: {}",
-                                  e.what());
-                    } catch (...) {
-                        LOG_ERROR("ViewerBorrowPublisher: endModelRead/publishViewerBorrow failed "
-                                  "during frame teardown with an unknown error");
-                    }
-                }
+                lfs::core::run_guarded<void>(
+                    {.name = "viewport-model-release", .domain = lfs::ErrorDomain::Rendering, .operation_id = lfs::OperationId::generate(), .site = LFS_SOURCE_SITE_CURRENT()},
+                    [&]() -> lfs::Status {
+                        if (renderer && lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan) {
+                            if (auto completed = renderer->waitForModelReads(); !completed)
+                                return completed;
+                        }
+                        if (trainer && renderer) {
+                            trainer->endModelRead(renderer->renderStream());
+                            trainer->publishViewerBorrow(renderer->renderCompleteValue());
+                        }
+                        return {};
+                    },
+                    [&](lfs::Status&& result) {
+                        if (!result) {
+                            LOG_ERROR("Viewport model release failed: {}", lfs::format_for_developer(result.error()));
+                            if (trainer)
+                                trainer->request_stop(result.error());
+                        }
+                    });
             }
         } viewer_borrow_publisher{live_trainer, vksplat_viewport_renderer_.get()};
 
@@ -4550,6 +4603,18 @@ namespace lfs::vis {
     }
 
     lfs::io::SplatTensorAllocator RenderingManager::makeSplatTensorAllocator() const {
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan) {
+            return [](lfs::core::TensorShape shape,
+                      const size_t capacity,
+                      const lfs::core::DataType dtype,
+                      const std::string_view name) -> lfs::core::Tensor {
+                (void)capacity;
+                lfs::core::Tensor tensor =
+                    lfs::core::Tensor::empty(std::move(shape), lfs::core::Device::CUDA, dtype);
+                tensor.set_name(std::string{name});
+                return tensor;
+            };
+        }
         if (!last_vulkan_context_ || !last_vulkan_context_->externalMemoryInteropEnabled()) {
             return {};
         }

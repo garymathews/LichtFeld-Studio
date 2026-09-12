@@ -4,7 +4,9 @@
 #include "sparsity_optimizer.hpp"
 #include "core/logger.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -253,6 +255,7 @@ namespace lfs::training {
 
             // Launch fused kernel via wrapper function
             // Note: Use accumulate=true in production if other losses contribute gradients
+#if LFS_TENSOR_CUDA
             launch_admm_backward_fused(
                 grad_opacities.ptr<float>(), // Output: gradients
                 ctx.opa_sigmoid_ptr,         // Input: sigmoid(opacities)
@@ -269,6 +272,9 @@ namespace lfs::training {
             if (err != cudaSuccess) {
                 return std::unexpected(std::format("CUDA kernel error: {}", cudaGetErrorString(err)));
             }
+#else
+            return std::unexpected("ADMM sparsity backward is unavailable on Vulkan");
+#endif
 
             return {};
         } catch (const std::exception& e) {

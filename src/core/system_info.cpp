@@ -4,7 +4,9 @@
 
 #include "core/system_info.hpp"
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -18,6 +20,8 @@
 #include <intrin.h>
 #include <windows.h>
 #include <winternl.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
 #else
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -35,11 +39,15 @@ namespace lfs::core::system_info {
         }
 
         std::string cuda_runtime_version() {
+#if LFS_TENSOR_CUDA
             int version = 0;
             if (cudaRuntimeGetVersion(&version) != cudaSuccess || version <= 0)
                 return {};
             return std::to_string(version / 1000) + "." +
                    std::to_string((version % 1000) / 10);
+#else
+            return {};
+#endif
         }
 
 #ifdef _WIN32
@@ -83,6 +91,36 @@ namespace lfs::core::system_info {
             if (!GlobalMemoryStatusEx(&state))
                 return 0;
             return static_cast<std::uint64_t>(state.ullTotalPhys / (1024ULL * 1024ULL));
+        }
+#elif defined(__APPLE__)
+        std::string sysctl_string(const char* key) {
+            size_t size = 0;
+            if (sysctlbyname(key, nullptr, &size, nullptr, 0) != 0 || size == 0)
+                return {};
+            std::string value(size, '\0');
+            if (sysctlbyname(key, value.data(), &size, nullptr, 0) != 0)
+                return {};
+            value.resize(size);
+            if (!value.empty() && value.back() == '\0')
+                value.pop_back();
+            return value;
+        }
+
+        void collect_os(SystemInfo& info) {
+            info.os = "macOS " + sysctl_string("kern.osproductversion");
+            info.os_build = sysctl_string("kern.osversion");
+        }
+
+        std::string collect_cpu() {
+            return sysctl_string("machdep.cpu.brand_string");
+        }
+
+        std::uint64_t collect_ram_mb() {
+            std::uint64_t bytes = 0;
+            size_t size = sizeof(bytes);
+            if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0)
+                return 0;
+            return bytes / (1024ULL * 1024ULL);
         }
 #else
         std::string unquote_os_release(std::string value) {
