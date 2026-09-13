@@ -3,12 +3,12 @@
 
 #include "core/cuda_error.hpp"
 #include "core/device_fault.hpp"
-#include "internal/cub_workspace.hpp"
-#include "internal/cuda_memory_guard.hpp"
+#include "core/tensor/internal/cub_workspace.hpp"
+#include "core/tensor/internal/tensor_ops.hpp"
+#include "core/tensor/internal/tensor_vectorized_ops.cuh"
+#include "core/tensor/internal/cuda_memory_guard.hpp"
 #include "internal/gpu_config.hpp"
 #include "internal/tensor_functors.hpp"
-#include "internal/tensor_ops.hpp"
-#include "internal/tensor_vectorized_ops.cuh"
 #include <cfloat>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
@@ -1073,7 +1073,17 @@ namespace lfs::core::tensor_ops {
 
     template <>
     __device__ inline void scatter_add<uint8_t>(uint8_t* dst, uint8_t value) {
-        *dst = static_cast<uint8_t>(*dst + value);
+        const size_t address = reinterpret_cast<size_t>(dst);
+        unsigned int* word = reinterpret_cast<unsigned int*>(address & ~size_t{3});
+        const unsigned int shift = static_cast<unsigned int>(address & size_t{3}) * 8u;
+        const unsigned int lane_mask = 0xffu << shift;
+        unsigned int observed = *word;
+        unsigned int assumed;
+        do {
+            assumed = observed;
+            const unsigned int byte = (((assumed & lane_mask) >> shift) + value) & 0xffu;
+            observed = atomicCAS(word, assumed, (assumed & ~lane_mask) | (byte << shift));
+        } while (observed != assumed);
     }
 
     template <typename T>

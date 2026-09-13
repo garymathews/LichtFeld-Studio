@@ -113,7 +113,7 @@ namespace lfs::core {
                     const size_t keep_count = static_cast<size_t>(keep_indices.numel());
                     const size_t layout_rest = input.max_sh_coeffs_rest();
                     // q16 / IEEE-f16: dequant to [N,K,3] then index_select (no ptr<float> on codes).
-                    if (input.shN_raw().dtype() != DataType::Float32) {
+                    if (gpu_backend_of(input.shN_raw()) != GpuBackend::CUDA || input.shN_raw().dtype() != DataType::Float32) {
                         Tensor canon = input.shN_canonical();
                         if (keep_indices.device() != canon.device())
                             keep_indices = keep_indices.to(canon.device());
@@ -122,6 +122,8 @@ namespace lfs::core {
                             keep_indices = keep_indices.to(DataType::Int32);
                         }
                         shN = canon.index_select(0, keep_indices).contiguous();
+
+#if LFS_TENSOR_CUDA
                     } else {
                         shN = Tensor::empty({keep_count, layout_rest, 3}, input.shN_raw().device());
                         if (keep_indices.dtype() == DataType::Int64) {
@@ -144,6 +146,8 @@ namespace lfs::core {
                                 static_cast<uint32_t>(layout_rest),
                                 static_cast<uint32_t>(layout_rest));
                         }
+
+#endif
                     }
                     shN = shN.to(device).contiguous();
                 } else {

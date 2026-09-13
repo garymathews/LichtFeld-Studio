@@ -4,7 +4,10 @@
 
 #pragma once
 
+#include "io/session_chapters.hpp"
 #include <memory>
+#include <chrono>
+#include <functional>
 
 namespace lfs::training {
     class TrainingProgress {
@@ -16,7 +19,8 @@ namespace lfs::training {
             Sparse
         };
 
-        TrainingProgress(int total_iterations, int update_frequency = 100);
+        TrainingProgress(int total_iterations, int update_frequency = 100,
+                         std::function<std::chrono::steady_clock::time_point()> clock = std::chrono::steady_clock::now);
         ~TrainingProgress();
 
         TrainingProgress(const TrainingProgress&) = delete;
@@ -24,12 +28,14 @@ namespace lfs::training {
         TrainingProgress(TrainingProgress&&) = delete;
         TrainingProgress& operator=(TrainingProgress&&) = delete;
 
+        void set_total_iterations(int total);
+        void start(int completed_iterations);
         void update(int current_iteration, float loss, int splat_count, Phase phase = Phase::Train);
         void pause();
         void resume(int current_iteration, float loss, int splat_count, Phase phase = Phase::Train);
-        void complete(bool user_stopped = false, int actual_iterations = -1);
+        void complete(io::project::TrainingFinishReason reason = io::project::TrainingFinishReason::None, int actual_iterations = -1);
         void print_final_summary(int final_splats, int actual_iterations = -1,
-                                 bool user_stopped = false);
+                                 io::project::TrainingFinishReason reason = io::project::TrainingFinishReason::Completed);
 
     private:
         struct Impl;

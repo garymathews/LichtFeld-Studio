@@ -7,14 +7,20 @@
 #include "core/logger.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/tensor.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#endif
 #include "rendering/rasterizer/vulkan/src/config.h"
+#if LFS_TENSOR_CUDA
 #include "vksplat_input_packer_cuda.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <format>
 #include <string_view>
 #include <vector>
@@ -203,6 +209,7 @@ namespace lfs::vis::vksplat {
 
         [[nodiscard]] std::expected<Tensor, std::string> buildPackedShTensor(
             const lfs::core::SplatData& splat_data) {
+#if LFS_TENSOR_CUDA
             const std::size_t n = static_cast<std::size_t>(splat_data.size());
 
             const Tensor& sh0_raw = splat_data.sh0();
@@ -254,7 +261,17 @@ namespace lfs::vis::vksplat {
                 n,
                 static_cast<std::uint32_t>(splat_data.max_sh_coeffs_rest()));
             return packed;
-        }
+
+#else
+            const size_t n = splat_data.size();
+            const size_t padded = lfs::core::sh_swizzled_padded_n(n);
+            auto canonical = Tensor::zeros({padded, 16, 3}, Device::GPU, DataType::Float32);
+            canonical.slice(0, 0, n).slice(1, 0, 1).copy_(splat_data.sh0().reshape(lfs::core::TensorShape({n, 1, 3})));
+            const auto rest = splat_data.shN_canonical();
+            if (rest.is_valid() && rest.numel()) canonical.slice(0, 0, n).slice(1, 1, 1 + rest.shape()[1]).copy_(rest);
+            return canonical.reshape(lfs::core::TensorShape({padded / SH_REORDER_SIZE, SH_REORDER_SIZE, 12, 4})).permute({0, 2, 1, 3}).contiguous();
+#endif
+}
 
         [[nodiscard]] bool validOpacityShape(const Tensor& opacity, const std::size_t n) {
             return opacity.ndim() != 0 &&
@@ -308,6 +325,8 @@ namespace lfs::vis::vksplat {
             }
         }
 
+
+#if LFS_TENSOR_CUDA
         [[nodiscard]] std::string cudaErrorMessage(
             const char* const operation,
             const cudaError_t status) {
@@ -317,6 +336,8 @@ namespace lfs::vis::vksplat {
                                cudaGetErrorString(status));
         }
 
+
+#endif
     } // namespace
 
     std::expected<DeviceInputLayout, std::string> deviceInputLayout(
@@ -409,7 +430,7 @@ namespace lfs::vis::vksplat {
         const bool shN_f16 = splat_data.shN_ieee_f16() && !omit_shN_upload && !shN_q16;
         const std::uint32_t n_cells =
             shN_q16 ? lfs::core::sh_value_quant::n_value_cells_per_prim(upload_layout_rest) : 0u;
-        std::size_t shN_bytes = sizeof(float4);
+        std::size_t shN_bytes = (4 * sizeof(float));
         std::size_t element_bytes = sizeof(float);
         std::size_t bounds_bytes = 0;
         if (!omit_shN_upload) {
@@ -487,6 +508,7 @@ namespace lfs::vis::vksplat {
         const lfs::core::SplatData& splat_data,
         void* const opacity_dst,
         const cudaStream_t stream) {
+#if LFS_TENSOR_CUDA
         if (opacity_dst == nullptr) {
             return std::unexpected("VkSplat raw opacity copy received a null destination region");
         }
@@ -561,7 +583,11 @@ namespace lfs::vis::vksplat {
                 "cudaMemcpyAsync(VkSplat raw opacity -> Vulkan opacity copy)", status));
         }
         return {};
-    }
+
+#else
+        return std::unexpected("CUDA pointer packing is unavailable on Vulkan; bind native tensor buffers");
+#endif
+}
 
     std::expected<DevicePackedInputs, std::string> packDeviceInputs(
         const lfs::core::SplatData& splat_data) {

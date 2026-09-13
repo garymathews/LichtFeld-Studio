@@ -4,8 +4,15 @@
 
 #include "metrics.hpp"
 #include "../kernels/normal_loss.hpp"
+#if LFS_TENSOR_CUDA
 #include "../rasterization/fast_rasterizer.hpp"
 #include "../rasterization/gsplat_rasterizer.hpp"
+#else
+#include "../rasterization/vulkan_rasterizer.hpp"
+#include "../losses/photometric_loss.hpp"
+#endif
+#include "core/tensor_backend.hpp"
+#include "core/nn/ops.hpp"
 #include "core/cuda/lanczos_resize/lanczos_resize.hpp"
 #include "core/cuda/undistort/undistort.hpp"
 #include "core/events.hpp"
@@ -32,7 +39,9 @@
 #include <utility>
 #include <vector>
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 namespace lfs::training {
 
@@ -213,6 +222,26 @@ namespace lfs::training {
             throw std::runtime_error("SSIM: prediction and target must have the same shape");
         }
 
+#if !LFS_TENSOR_CUDA
+        losses::PhotometricLoss reference;
+        const auto evaluated = reference.forward(pred, target, {.lambda_dssim = 1.f});
+        if (!evaluated) throw std::runtime_error(evaluated.error());
+        auto ssim_map = reference.ssim_workspace().ssim_map;
+        if (mask.is_valid()) {
+            const auto layout = get_layout_info(pred, "SSIM");
+            const auto weights = mask_as_float01(mask);
+            validate_mask_shape_or_throw(weights, layout, "SSIM");
+            const auto denominator = get_non_empty_mask_sum_or_throw(weights, "SSIM") * layout.c * layout.n;
+            const float value = (ssim_map * expand_mask(weights, layout, 4)).sum().cpu().item<float>() / denominator;
+            if (!std::isfinite(value)) throw std::runtime_error("Non-finite masked SSIM");
+            return value;
+        }
+        if (apply_valid_padding_ && ssim_map.shape()[2] > 10 && ssim_map.shape()[3] > 10)
+            ssim_map = ssim_map.slice(2, 5, ssim_map.shape()[2] - 5).slice(3, 5, ssim_map.shape()[3] - 5);
+        const float value = ssim_map.mean().cpu().item<float>();
+        if (!std::isfinite(value)) throw std::runtime_error("Non-finite SSIM");
+        return value;
+#else
         if (mask.is_valid()) {
             // Match masked training semantics: no valid-padding crop, masked mean over all pixels.
             const auto layout = get_layout_info(pred, "SSIM");
@@ -243,6 +272,7 @@ namespace lfs::training {
             throw std::runtime_error("SSIM: produced non-finite SSIM");
         }
         return value;
+#endif
     }
 
     namespace {
@@ -601,23 +631,12 @@ namespace lfs::training {
         auto gpu_uint8 = cpu_tensor.to(lfs::core::Device::CUDA);
         lfs::core::free_image(img_data);
 
-        auto rgb = lfs::core::Tensor::zeros(
-            lfs::core::TensorShape({3, H, W}),
-            lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
-        auto mask = lfs::core::Tensor::zeros(
-            lfs::core::TensorShape({H, W}),
-            lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-
-        lfs::io::cuda::launch_uint8_rgba_split_to_uint8_rgb_and_float32_alpha(
-            gpu_uint8.ptr<uint8_t>(), rgb.ptr<uint8_t>(), mask.ptr<float>(),
-            H, W, nullptr);
-        gpu_uint8 = lfs::core::Tensor();
-
-        if (_params.optimization.invert_masks)
-            lfs::io::cuda::launch_mask_invert(mask.ptr<float>(), H, W, nullptr);
+        auto chw = gpu_uint8.permute({2, 0, 1});
+        auto rgb = chw.slice(0, 0, 3).contiguous();
+        auto mask = chw.slice(0, 3, 4).squeeze(0).to(lfs::core::DataType::Float32) / 255.f;
+        if (_params.optimization.invert_masks) mask = mask.neg() + 1.f;
         if (_params.optimization.mask_threshold > 0)
-            lfs::io::cuda::launch_mask_threshold(
-                mask.ptr<float>(), H, W, _params.optimization.mask_threshold, nullptr);
+            mask = (mask >= _params.optimization.mask_threshold).to(lfs::core::DataType::Float32);
 
         if (cam->is_undistort_prepared()) {
             const auto scaled = lfs::core::scale_undistort_params(
@@ -625,16 +644,7 @@ namespace lfs::training {
                 static_cast<int>(W), static_cast<int>(H));
             auto rgb_float = rgb.to(lfs::core::DataType::Float32) / 255.0f;
             rgb_float = lfs::core::undistort_image(rgb_float, scaled, nullptr);
-            auto rgb_uint8 = lfs::core::Tensor::empty(
-                rgb_float.shape(), lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
-            lfs::io::cuda::launch_float32_chw_to_uint8_chw(
-                rgb_float.ptr<float>(),
-                rgb_uint8.ptr<uint8_t>(),
-                rgb_float.shape()[1],
-                rgb_float.shape()[2],
-                rgb_float.shape()[0],
-                nullptr);
-            rgb = std::move(rgb_uint8);
+            rgb = (rgb_float.clamp(0.f, 1.f) * 255.f + .5f).to(lfs::core::DataType::UInt8);
             mask = lfs::core::undistort_mask(mask, scaled, nullptr);
         }
 
@@ -645,7 +655,8 @@ namespace lfs::training {
     EvalMetrics MetricsEvaluator::evaluate(const int iteration,
                                            const lfs::core::SplatData& splatData,
                                            std::shared_ptr<CameraDataset> val_dataset,
-                                           lfs::core::Tensor& background) {
+                                           lfs::core::Tensor& background,
+                                           const lfs::core::Tensor& background_image) {
         if (!_params.optimization.enable_eval) {
             throw std::runtime_error("Evaluation is not enabled");
         }
@@ -694,6 +705,7 @@ namespace lfs::training {
                          lfs::core::path_to_utf8(weights_path), e.what());
             }
         }
+#if LFS_TENSOR_CUDA
         if (_lpips_metric) {
             const bool start_created = cudaEventCreate(&lpips_start_event) == cudaSuccess;
             const bool stop_created = start_created && cudaEventCreate(&lpips_stop_event) == cudaSuccess;
@@ -707,6 +719,10 @@ namespace lfs::training {
             }
         }
 
+#endif
+#if !LFS_TENSOR_CUDA
+        if (!vulkan_rasterizer_) vulkan_rasterizer_ = std::make_unique<VulkanTrainingRasterizer>();
+#endif
         std::ofstream per_image_csv;
         if (_params.optimization.enable_save_eval_images) {
             if (lfs::core::open_file_for_write(eval_dir / "per_image_metrics.csv", per_image_csv)) {
@@ -766,12 +782,23 @@ namespace lfs::training {
 
             auto& splatData_mutable = const_cast<lfs::core::SplatData&>(splatData);
             RenderOutput r_output;
+#if LFS_TENSOR_CUDA
             if (_params.optimization.gut) {
                 r_output = gsplat_rasterize(*cam, splatData_mutable, background,
                                             1.0f, false, GsplatRenderMode::RGB, true);
             } else {
                 r_output = fast_rasterize(*cam, splatData_mutable, background,
                                           _params.optimization.mip_filter, {}, render_normal);
+            }
+#else
+            const auto bg = background.cpu().to_vector();
+            r_output = vulkan_rasterizer_->forward(*cam, splatData_mutable,
+                {bg.at(0), bg.at(1), bg.at(2)}, _params.optimization.mip_filter);
+#endif
+            if (background_image.is_valid()) {
+                const auto pixels = core::nn::resize2d(background_image.unsqueeze(0), r_output.image.shape()[1], r_output.image.shape()[2],
+                    core::nn::ResizeMode::Bilinear, core::nn::CoordTransform::HalfPixel).squeeze(0);
+                r_output.composite_background(pixels, background);
             }
             const auto render_raw = r_output.image.is_valid()
                                         ? r_output.image.clamp(0.0f, 1.0f)
@@ -816,10 +843,9 @@ namespace lfs::training {
                     const bool size_changed = !lpips_preflight_size || *lpips_preflight_size != image_size;
                     lpips_preflight_size = image_size;
                     const auto required = _lpips_metric->estimated_peak_bytes(image_height, image_width);
-                    std::size_t free_bytes = 0;
-                    std::size_t total_bytes = 0;
-                    const auto status = cudaMemGetInfo(&free_bytes, &total_bytes);
-                    const bool lpips_preflight_ok = status == cudaSuccess && free_bytes >= required;
+                    const auto memory = lfs::core::gpu_backend_memory_info(lfs::core::default_gpu_backend());
+                    const auto free_bytes = memory.free_bytes;
+                    const bool lpips_preflight_ok = free_bytes >= required;
                     if (!lpips_preflight_ok && size_changed) {
                         const auto shortfall = required > free_bytes ? required - free_bytes : 0;
                         LOG_WARN("Eval: LPIPS skipped for this image size; tile={} required={} free={} shortfall={} bytes",
@@ -830,16 +856,24 @@ namespace lfs::training {
                                   _lpips_metric->tile_size_for(image_height, image_width), required, free_bytes);
                     }
                     if (lpips_preflight_ok) {
+#if LFS_TENSOR_CUDA
                         const cudaStream_t lpips_stream = pred_lpips.stream();
                         const bool timed_lpips = lpips_start_event != nullptr &&
                                                  cudaEventRecord(lpips_start_event, lpips_stream) == cudaSuccess;
+#else
+                        const auto lpips_started = std::chrono::steady_clock::now();
+#endif
                         auto value = _lpips_metric->forward(
                             pred_lpips, target_lpips,
                             lfs::core::nn::models::InputScaling::Identity);
+#if LFS_TENSOR_CUDA
                         const bool lpips_event_complete =
                             timed_lpips && cudaEventRecord(lpips_stop_event, lpips_stream) == cudaSuccess &&
                             cudaEventSynchronize(lpips_stop_event) == cudaSuccess;
+#endif
                         if (value && std::isfinite(*value)) {
+#if LFS_TENSOR_CUDA
+
                             if (lpips_event_complete) {
                                 float elapsed_ms = 0.0f;
                                 if (cudaEventElapsedTime(&elapsed_ms, lpips_start_event, lpips_stop_event) ==
@@ -849,6 +883,11 @@ namespace lfs::training {
                                     lpips_timed_images++;
                                 }
                             }
+#else
+                            lpips_elapsed_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - lpips_started).count();
+                            ++lpips_timed_images;
+#endif
                             lpips = *value;
                             lpips_values.push_back(*value);
                         } else if (!value) {
@@ -913,8 +952,11 @@ namespace lfs::training {
                             const int render_w = static_cast<int>(r_output.normal.shape()[2]);
                             if (static_cast<int>(prior.shape()[1]) != render_h ||
                                 static_cast<int>(prior.shape()[2]) != render_w) {
-                                prior = lfs::core::lanczos_resize_float_chw(
-                                    prior, render_h, render_w, 2, r_output.normal.stream());
+                                #if LFS_TENSOR_CUDA
+                                prior = lfs::core::lanczos_resize_float_chw(prior, render_h, render_w, 2, r_output.normal.stream());
+#else
+                                prior = lfs::core::nn::resize2d(prior.unsqueeze(0), render_h, render_w, lfs::core::nn::ResizeMode::Bilinear, lfs::core::nn::CoordTransform::HalfPixel).squeeze(0);
+#endif
                             }
                             if (const auto angle = mean_normal_angle_deg(
                                     r_output.normal, prior, r_output.alpha)) {
@@ -1020,10 +1062,12 @@ namespace lfs::training {
         if (per_image_csv)
             per_image_csv.close();
 
+#if LFS_TENSOR_CUDA
         if (lpips_start_event != nullptr)
             cudaEventDestroy(lpips_start_event);
         if (lpips_stop_event != nullptr)
             cudaEventDestroy(lpips_stop_event);
+#endif
         if (lpips_timed_images > 0) {
             LOG_DEBUG("Eval: LPIPS-only {:.3f} ms/image over {} images",
                       lpips_elapsed_ms / static_cast<double>(lpips_timed_images), lpips_timed_images);

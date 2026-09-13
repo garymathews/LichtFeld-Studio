@@ -8,6 +8,9 @@
 #include <cerrno>
 #include <mutex>
 #include <random>
+#ifdef __APPLE__
+#include <sys/random.h>
+#endif
 #include <system_error>
 
 #if defined(_WIN32)

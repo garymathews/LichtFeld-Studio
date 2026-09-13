@@ -3,18 +3,21 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/camera.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
+#include "core/cuda_error_typed.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
+#include <cuda_runtime.h>
+#endif
 #include "core/cuda/lanczos_resize/lanczos_resize.hpp"
 #include "core/cuda/undistort/undistort.hpp"
-#include "core/cuda_error_typed.hpp"
 #include "core/image_io.hpp"
 #include "core/image_loader.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
-#include "core/tensor/internal/memory_pool.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <cuda_runtime.h>
 #include <format>
 #include <stdexcept>
 
@@ -136,6 +139,8 @@ namespace lfs::core {
         _FoVx = focal2fov(_focal_x, _camera_width);
         _FoVy = focal2fov(_focal_y, _camera_height);
 
+#if LFS_TENSOR_CUDA
+        if (gpu_backend_of(_world_view_transform) == GpuBackend::CUDA) {
         // Non-blocking so image loading doesn't serialize with the legacy stream.
         // On failure fall back to the default stream rather than a bad handle.
         // log_cuda_teardown_failure is the frozen no-throw log-and-continue adapter.
@@ -158,15 +163,19 @@ namespace lfs::core {
                 stream_create_site);
             _stream = nullptr;
         }
+        }
+#endif
     }
 
     Camera::~Camera() {
         // Destroy CUDA stream if it was created
+#if LFS_TENSOR_CUDA
         if (_stream) {
             CudaMemoryPool::instance().release_stream(_stream);
             LFS_CUDA_LOG_TEARDOWN(cudaStreamDestroy(_stream), _stream, "camera stream teardown");
             _stream = nullptr;
         }
+#endif
     }
 
     Camera::Camera(Camera&& other) noexcept
@@ -221,10 +230,12 @@ namespace lfs::core {
     Camera& Camera::operator=(Camera&& other) noexcept {
         if (this != &other) {
             // Destroy our current stream
+#if LFS_TENSOR_CUDA
             if (_stream) {
                 CudaMemoryPool::instance().release_stream(_stream);
                 LFS_CUDA_LOG_TEARDOWN(cudaStreamDestroy(_stream), _stream, "camera stream teardown");
             }
+#endif
 
             // Move all members
             _FoVx = other._FoVx;
@@ -308,6 +319,8 @@ namespace lfs::core {
         _world_view_transform = transform;
         _sfm_observations = other._sfm_observations;
 
+#if LFS_TENSOR_CUDA
+        if (gpu_backend_of(_world_view_transform) == GpuBackend::CUDA) {
         // Non-blocking so image loading doesn't serialize with the legacy stream.
         // On failure fall back to the default stream rather than a bad handle.
         // log_cuda_teardown_failure is the frozen no-throw log-and-continue adapter.
@@ -330,6 +343,8 @@ namespace lfs::core {
                 stream_create_site);
             _stream = nullptr;
         }
+        }
+#endif
     }
     Tensor Camera::K() const {
         // Create [1, 3, 3] zero matrix on same device as world_view_transform
@@ -382,7 +397,10 @@ namespace lfs::core {
         if (image.device() != Device::CUDA) {
             image = image.to(Device::CUDA, _stream);
             if (_stream) {
+
+#if LFS_TENSOR_CUDA
                 LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "image upload sync");
+#endif
             }
         }
 
@@ -540,7 +558,10 @@ namespace lfs::core {
             if (mask.device() != Device::CUDA) {
                 mask = mask.to(Device::CUDA, _stream);
                 if (_stream) {
+
+#if LFS_TENSOR_CUDA
                     LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "mask upload sync");
+#endif
                 }
             }
             if (mask.dtype() == DataType::UInt8) {
@@ -566,7 +587,10 @@ namespace lfs::core {
             if (mask.device() != Device::CUDA) {
                 mask = mask.to(Device::CUDA, _stream);
                 if (_stream) {
+
+#if LFS_TENSOR_CUDA
                     LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "mask upload sync");
+#endif
                 }
             }
 
@@ -630,7 +654,10 @@ namespace lfs::core {
                 Device::CPU, DataType::Float32);
             depth = cpu_depth.to(Device::CUDA, _stream);
             if (_stream) {
+
+#if LFS_TENSOR_CUDA
                 LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "depth upload sync");
+#endif
             }
             free_image_float(gray);
         } else {
@@ -643,7 +670,10 @@ namespace lfs::core {
             if (depth.device() != Device::CUDA) {
                 depth = depth.to(Device::CUDA, _stream);
                 if (_stream) {
+
+#if LFS_TENSOR_CUDA
                     LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "depth upload sync");
+#endif
                 }
             }
 
@@ -704,7 +734,10 @@ namespace lfs::core {
                 Device::CPU, DataType::Float32);
             normal = cpu_normal.to(Device::CUDA, _stream);
             if (_stream) {
+
+#if LFS_TENSOR_CUDA
                 LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "normal upload sync");
+#endif
             }
             free_image_float(rgb);
             normal = normal.permute({2, 0, 1}).contiguous();
@@ -718,7 +751,10 @@ namespace lfs::core {
             if (normal.is_valid() && normal.device() != Device::CUDA) {
                 normal = normal.to(Device::CUDA, _stream);
                 if (_stream) {
+
+#if LFS_TENSOR_CUDA
                     LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "normal upload sync");
+#endif
                 }
             }
             if (normal.is_valid()) {
@@ -777,7 +813,10 @@ namespace lfs::core {
             }
             normal = normal_cpu.to(Device::CUDA, _stream);
             if (_stream) {
+
+#if LFS_TENSOR_CUDA
                 LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "normal upload sync");
+#endif
             }
         }
 

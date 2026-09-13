@@ -42,11 +42,15 @@ class IterationRateTracker:
         self.samples = []
 
     def add_sample(self, iteration):
+        if self.samples and iteration < self.samples[-1][0]:
+            self.clear()
+        if self.samples and iteration == self.samples[-1][0]:
+            return
         now = time.monotonic()
         self.samples.append((iteration, now))
-        self.samples = [
-            (i, t) for i, t in self.samples if now - t <= self.WINDOW_SECONDS
-        ]
+        # Keep an anchor outside the window, including for slow iterations.
+        while len(self.samples) > 2 and now - self.samples[1][1] > self.WINDOW_SECONDS:
+            self.samples.pop(0)
 
     def get_rate(self):
         if len(self.samples) < 2:
@@ -54,7 +58,7 @@ class IterationRateTracker:
         oldest = self.samples[0]
         newest = self.samples[-1]
         iter_diff = newest[0] - oldest[0]
-        time_diff = newest[1] - oldest[1]
+        time_diff = time.monotonic() - oldest[1]
         return iter_diff / time_diff if time_diff > 0 else 0.0
 
     def clear(self):
@@ -474,6 +478,8 @@ class TrainingPanel(Panel):
             self._queue_pv_publish(binding)
 
     def _property_view_condition_visible(self, condition_id):
+        if condition_id == "cuda_backend":
+            return lf.get_gpu_backend() == "cuda"
         if str(condition_id) == "has_dataset":
             dataset = lf.dataset_params()
             return bool(dataset and dataset.has_params())
@@ -503,6 +509,7 @@ class TrainingPanel(Panel):
         return bool(conditions.get(str(condition_id), True))
 
     def _bind_visibility(self, model, p, d):
+        model.bind_func("cuda_backend", lambda: lf.get_gpu_backend() == "cuda")
         def _state():
             value = RuntimeState.trainer_state.value
             session = _training_session_state()
@@ -1111,10 +1118,7 @@ class TrainingPanel(Panel):
             return f"{tr('status.mode')} {labels.get(state, tr('status.unknown'))}"
 
         def _status_iteration():
-            it = RuntimeState.iteration.value
-            if it <= 0:
-                it = int(_training_session_state().get("iteration") or 0)
-            _rate_tracker.add_sample(it)
+            it = max(0, self._last_iteration)
             rate = _rate_tracker.get_rate()
             return f"{tr('status.iteration')} {it:,} ({rate:.1f} {tr('training_panel.iters_per_sec')})"
 
@@ -1123,9 +1127,7 @@ class TrainingPanel(Panel):
 
         def _progress_text():
             session = _training_session_state()
-            it = RuntimeState.iteration.value
-            if it <= 0:
-                it = int(session.get("iteration") or 0)
+            it = max(0, self._last_iteration)
             mx = RuntimeState.max_iterations.value
             if mx <= 0:
                 mx = int(session.get("max_iterations") or 0)
@@ -1429,19 +1431,11 @@ class TrainingPanel(Panel):
         state = RuntimeState.trainer_state.value
         if state != self._last_state:
             self._last_state = state
-            if state == "ready":
-                _rate_tracker.clear()
+            _rate_tracker.clear()
             self._sync_text_bufs()
             self._handle.dirty_all()
             dirty = True
         else:
-            it = RuntimeState.iteration.value
-            if it != self._last_iteration:
-                self._last_iteration = it
-                self._handle.dirty("status_iteration")
-                self._handle.dirty("progress_text")
-                self._handle.dirty("show_training_telemetry")
-                dirty = True
             if state == "stopping":
                 self._handle.dirty("status_mode")
 
@@ -1459,6 +1453,18 @@ class TrainingPanel(Panel):
                 self._last_project_saved_visible = project_saved_visible
                 self._handle.dirty("show_project_saved")
                 dirty = True
+
+        it = lf.trainer_current_iteration()
+        if state == "running":
+            _rate_tracker.add_sample(it)
+            self._schedule_deferred_update(0.5)
+        if state == "running" or it != self._last_iteration:
+            self._handle.dirty("status_iteration")
+            dirty = True
+        if it != self._last_iteration:
+            self._last_iteration = it
+            self._handle.dirty("progress_text")
+            self._handle.dirty("show_training_telemetry")
 
         if state == "ready" and RuntimeState.iteration.value == 0:
             params = lf.optimization_params()
@@ -1478,7 +1484,7 @@ class TrainingPanel(Panel):
         return dirty
 
     def _update_progress(self):
-        it = RuntimeState.iteration.value
+        it = self._last_iteration
         mx = RuntimeState.max_iterations.value
         frac = it / mx if mx > 0 and it > 0 else 0.0
         if frac != self._last_progress_frac:

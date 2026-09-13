@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#ifdef LFS_DIAGNOSTICS_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <deque>
 #include <iterator>
 #include <list>
@@ -130,8 +132,10 @@ namespace lfs::diagnostics {
 
         struct PendingGpuEvent {
             std::string scope;
+#ifdef LFS_DIAGNOSTICS_CUDA
             cudaEvent_t start = nullptr;
             cudaEvent_t stop = nullptr;
+#endif
             bool start_recorded = false;
             bool stop_recorded = false;
         };
@@ -241,6 +245,7 @@ namespace lfs::diagnostics {
 
         [[nodiscard]] bool sample_cuda_used_bytes(std::size_t& used_bytes,
                                                   std::size_t* total_bytes = nullptr) {
+#ifdef LFS_DIAGNOSTICS_CUDA
             std::size_t free_bytes = 0;
             std::size_t total = 0;
             if (cudaMemGetInfo(&free_bytes, &total) != cudaSuccess || total < free_bytes) {
@@ -251,6 +256,9 @@ namespace lfs::diagnostics {
                 *total_bytes = total;
             }
             return true;
+#else
+            return false;
+#endif
         }
 
         [[nodiscard]] std::string method_label(const VramAllocationMethod method) {
@@ -823,6 +831,7 @@ namespace lfs::diagnostics {
     }
 
     std::int32_t VramProfiler::acquireGpuEventPair(std::string_view scope, void* stream) {
+#ifdef LFS_DIAGNOSTICS_CUDA
         if (!enabled()) {
             return -1;
         }
@@ -853,9 +862,13 @@ namespace lfs::diagnostics {
             return static_cast<std::int32_t>(i);
         }
         return -1;
+#else
+        return -1;
+#endif
     }
 
     void VramProfiler::releaseGpuEventPair(const std::int32_t pair, void* stream) {
+#ifdef LFS_DIAGNOSTICS_CUDA
         if (pair < 0 || static_cast<std::size_t>(pair) >= kGpuEventPoolSize) {
             return;
         }
@@ -872,9 +885,11 @@ namespace lfs::diagnostics {
             }
         }
         impl_->gpu_event_in_use[static_cast<std::size_t>(pair)] = false;
+#endif
     }
 
     void VramProfiler::drainGpuEvents() {
+#ifdef LFS_DIAGNOSTICS_CUDA
         if (!enabled()) {
             return;
         }
@@ -906,6 +921,7 @@ namespace lfs::diagnostics {
             impl_->gpu_event_in_use[idx] = false;
             it = impl_->gpu_event_pending.erase(it);
         }
+#endif
     }
 
     void VramProfiler::setGauge(std::string_view key, const double value) {
@@ -1093,6 +1109,7 @@ namespace lfs::diagnostics {
     }
 
     void VramProfiler::sampleCudaMemory() {
+#ifdef LFS_DIAGNOSTICS_CUDA
         if (!enabled()) {
             return;
         }
@@ -1154,6 +1171,7 @@ namespace lfs::diagnostics {
             impl_->sequence.fetch_add(1, std::memory_order_relaxed);
         }
         drainGpuEvents();
+#endif
     }
 
     void VramProfiler::updateProcessMemory(const std::size_t process_used,

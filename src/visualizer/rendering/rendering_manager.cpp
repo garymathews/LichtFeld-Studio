@@ -1,11 +1,14 @@
+#if LFS_TENSOR_CUDA
+#include "core/cuda/memory_arena.hpp"
+#endif
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "rendering_manager.hpp"
-#include "core/cuda/memory_arena.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/tensor_backend.hpp"
 #include "point_cloud_vulkan_renderer.hpp"
 #include "preferences.hpp"
 #include "rendering/export_post_process.hpp"
@@ -431,7 +434,9 @@ namespace lfs::vis {
             point_cloud_vulkan_renderer_->reset();
         }
         frame_lifecycle_service_.resetModelTracking();
-        lfs::core::Tensor::trim_memory_pool();
+        if (lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA)) {
+            lfs::core::Tensor::trim_memory_pool();
+        }
     }
 
     void RenderingManager::noteVksplatIdleFrame(const bool training_active) {
@@ -440,8 +445,14 @@ namespace lfs::vis {
             return;
         }
 
+
+#if LFS_TENSOR_CUDA
         auto* const arena = lfs::core::GlobalArenaManager::instance().try_get_arena();
         const bool under_pressure = arena != nullptr && arena->is_under_memory_pressure();
+
+#else
+        const bool under_pressure = false; // CUDA arena pressure is not a Vulkan memory metric.
+#endif
 
         if (!training_active) {
             vksplat_idle_frame_count_ = 0;
@@ -504,18 +515,6 @@ namespace lfs::vis {
                 settings_.lod_cone_foveation != sanitized_settings.lod_cone_foveation ||
                 settings_.lod_cone_inner_degrees != sanitized_settings.lod_cone_inner_degrees ||
                 settings_.lod_cone_outer_degrees != sanitized_settings.lod_cone_outer_degrees;
-
-            // Update preview color if changed
-            if (settings_.selection_color_preview != sanitized_settings.selection_color_preview) {
-                const auto& p = sanitized_settings.selection_color_preview;
-                lfs::rendering::config::setSelectionPreviewColor(make_float3(p.x, p.y, p.z));
-            }
-
-            // Update center marker color (group 0) if changed
-            if (settings_.selection_color_center_marker != sanitized_settings.selection_color_center_marker) {
-                const auto& m = sanitized_settings.selection_color_center_marker;
-                lfs::rendering::config::setSelectionGroupColor(0, make_float3(m.x, m.y, m.z));
-            }
 
             if (sanitized_settings.camera_metrics_mode == RenderSettings::CameraMetricsMode::Off) {
                 clear_metrics = true;

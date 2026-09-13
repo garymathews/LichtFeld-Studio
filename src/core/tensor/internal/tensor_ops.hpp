@@ -4,7 +4,8 @@
 #pragma once
 
 #include "core/export.hpp"
-#include "tensor_functors.hpp"
+#include "core/tensor/backend/kernel_contracts.hpp"
+#include "core/tensor/internal/tensor_functors.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -26,7 +27,8 @@ namespace lfs::core {
 #ifdef __CUDACC__
 #include "tensor_generic_ops.cuh"
 #include <cfloat>
-#define CUDA_INFINITY FLT_MAX
+#include <cmath>
+#define CUDA_INFINITY INFINITY
 #else
 // Forward declaration for C++ files - implementation in tensor_ops.cu
 namespace lfs::core::tensor_ops {
@@ -44,25 +46,6 @@ namespace lfs::core::tensor_ops {
 } // namespace lfs::core::tensor_ops
 #define CUDA_INFINITY INFINITY
 #endif
-
-// ============= CPU Helpers (Generic, Header-Only) =============
-namespace lfs::core {
-    // CPU helper for unary operations
-    template <typename T, typename OutT, typename Op>
-    void apply_unary_cpu(const T* input, OutT* output, size_t n, Op op) {
-        for (size_t i = 0; i < n; ++i) {
-            output[i] = op(input[i]);
-        }
-    }
-
-    // CPU helper for binary operations
-    template <typename T, typename OutputT, typename Op>
-    void apply_binary_cpu(const T* a, const T* b, OutputT* c, size_t n, Op op) {
-        for (size_t i = 0; i < n; ++i) {
-            c[i] = op(a[i], b[i]);
-        }
-    }
-} // namespace lfs::core
 
 namespace lfs::core::tensor_ops {
 
@@ -116,23 +99,6 @@ namespace lfs::core::tensor_ops {
                                                  size_t outer_size, size_t reduce_size,
                                                  size_t inner_size, ReduceOp op,
                                                  cudaStream_t stream);
-
-    // Host heuristic: true → prefer strided_fast over permute+contiguous.
-    [[nodiscard]] LFS_CORE_API bool should_prefer_strided_over_transpose(
-        size_t outer_size, size_t reduce_size, size_t inner_size) noexcept;
-
-    // Test/debug hooks for path selection
-    enum class ReducePathForTesting : int {
-        None = 0,
-        StridedFast,
-        Transpose,
-        Column,
-        Default,
-    };
-    LFS_CORE_API void set_reduce_path_override_for_testing(ReducePathForTesting path) noexcept;
-    [[nodiscard]] LFS_CORE_API ReducePathForTesting reduce_path_override_for_testing() noexcept;
-    [[nodiscard]] LFS_CORE_API ReducePathForTesting reduce_last_path_for_testing() noexcept;
-    LFS_CORE_API void set_reduce_last_path_for_testing(ReducePathForTesting path) noexcept;
 
     // ============= Direct Scalar Reductions (Fast Path) =============
     LFS_CORE_API float direct_sum_scalar(const float* data, size_t n, cudaStream_t stream);
@@ -195,10 +161,6 @@ namespace lfs::core::tensor_ops {
     template <typename T>
     struct div_op {
         __device__ T operator()(T a, T b) const { return a / b; }
-    };
-    template <typename T>
-    struct pow_op {
-        __device__ T operator()(T a, T b) const { return powf(a, b); }
     };
     template <typename T>
     struct eq_op {
@@ -270,63 +232,9 @@ namespace lfs::core::tensor_ops {
         size_t lhs_rank, size_t rhs_rank, size_t output_rank, size_t output_elements,
         cudaStream_t stream);
 
-    template <typename UnaryOp>
-    void launch_float_unary_with_numeric_policy(const float* input, float* output,
-                                                size_t n, UnaryOp op, cudaStream_t stream) {
-        if constexpr (std::is_same_v<UnaryOp, ops::round_op>) {
-            launch_ieee_round_float(input, output, n, stream);
-        } else {
-            launch_unary_op_generic(input, output, n, op, stream);
-        }
-    }
-
-    template <typename BinaryOp>
-    void launch_float_binary_with_numeric_policy(const float* lhs, const float* rhs,
-                                                 float* output, size_t n, BinaryOp op,
-                                                 cudaStream_t stream) {
-        if constexpr (std::is_same_v<BinaryOp, ops::maximum_op>) {
-            launch_ieee_maximum_float(lhs, rhs, output, n, stream);
-        } else if constexpr (std::is_same_v<BinaryOp, ops::minimum_op>) {
-            launch_ieee_minimum_float(lhs, rhs, output, n, stream);
-        } else {
-            launch_binary_op_generic(lhs, rhs, output, n, op, stream);
-        }
-    }
-
-    template <typename BinaryOp>
-    void launch_float_broadcast_with_numeric_policy(
-        const float* lhs, const float* rhs, float* output,
-        const size_t* lhs_shape, const size_t* rhs_shape, const size_t* output_shape,
-        size_t lhs_rank, size_t rhs_rank, size_t output_rank, size_t output_elements,
-        BinaryOp op, cudaStream_t stream) {
-        if constexpr (std::is_same_v<BinaryOp, ops::maximum_op>) {
-            launch_ieee_maximum_float_broadcast(
-                lhs, rhs, output, lhs_shape, rhs_shape, output_shape,
-                lhs_rank, rhs_rank, output_rank, output_elements, stream);
-        } else if constexpr (std::is_same_v<BinaryOp, ops::minimum_op>) {
-            launch_ieee_minimum_float_broadcast(
-                lhs, rhs, output, lhs_shape, rhs_shape, output_shape,
-                lhs_rank, rhs_rank, output_rank, output_elements, stream);
-        } else {
-            launch_broadcast_binary(
-                lhs, rhs, output, lhs_shape, rhs_shape, output_shape,
-                lhs_rank, rhs_rank, output_rank, output_elements, op, stream);
-        }
-    }
+    // IEEE round, maximum and minimum policy selection lives in CudaBackendOps.
 
     // ============= Matrix Operations =============
-    LFS_CORE_API void launch_matmul(const float* a, const float* b, float* c,
-                                    size_t m, size_t n, size_t k,
-                                    cudaStream_t stream);
-
-    LFS_CORE_API void launch_batch_matmul(const float* a, const float* b, float* c,
-                                          size_t batch_size, size_t m, size_t n, size_t k,
-                                          cudaStream_t stream);
-
-    LFS_CORE_API void launch_transpose(const float* input, float* output,
-                                       size_t rows, size_t cols,
-                                       cudaStream_t stream);
-
     LFS_CORE_API void launch_dot_product(const float* a, const float* b, float* result,
                                          size_t n, cudaStream_t stream);
 
@@ -605,26 +513,6 @@ namespace lfs::core::tensor_ops {
     LFS_CORE_API void launch_fused_affine_transform(const float* input, float* output,
                                                     size_t n, float a, float b,
                                                     cudaStream_t stream = nullptr);
-
-    // ============= Fused Pointwise Chain =============
-    static constexpr int FUSED_POINTWISE_MAX_OPS = 16;
-
-    struct FusedPointwiseOp {
-        uint8_t kind = 0;
-        float scalar = 0.0f;
-        // Device pointer for tensor-binary stages (kinds 4-7). Null for scalar/unary.
-        const float* rhs = nullptr;
-    };
-
-    struct FusedPointwiseOpChain {
-        FusedPointwiseOp ops[FUSED_POINTWISE_MAX_OPS];
-        int num_ops = 0;
-    };
-
-    // Optional test/diagnostic counter of tensor-lib kernel launches (fused + binary).
-    LFS_CORE_API void reset_tensor_kernel_launch_count() noexcept;
-    LFS_CORE_API uint64_t tensor_kernel_launch_count() noexcept;
-    LFS_CORE_API void record_tensor_kernel_launch(uint64_t n = 1) noexcept;
 
     LFS_CORE_API void launch_fused_pointwise_chain(const float* input, float* output,
                                                    size_t n, const FusedPointwiseOpChain& chain,

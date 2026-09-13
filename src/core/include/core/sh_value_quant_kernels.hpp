@@ -5,7 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 
 namespace lfs::core::sh_value_quant {
 

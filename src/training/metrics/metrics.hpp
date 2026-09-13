@@ -5,6 +5,7 @@
 #pragma once
 
 #include "../dataset.hpp"
+#include "../rasterization/vulkan_rasterizer.hpp"
 #include "core/nn/models/lpips.hpp"
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
@@ -173,6 +174,7 @@ namespace lfs::training {
         }
 
         // Check if evaluation is enabled
+        void set_evaluation_params(const core::param::OptimizationParameters& params) { _params.optimization = params; }
         bool is_enabled() const { return _params.optimization.enable_eval; }
 
         // Check if we should evaluate at this iteration
@@ -182,7 +184,8 @@ namespace lfs::training {
         EvalMetrics evaluate(const int iteration,
                              const lfs::core::SplatData& splatData,
                              std::shared_ptr<CameraDataset> val_dataset,
-                             lfs::core::Tensor& background);
+                             lfs::core::Tensor& background,
+                             const lfs::core::Tensor& background_image = {});
 
         // Save final report
         void save_report() const {
@@ -198,8 +201,10 @@ namespace lfs::training {
 
     private:
         // Configuration
-        const lfs::core::param::TrainingParameters _params;
+        lfs::core::param::TrainingParameters _params;
         lfs::core::Camera::NormalPriorDecode _normal_prior_decode{};
+
+        std::unique_ptr<VulkanTrainingRasterizer> vulkan_rasterizer_;
 
         // Metrics
         std::unique_ptr<PSNR> _psnr_metric;

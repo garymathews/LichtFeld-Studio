@@ -670,6 +670,10 @@ namespace lfs::python {
             "set_panel_enabled", [](const std::string& panel_id, bool enabled) {
                 invoke_on_viewer([panel_id, enabled] {
                     gui::PanelRegistry::instance().set_panel_enabled(panel_id, enabled);
+#ifdef __APPLE__
+                    if (enabled)
+                        gui::PanelRegistry::instance().bring_panel_to_front(panel_id);
+#endif
                 });
             },
             nb::arg("panel_id"), nb::arg("enabled"), "Enable or disable a panel by id");

@@ -348,15 +348,14 @@ namespace lfs::training::morton {
         }
     } // namespace
 
-    void permute_row_tensor(Tensor& tensor, const Tensor& perm) {
+    void permute_row_tensor(Tensor& tensor, const Tensor& perm, const int axis) {
         if (!tensor.is_valid() || tensor.numel() == 0 || !perm.is_valid() || perm.numel() == 0) {
             return;
         }
-        const std::size_t n = perm.numel();
-        if (tensor.ndim() == 2 && tensor.size(1) == n && tensor.size(0) != n) {
+        if (axis != 0) {
             Tensor dest = Tensor::zeros(tensor.shape(), tensor.device(), tensor.dtype());
             dest.set_stream(tensor.stream());
-            tensor.index_select_into(dest, 1, perm, BoundaryMode::Assert);
+            tensor.index_select_into(dest, axis, perm, BoundaryMode::Assert);
             tensor = std::move(dest);
             return;
         }
@@ -400,7 +399,7 @@ namespace lfs::training::morton {
         permute_shN(splat, result.permutation, stream);
 
         if (splat._densification_info.is_valid() && splat._densification_info.numel() > 0) {
-            permute_row_tensor(splat._densification_info, result.permutation);
+            permute_row_tensor(splat._densification_info, result.permutation, 1);
         }
         if (splat._max_screen_share.is_valid() && splat._max_screen_share.numel() > 0) {
             LFS_CUDA_CHECK_MSG(cudaDeviceSynchronize(),

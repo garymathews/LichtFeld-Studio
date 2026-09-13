@@ -2,17 +2,21 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/memory_pressure.hpp"
+#include "core/tensor.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
+#include "core/cuda_error.hpp"
+#include "core/pinned_memory_allocator.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
+#include <cuda_runtime_api.h>
+#endif
 
 #include "core/alloc_counter.hpp"
 #include "core/checked_arithmetic.hpp"
-#include "core/cuda_error.hpp"
 #include "core/environment.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
-#include "core/pinned_memory_allocator.hpp"
-#include "tensor/internal/memory_pool.hpp"
 
-#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <atomic>
@@ -35,6 +39,10 @@ namespace lfs::core {
         // Consumes only a sticky OOM before querying so an unrelated asynchronous
         // error is preserved for its real handler.
         size_t query_device_free_bytes() {
+            if (default_gpu_backend() == GpuBackend::Vulkan) {
+                return gpu_backend_memory_info(GpuBackend::Vulkan).free_bytes;
+            }
+#if LFS_TENSOR_CUDA
             const cudaError_t sticky = cudaPeekAtLastError();
             if (sticky == cudaErrorMemoryAllocation) {
                 cudaGetLastError();
@@ -49,17 +57,28 @@ namespace lfs::core {
                 return 0;
             }
             return free_bytes;
+#else
+            return 0;
+#endif
         }
 
         size_t query_device_total_bytes() {
+            if (default_gpu_backend() == GpuBackend::Vulkan) {
+                return gpu_backend_memory_info(GpuBackend::Vulkan).total_bytes;
+            }
+#if LFS_TENSOR_CUDA
             size_t free_bytes = 0;
             size_t total_bytes = 0;
             if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
                 return 0;
             }
             return total_bytes;
+#else
+            return 0;
+#endif
         }
 
+#if LFS_TENSOR_CUDA
         [[noreturn]] void throw_cuda_unavailable_allocation(
             const size_t bytes,
             const cudaStream_t stream,
@@ -122,18 +141,8 @@ namespace lfs::core {
                 label ? label : "", operation ? operation : ""));
         }
 
+#endif
     } // namespace
-
-    MemoryAllocationError::MemoryAllocationError(const AllocationFailure& failure)
-        : std::runtime_error(std::format(
-              "{} out of memory: failed to allocate {} for '{}' (op '{}', device {}, native {})",
-              to_string(failure.domain),
-              format_bytes(failure.requested_bytes),
-              failure.label ? failure.label : "",
-              failure.operation ? failure.operation : "",
-              failure.device,
-              failure.native_error)),
-          failure_(failure) {}
 
     struct MemoryPressureCoordinator::Impl {
         struct LedgerEntry {
@@ -224,6 +233,7 @@ namespace lfs::core {
 
     MemoryPressureCoordinator::MemoryPressureCoordinator()
         : impl_(new Impl()) {
+#if LFS_TENSOR_CUDA
         register_client(PressureClient{
             .name = "tensor-cuda-pool",
             .priority = 10,
@@ -249,6 +259,20 @@ namespace lfs::core {
                 allocator.empty_cache();
                 return ReclaimResult{.logical_bytes_released = before}; },
         });
+#endif
+#if LFS_TENSOR_VULKAN
+        register_client(PressureClient{
+            .name = "tensor-vulkan-pool",
+            .priority = 10,
+            .domain = MemoryDomain::VulkanDevice,
+            .affinity = PressureAffinity::ImmediateThreadSafe,
+            .estimate = nullptr,
+            .shrink = [](const PressureRequest&) {
+                Tensor::trim_memory_pool();
+                return ReclaimResult{};
+            },
+        });
+#endif
     }
 
     MemoryPressureCoordinator::~MemoryPressureCoordinator() {
@@ -260,6 +284,7 @@ namespace lfs::core {
         return coordinator;
     }
 
+#if LFS_TENSOR_CUDA
     void* allocate_cuda_storage(const size_t bytes,
                                 const cudaStream_t stream,
                                 const CudaStorageMode mode,
@@ -294,9 +319,11 @@ namespace lfs::core {
         if (ptr != nullptr) {
             return ptr;
         }
-        if (cuda_is_unavailable()) {
+#if LFS_TENSOR_CUDA
+        if (default_gpu_backend() == GpuBackend::CUDA && cuda_is_unavailable()) {
             throw_cuda_unavailable_allocation(bytes, stream, label, operation);
         }
+#endif
         if (failure_status != cudaErrorMemoryAllocation) {
             throw_non_oom_cuda_allocation(failure_status, bytes, label, operation);
         }
@@ -320,7 +347,8 @@ namespace lfs::core {
         // state sticky. Consume it before returning control to later CUDA work.
         (void)cudaGetLastError();
         if (ptr == nullptr) {
-            if (cuda_is_unavailable()) {
+    #if LFS_TENSOR_CUDA
+        if (default_gpu_backend() == GpuBackend::CUDA && cuda_is_unavailable()) {
                 throw_cuda_unavailable_allocation(bytes, stream, label, operation);
             }
             if (failure_status != cudaErrorMemoryAllocation) {
@@ -328,8 +356,11 @@ namespace lfs::core {
             }
             throw MemoryAllocationError(failure);
         }
+#endif
         return ptr;
     }
+
+#endif
 
     size_t MemoryPressureCoordinator::reserve_bytes() const noexcept {
         std::call_once(impl_->reserve_once, [this]() {
@@ -363,18 +394,22 @@ namespace lfs::core {
         if (Impl::in_episode) {
             return 0;
         }
-        if (cuda_is_unavailable()) {
+#if LFS_TENSOR_CUDA
+        if (default_gpu_backend() == GpuBackend::CUDA && cuda_is_unavailable()) {
             return 0;
         }
+#endif
         Impl::in_episode = true;
         struct Guard {
             ~Guard() { Impl::in_episode = false; }
         } guard;
 
         std::lock_guard<std::mutex> episode_lock(impl_->episode_mutex);
-        if (cuda_is_unavailable()) {
+#if LFS_TENSOR_CUDA
+        if (default_gpu_backend() == GpuBackend::CUDA && cuda_is_unavailable()) {
             return 0;
         }
+#endif
 
         const size_t reserve = reserve_bytes();
         const size_t target = saturating_add(failure.requested_bytes, reserve);
@@ -426,7 +461,9 @@ namespace lfs::core {
         const bool satisfied = !is_device_heap(failure.domain) || free_after >= target;
         const size_t observed_released = free_after > free_before ? free_after - free_before : 0;
 
+#if LFS_TENSOR_CUDA
         record_cuda_breadcrumb("memory-pressure.episode", __FILE__, __LINE__);
+#endif
 
         std::string summary = std::format(
             "VRAM pressure episode #{} ({}): requested {}, reserve {}, free {} -> {}, released {} across {} client(s){}",
@@ -465,9 +502,11 @@ namespace lfs::core {
 
     bool MemoryPressureCoordinator::relieve_and_should_retry(const AllocationFailure& failure,
                                                              PressureContext context) {
-        if (cuda_is_unavailable()) {
+#if LFS_TENSOR_CUDA
+        if (default_gpu_backend() == GpuBackend::CUDA && cuda_is_unavailable()) {
             return false;
         }
+#endif
         const size_t target = saturating_add(failure.requested_bytes, reserve_bytes());
         const size_t freed = run_episode(failure, context);
         if (freed > 0) {
@@ -521,9 +560,11 @@ namespace lfs::core {
     }
 
     void MemoryPressureCoordinator::maybe_recover() {
-        if (cuda_is_unavailable()) {
+#if LFS_TENSOR_CUDA
+        if (default_gpu_backend() == GpuBackend::CUDA && cuda_is_unavailable()) {
             return;
         }
+#endif
         if (!impl_->pressure_active.load()) {
             return;
         }

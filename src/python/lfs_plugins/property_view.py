@@ -114,6 +114,13 @@ AUTO_ADVANCED_RUN_ID = "advanced_registry"
 
 # Per-row visibility inside a run (auto-advanced rows have no run-level condition).
 PROP_VISIBILITY_CONDITION_IDS = {
+    "gut": "cuda_backend",
+    "ppisp": "cuda_backend",
+    "use_exposure_correction": "cuda_backend",
+    "use_bilateral_grid": "cuda_backend",
+    "enable_sparsity": "cuda_backend",
+    "use_depth_loss": "cuda_backend",
+    "use_normal_loss": "cuda_backend",
     "ppisp_reg_weight": "dep_show_ppisp_reg_weight",
 }
 

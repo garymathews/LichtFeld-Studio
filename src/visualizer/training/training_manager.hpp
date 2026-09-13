@@ -98,8 +98,16 @@ namespace lfs::vis {
 
         // State machine access
         [[nodiscard]] const TrainingStateMachine& getStateMachine() const { return state_machine_; }
-        [[nodiscard]] bool canPerform(TrainingAction action) const { return state_machine_.canPerform(action); }
+        [[nodiscard]] bool canPerform(TrainingAction action) const {
+            // A reopened project presents its checkpoint before constructing a
+            // live Trainer. Resume hydrates that session through the viewer.
+            if (action == TrainingAction::Resume && stored_session_presentation_active_)
+                return !stored_session_presentation_completed_;
+            return state_machine_.canPerform(action);
+        }
         [[nodiscard]] std::string_view getActionBlockedReason(TrainingAction action) const {
+            if (action == TrainingAction::Resume && canPerform(action))
+                return {};
             return state_machine_.getActionBlockedReason(action);
         }
 
@@ -139,6 +147,8 @@ namespace lfs::vis {
         int getMaxGaussians() const;
         std::vector<size_t> getSaveSteps() const;
         void setSaveSteps(std::vector<size_t> save_steps);
+        void processParameterUpdateResult(
+            std::optional<lfs::training::Trainer::ParameterUpdateResult> result = std::nullopt);
         const char* getStrategyType() const;
         bool isGutEnabled() const;
 

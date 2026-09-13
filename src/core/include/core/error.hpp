@@ -147,6 +147,16 @@ namespace lfs {
         SmallFields& add(std::string_view key, std::int64_t value);
         SmallFields& add(std::string_view key, std::uint64_t value);
         SmallFields& add(std::string_view key, double value);
+        // size_t is unsigned long on macOS, while uint64_t is unsigned long long.
+        // Normalize other integral types rather than selecting bool/double by accident.
+        template <std::integral T>
+            requires(!std::same_as<T, bool> && !std::same_as<T, std::int64_t> && !std::same_as<T, std::uint64_t>)
+        SmallFields& add(std::string_view key, T value) {
+            if constexpr (std::is_signed_v<T>)
+                return add(key, static_cast<std::int64_t>(value));
+            else
+                return add(key, static_cast<std::uint64_t>(value));
+        }
         SmallFields& add(std::string_view key, std::string value);
         SmallFields& add(std::string_view key, std::string_view value);
 

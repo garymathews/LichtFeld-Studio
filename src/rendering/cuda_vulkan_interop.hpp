@@ -8,7 +8,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <optional>
 #include <string>
 #include <vector>
@@ -137,11 +139,13 @@ namespace lfs::rendering {
         [[nodiscard]] bool signal(std::uint64_t value, cudaStream_t stream) const;
 
     private:
+#if LFS_TENSOR_CUDA
         cudaExternalMemory_t cuda_mem_ = nullptr;
         cudaMipmappedArray_t cuda_mip_ = nullptr;
         cudaArray_t cuda_array_ = nullptr;
         cudaSurfaceObject_t surface_ = 0;
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
+#endif
         mutable std::uint64_t last_signaled_ = 0;
         mutable std::uint64_t last_waited_ = 0;
         std::size_t allocation_size_ = 0;
@@ -171,18 +175,28 @@ namespace lfs::rendering {
         [[nodiscard]] bool init(CudaVulkanExternalSemaphoreImport semaphore);
         void reset();
 
-        [[nodiscard]] bool valid() const { return cuda_timeline_ != nullptr; }
+        [[nodiscard]] bool valid() const {
+#if LFS_TENSOR_CUDA
+            return cuda_timeline_ != nullptr;
+#else
+            return false;
+#endif
+        }
         [[nodiscard]] const std::string& lastError() const { return last_error_; }
 
         // Raw handle for consumers that enqueue waits themselves (the trainer's
         // viewer-release fence). Lifetime stays owned by this object.
+#if LFS_TENSOR_CUDA
         [[nodiscard]] cudaExternalSemaphore_t handle() const { return cuda_timeline_; }
+#endif
 
         [[nodiscard]] bool cudaSignal(std::uint64_t value, cudaStream_t stream) const;
         [[nodiscard]] bool cudaWait(std::uint64_t value, cudaStream_t stream) const;
 
     private:
+#if LFS_TENSOR_CUDA
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
+#endif
         mutable std::uint64_t last_signaled_ = 0;
         mutable std::uint64_t last_waited_ = 0;
         mutable std::string last_error_;

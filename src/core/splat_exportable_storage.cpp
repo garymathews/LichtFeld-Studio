@@ -12,7 +12,9 @@
 #include "core/tensor/internal/tensor_impl.hpp"
 #include "diagnostics/vram_profiler.hpp"
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -138,11 +140,15 @@ namespace lfs::core {
     } // namespace
 
     std::size_t SplatExportableStorage::layoutBytes(std::size_t capacity, int sh_degree) {
+#if LFS_TENSOR_CUDA
         if (capacity == 0) {
             return 0;
         }
         const std::size_t gran = exportable_allocation_granularity(0);
         return compute_layout(capacity, sh_degree, gran).total;
+#else
+        throw std::runtime_error("CUDA VMM storage is unavailable; Vulkan uses tensor storage");
+#endif
     }
 
     std::size_t SplatExportableStorage::layoutBytesPerSplat(int sh_degree) {
@@ -183,6 +189,7 @@ namespace lfs::core {
     std::expected<SplatExportableStorage, std::string>
     SplatExportableStorage::create(std::size_t capacity, int sh_degree, int device,
                                    std::size_t reserve_capacity) {
+#if LFS_TENSOR_CUDA
         if (capacity == 0) {
             return std::unexpected("SplatExportableStorage::create: capacity must be > 0");
         }
@@ -245,9 +252,13 @@ namespace lfs::core {
                  live_bytes[ShNBounds] >> 20);
 
         return out;
+#else
+        return std::unexpected("CUDA VMM storage is unavailable; Vulkan uses tensor storage");
+#endif
     }
 
     std::expected<bool, std::string> SplatExportableStorage::grow(std::size_t new_capacity) {
+#if LFS_TENSOR_CUDA
         if (poisoned_) {
             return std::unexpected(
                 "SplatExportableStorage::grow: storage is poisoned by a failed rollback");
@@ -344,6 +355,9 @@ namespace lfs::core {
                  block->committed_bytes >> 20,
                  block->chunks.size());
         return true;
+#else
+        return std::unexpected("CUDA VMM storage is unavailable; Vulkan uses tensor storage");
+#endif
     }
 
     void SplatExportableStorage::restoreCapacity(const std::size_t capacity,

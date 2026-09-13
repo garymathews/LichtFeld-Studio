@@ -5,6 +5,7 @@
 #include "viewport_interop_service.hpp"
 
 #include "core/logger.hpp"
+#include "core/tensor_backend.hpp"
 #include "output_image_pool.hpp"
 #include "passes/vulkan_viewport_pass.hpp"
 #include "window/vulkan_context.hpp"
@@ -137,9 +138,12 @@ namespace lfs::vis {
             return;
         }
         upload_stream_init_attempted_ = true;
+        if (!lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA)) {
+            return;
+        }
         if (!upload_stream_.init()) {
-            LOG_ERROR("Could not create the non-blocking CUDA/Vulkan GUI upload stream: {}",
-                      upload_stream_.lastError());
+            LOG_WARN("Could not create the non-blocking CUDA/Vulkan GUI upload stream: {}",
+                     upload_stream_.lastError());
         }
     }
 
@@ -1036,7 +1040,7 @@ namespace lfs::vis {
         pending_uploads_.clear();
         pending_frame_barriers_.clear();
         pending_layout_commits_.clear();
-        if (!upload_stream_.synchronize()) {
+        if (teardown_context_ && teardown_context_->externalMemoryInteropEnabled() && !upload_stream_.synchronize()) {
             LOG_WARN("CUDA/Vulkan GUI upload stream synchronization failed during shutdown: {}",
                      upload_stream_.lastError());
         }

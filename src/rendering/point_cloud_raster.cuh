@@ -6,7 +6,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "core/cuda_stream_fwd.hpp"
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 namespace lfs::rendering::pcraster {
 
@@ -64,6 +67,11 @@ namespace lfs::rendering::pcraster {
     // Returns cudaSuccess on success. The image and depth pointers must point to
     // device memory of size [channels, height, width] and [1, height, width]
     // respectively.
+#if LFS_TENSOR_CUDA
     cudaError_t launchPointCloudRaster(const LaunchParams& params);
+#else
+    // All pointers reference host memory. This is the software viewer fallback.
+    void rasterizePointCloudCpu(const LaunchParams& params);
+#endif
 
 } // namespace lfs::rendering::pcraster

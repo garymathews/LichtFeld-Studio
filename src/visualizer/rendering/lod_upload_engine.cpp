@@ -5,9 +5,14 @@
 #include "lod_upload_engine.hpp"
 
 #include "core/logger.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/memory_pool.hpp"
+#endif
+#include "core/tensor_backend.hpp"
 
+#if LFS_TENSOR_CUDA
 #include "lod_page_dequant_cuda.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -50,11 +55,17 @@ namespace lfs::vis {
         std::lock_guard lock(mutex_);
         shutdown_ = true;
         slot_cv_.notify_all();
+
+#if LFS_TENSOR_CUDA
         for (const cudaEvent_t event : event_pool_) {
             (void)cudaEventDestroy(event);
         }
+#endif
+
         event_pool_.clear();
         releaseStagingRingLocked();
+
+#if LFS_TENSOR_CUDA
         if (stream_ != nullptr) {
             // The staging copies and dequant launches only touch raw cudaMalloc /
             // cudaHostAlloc + Vulkan-external memory, never the tensor pool — but
@@ -65,11 +76,14 @@ namespace lfs::vis {
             (void)cudaStreamDestroy(stream_);
             stream_ = nullptr;
         }
+#endif
+
     }
 
     std::vector<LodPageCache::PendingUpload>
     LodUploadEngine::configure(const DeviceLayout& layout,
                                const lfs::rendering::CudaTimelineSemaphore* const timeline) {
+#if LFS_TENSOR_CUDA
         {
             std::lock_guard lock(mutex_);
             if (layout_ == layout && timeline_ == timeline) {
@@ -81,7 +95,11 @@ namespace lfs::vis {
         layout_ = layout;
         timeline_ = timeline;
         if (stream_ == nullptr && layout_.valid()) {
-            if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
+            if (!lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA) ||
+                cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
+                if (!lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA)) {
+                    LOG_WARN("LOD upload engine is unavailable without a usable CUDA device");
+                }
                 stream_ = nullptr;
             }
         }
@@ -89,7 +107,9 @@ namespace lfs::vis {
         staging_layout_ = stagingLayoutFor(layout_.meta_base != nullptr);
         if (layout_.valid() && stream_ != nullptr) {
             staging_ring_.resize(stagingRingDepth());
-            for (auto& slot : staging_ring_) {
+
+#if LFS_TENSOR_CUDA
+        for (auto& slot : staging_ring_) {
                 if (cudaHostAlloc(reinterpret_cast<void**>(&slot.data),
                                   staging_layout_.total_bytes,
                                   cudaHostAllocDefault) != cudaSuccess) {
@@ -103,6 +123,8 @@ namespace lfs::vis {
                     slot.last_use = nullptr;
                 }
             }
+#endif
+
             // Partially-allocated slots can never be acquired; keep only
             // complete ones so an allocation-starved ring reads as
             // unconfigured instead of parking decode workers forever in
@@ -132,7 +154,12 @@ namespace lfs::vis {
         }
         slot_cv_.notify_all();
         return drained;
-    }
+
+#else
+        if (layout.valid()) throw std::runtime_error("Quantized LOD streaming is unavailable on Vulkan");
+        return {};
+#endif
+}
 
     bool LodUploadEngine::configured() const {
         std::lock_guard lock(mutex_);
@@ -159,6 +186,7 @@ namespace lfs::vis {
     }
 
     LodUploadEngine::StagingSlot* LodUploadEngine::acquireStagingSlot() {
+#if LFS_TENSOR_CUDA
         std::unique_lock lock(mutex_);
         while (true) {
             if (shutdown_ || staging_ring_.empty()) {
@@ -194,7 +222,11 @@ namespace lfs::vis {
             }
             return candidate;
         }
-    }
+
+#else
+        return nullptr; // No CUDA staging ring is configured.
+#endif
+}
 
     void LodUploadEngine::releaseSlot(StagingSlot* const slot) {
         if (slot == nullptr) {
@@ -209,6 +241,7 @@ namespace lfs::vis {
                                            const lfs::io::RadPagePackedDesc& desc,
                                            const std::uint32_t page,
                                            const std::uint64_t generation) {
+#if LFS_TENSOR_CUDA
         Job job{
             .upload = {
                 .page = page,
@@ -340,9 +373,14 @@ namespace lfs::vis {
         slot->acquired = false;
         slot_cv_.notify_all();
         in_flight_.push_back(std::move(job));
-    }
+
+#else
+        throw std::runtime_error("Quantized LOD streaming is unavailable on Vulkan");
+#endif
+}
 
     cudaEvent_t LodUploadEngine::acquireEventLocked() {
+#if LFS_TENSOR_CUDA
         if (!event_pool_.empty()) {
             const cudaEvent_t event = event_pool_.back();
             event_pool_.pop_back();
@@ -353,13 +391,19 @@ namespace lfs::vis {
             return nullptr;
         }
         return event;
-    }
+
+#else
+        throw std::logic_error("CUDA event requested by Vulkan LOD engine");
+#endif
+}
 
     std::vector<LodPageCache::PendingUpload>
     LodUploadEngine::takeCompletedLocked(const bool wait_for_all) {
         std::vector<LodPageCache::PendingUpload> published;
         while (!in_flight_.empty()) {
             Job& job = in_flight_.front();
+
+#if LFS_TENSOR_CUDA
             if (job.event != nullptr) {
                 if (!wait_for_all) {
                     const cudaError_t status = cudaEventQuery(job.event);
@@ -376,6 +420,10 @@ namespace lfs::vis {
                 job.event = nullptr;
                 last_published_signal_ = std::max(last_published_signal_, job.signal_value);
             }
+#else
+            if (job.event) throw std::logic_error("CUDA event in Vulkan LOD engine");
+#endif
+
             published.push_back(std::move(job.upload));
             in_flight_.pop_front();
         }
@@ -395,14 +443,20 @@ namespace lfs::vis {
                                     [](const StagingSlot& slot) { return slot.acquired; });
             });
         }
+
+#if LFS_TENSOR_CUDA
         if (stream_ != nullptr) {
             (void)cudaStreamSynchronize(stream_);
         }
+#endif
+
         std::lock_guard lock(mutex_);
         return takeCompletedLocked(true);
     }
 
     void LodUploadEngine::releaseStagingRingLocked() {
+
+#if LFS_TENSOR_CUDA
         for (auto& slot : staging_ring_) {
             if (slot.data != nullptr) {
                 (void)cudaFreeHost(slot.data);
@@ -414,6 +468,8 @@ namespace lfs::vis {
                 (void)cudaEventDestroy(slot.last_use);
             }
         }
+#endif
+
         staging_ring_.clear();
         staging_cursor_ = 0;
     }

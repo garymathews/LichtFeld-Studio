@@ -4,15 +4,20 @@
 
 #include "vulkan_external_tensor.hpp"
 
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/exportable_storage.hpp"
 #include "core/services.hpp"
 #include "core/shareable_allocation_limit.hpp"
+#include "core/tensor_backend.hpp"
 #include "window/window_manager.hpp"
 
 #include <algorithm>
 #include <array>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <format>
 #include <limits>
 
@@ -55,10 +60,14 @@ namespace lfs::vis {
           bytes_(bytes),
           extra_owner_(std::move(extra_owner)) {
         registered_cuda_base_ = cuda_ptr;
+
+#if LFS_TENSOR_CUDA
         if (registered_cuda_base_ != nullptr) {
             lfs::core::register_cuda_address_range(
                 registered_cuda_base_, bytes_, std::move(debug_label));
         }
+#endif
+
     }
 
     VulkanExternalTensorStorage::VulkanExternalTensorStorage(
@@ -90,9 +99,13 @@ namespace lfs::vis {
         if (parent_) {
             return;
         }
+
+#if LFS_TENSOR_CUDA
         if (registered_cuda_base_ != nullptr) {
             lfs::core::unregister_cuda_address_range(registered_cuda_base_);
         }
+#endif
+
         if (context_) {
             context_->destroyExternalBuffer(buffer_);
         }
@@ -160,6 +173,7 @@ namespace lfs::vis {
         const lfs::core::DataType dtype,
         const std::size_t capacity,
         const char* const debug_name) {
+#if LFS_TENSOR_CUDA
         if (!context.externalMemoryInteropEnabled()) {
             return std::unexpected("Vulkan external tensor allocation requires CUDA/Vulkan external-memory interop");
         }
@@ -257,7 +271,12 @@ namespace lfs::vis {
             cap_rows,
             nullptr,
             "vulkan_external_buffer");
-    }
+
+#else
+        try { return lfs::core::Tensor::zeros_direct(std::move(shape), capacity, lfs::core::Device::GPU, dtype); }
+        catch (const std::exception& e) { return std::unexpected(e.what()); }
+#endif
+}
 
     lfs::Result<lfs::core::SplatTensorAllocator>
     makeSplatExportableInteropAllocator(VulkanContext& context,
@@ -487,6 +506,19 @@ namespace lfs::vis {
     }
 
     lfs::core::SplatTensorAllocator makeViewerSplatTensorAllocator() {
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan) {
+            return [](lfs::core::TensorShape shape,
+                      const size_t capacity,
+                      const lfs::core::DataType dtype,
+                      const std::string_view name) -> lfs::core::Tensor {
+                (void)capacity;
+                auto tensor = lfs::core::Tensor::empty(
+                    std::move(shape), lfs::core::Device::CUDA, dtype);
+                tensor.set_name(std::string{name});
+                return tensor;
+            };
+        }
+
         auto* const window_manager = services().windowOrNull();
         auto* const context = window_manager ? window_manager->getVulkanContext() : nullptr;
         if (!context || !context->externalMemoryInteropEnabled()) {

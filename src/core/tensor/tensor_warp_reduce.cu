@@ -14,12 +14,12 @@
 
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
+#include "core/tensor/internal/packed128.cuh"
+#include "core/tensor/internal/tensor_ops.hpp"
+#include "core/tensor/internal/warp_reduce.cuh"
 #include "internal/gpu_config.hpp"
-#include "internal/packed128.cuh"
 #include "internal/tensor_functors.hpp"
 #include "internal/tensor_impl.hpp"
-#include "internal/tensor_ops.hpp"
-#include "internal/warp_reduce.cuh"
 #include <algorithm>
 #include <cfloat>
 #include <cuda_runtime.h>
@@ -1409,7 +1409,7 @@ namespace lfs::core::tensor_ops {
         const size_t row_start = blockIdx.y * rows_per_block;
         const size_t row_end = min(row_start + rows_per_block, M);
 
-        float val = -FLT_MAX;
+        float val = -CUDA_INFINITY;
         for (size_t row = row_start; row < row_end; row++) {
             val = ops::max_reduce_op{}(val, input[row * N + col]);
         }
@@ -1437,7 +1437,7 @@ namespace lfs::core::tensor_ops {
         const size_t row_start = blockIdx.y * rows_per_block;
         const size_t row_end = min(row_start + rows_per_block, M);
 
-        float val = FLT_MAX;
+        float val = CUDA_INFINITY;
         for (size_t row = row_start; row < row_end; row++) {
             val = ops::min_reduce_op{}(val, input[row * N + col]);
         }
@@ -1492,7 +1492,7 @@ namespace lfs::core::tensor_ops {
         case ReduceOp::Max:
             if (grid_y > 1) {
                 thrust::fill(thrust::cuda::par_nosync.on(stream),
-                             thrust::device_ptr<float>(output), thrust::device_ptr<float>(output + N), -FLT_MAX);
+                             thrust::device_ptr<float>(output), thrust::device_ptr<float>(output + N), -CUDA_INFINITY);
             }
             column_reduce_max_kernel<<<grid, BLOCK, 0, stream>>>(input, output, M, N);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.warp_reduce.column_min_max");
@@ -1500,7 +1500,7 @@ namespace lfs::core::tensor_ops {
         case ReduceOp::Min:
             if (grid_y > 1) {
                 thrust::fill(thrust::cuda::par_nosync.on(stream),
-                             thrust::device_ptr<float>(output), thrust::device_ptr<float>(output + N), FLT_MAX);
+                             thrust::device_ptr<float>(output), thrust::device_ptr<float>(output + N), CUDA_INFINITY);
             }
             column_reduce_min_kernel<<<grid, BLOCK, 0, stream>>>(input, output, M, N);
             LFS_CUDA_LAUNCH_CHECK(stream, "tensor.warp_reduce.column_min_max");
@@ -1553,51 +1553,6 @@ namespace lfs::core::tensor_ops {
     //   - Y partitions the reduce dim; multi-Y uses atomics + SM-capped grid.
     // Beats permute+contiguous for many large-inner shapes by avoiding the
     // full-tensor transpose copy bandwidth.
-
-    namespace {
-        thread_local ReducePathForTesting g_reduce_path_override =
-            ReducePathForTesting::None;
-        thread_local ReducePathForTesting g_reduce_last_path =
-            ReducePathForTesting::Default;
-    } // namespace
-
-    void set_reduce_path_override_for_testing(ReducePathForTesting path) noexcept {
-        g_reduce_path_override = path;
-    }
-    ReducePathForTesting reduce_path_override_for_testing() noexcept {
-        return g_reduce_path_override;
-    }
-    ReducePathForTesting reduce_last_path_for_testing() noexcept {
-        return g_reduce_last_path;
-    }
-    void set_reduce_last_path_for_testing(ReducePathForTesting path) noexcept {
-        g_reduce_last_path = path;
-    }
-
-    bool should_prefer_strided_over_transpose(
-        size_t outer_size, size_t reduce_size, size_t inner_size) noexcept {
-        // Measured argmin on RTX 4080 (microbench, µs):
-        //   [64,512,512] dim0:  strided ~109  vs transpose ~570  → strided
-        //   [32,128,512] dim1:  strided ~17   vs transpose ~23   → strided
-        //   [4,2048,256] dim1:  strided ~18   vs transpose ~38   → strided
-        //   [1,4096,512] dim1:  strided ~18   vs transpose ~52   → strided
-        //   [8,64,1024]  dim1:  strided ~9.5  vs transpose ~8.0  → transpose (edge)
-        //   [16,16,256]  dim0:  strided ~3.9  vs transpose ~6.0  → strided
-        //
-        // New strided_fast kernel (coalesced inner, unrolled) beats the old
-        // ~74µs strided path; full-tensor transpose copy only edges out when
-        // the reduce axis is short (copy is cheap) and output is wide.
-        const size_t output_elems = outer_size * inner_size;
-        if (output_elems == 0 || reduce_size == 0 || inner_size < 256) {
-            return false; // small-inner uses legacy warp_strided / other paths
-        }
-        const size_t numel = outer_size * reduce_size * inner_size;
-        // Cheap-copy edge: short reduce + wide output + modest total size.
-        if (reduce_size <= 64 && output_elems >= 8192 && numel <= (1u << 20)) {
-            return false; // transpose class (measured)
-        }
-        return true; // strided_fast default for large-inner zone
-    }
 
     __global__ void strided_fast_sum_kernel(
         const float* __restrict__ input, float* __restrict__ output,
@@ -1803,7 +1758,7 @@ namespace lfs::core::tensor_ops {
                 thrust::fill(thrust::cuda::par_nosync.on(stream),
                              thrust::device_ptr<float>(output),
                              thrust::device_ptr<float>(output + output_elems),
-                             -FLT_MAX);
+                             -CUDA_INFINITY);
             }
             strided_fast_max_kernel<<<grid, BLOCK, 0, stream>>>(
                 input, output, outer_size, reduce_size, inner_size);
@@ -1814,7 +1769,7 @@ namespace lfs::core::tensor_ops {
                 thrust::fill(thrust::cuda::par_nosync.on(stream),
                              thrust::device_ptr<float>(output),
                              thrust::device_ptr<float>(output + output_elems),
-                             FLT_MAX);
+                             CUDA_INFINITY);
             }
             strided_fast_min_kernel<<<grid, BLOCK, 0, stream>>>(
                 input, output, outer_size, reduce_size, inner_size);

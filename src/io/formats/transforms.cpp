@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "transforms.hpp"
+#include "colmap.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/tensor.hpp"
-#include "formats/colmap.hpp"
 #include "tinyply.hpp"
 #include <array>
 #include <cmath>

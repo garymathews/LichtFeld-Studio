@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "Common.h"
-#include "memory_pool.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 
 #include <format>
 

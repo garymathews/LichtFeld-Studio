@@ -12,7 +12,11 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -97,12 +101,12 @@ namespace lfs::python {
         if (pid_ > 0) {
             ::kill(pid_, SIGTERM);
             usleep(50000);
-            if (is_running())
+            if (is_running()) {
                 ::kill(pid_, SIGKILL);
-            int status;
-            waitpid(pid_, &status, 0);
-            if (WIFEXITED(status))
-                exit_code_ = WEXITSTATUS(status);
+                wait();
+            }
+            // is_running() may already have reaped this child and set pid_ to
+            // -1. Never waitpid(-1): that would consume an unrelated child.
             pid_ = -1;
         }
     }
@@ -116,8 +120,12 @@ namespace lfs::python {
             stdout_fd_ = -1;
         }
 
-        int status;
-        if (waitpid(pid_, &status, 0) == pid_) {
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(pid_, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == pid_) {
             if (WIFEXITED(status))
                 exit_code_ = WEXITSTATUS(status);
             else if (WIFSIGNALED(status))

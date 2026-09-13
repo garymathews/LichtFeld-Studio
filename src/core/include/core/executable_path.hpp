@@ -11,6 +11,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <cstdint>
 #else
 #include <limits.h>
 #include <unistd.h>
@@ -41,6 +44,14 @@ namespace lfs::core {
 
         path.resize(size);
         return std::filesystem::path(path);
+#elif defined(__APPLE__)
+        uint32_t size = 0;
+        _NSGetExecutablePath(nullptr, &size);
+        std::string path(size, '\0');
+        if (_NSGetExecutablePath(path.data(), &size) != 0) {
+            throw std::runtime_error("_NSGetExecutablePath failed");
+        }
+        return std::filesystem::canonical(path.c_str());
 #else
         char path[PATH_MAX];
         const ssize_t count = readlink("/proc/self/exe", path, PATH_MAX - 1);
@@ -61,6 +72,15 @@ namespace lfs::core {
         static const std::filesystem::path resource_base = [] {
             const auto exe_dir = getExecutableDir();
 
+#ifdef __APPLE__
+            if (exe_dir.filename() == "MacOS") {
+                const auto bundle = exe_dir.parent_path() / "Resources";
+                if (std::filesystem::is_directory(bundle)) {
+                    return bundle;
+                }
+            }
+#endif
+
             // Production: exe in bin/, resources in ../share/LichtFeld-Studio/
             if (const auto prod = exe_dir.parent_path() / "share" / "LichtFeld-Studio";
                 std::filesystem::exists(prod)) {
@@ -77,6 +97,10 @@ namespace lfs::core {
         return resource_base;
     }
 
+    inline bool usingDevelopmentResources() {
+        return getResourceBaseDir() == getExecutableDir() / "resources";
+    }
+
     inline std::filesystem::path getAssetsDir() { return getResourceBaseDir() / "assets"; }
     inline std::filesystem::path getIconsDir() { return getAssetsDir() / "icon"; }
     inline std::filesystem::path getFontsDir() { return getAssetsDir() / "fonts"; }
@@ -87,6 +111,15 @@ namespace lfs::core {
     // Library path lookup: production (bin/../lib) or build directory
     inline std::filesystem::path getLibDir() {
         const auto exe_dir = getExecutableDir();
+
+#ifdef __APPLE__
+        if (exe_dir.filename() == "MacOS") {
+            const auto frameworks = exe_dir.parent_path() / "Frameworks";
+            if (std::filesystem::is_directory(frameworks)) {
+                return frameworks;
+            }
+        }
+#endif
 
         // Production: exe in bin/, libs in ../lib/
         if (const auto prod = exe_dir.parent_path() / "lib";

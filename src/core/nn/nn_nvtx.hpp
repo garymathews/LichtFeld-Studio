@@ -3,21 +3,32 @@
 #pragma once
 
 #include "core/alloc_counter.hpp"
+#include "core/cuda_stream_fwd.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
 
 #include <nvtx3/nvToolsExt.h>
+#include <cuda_runtime.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
-#include <cuda_runtime.h>
 #include <string>
 #include <vector>
 
 namespace lfs::core::nn {
 
     struct NvtxRange {
-        explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
-        ~NvtxRange() { nvtxRangePop(); }
+        explicit NvtxRange([[maybe_unused]] const char* name) {
+#if LFS_TENSOR_CUDA
+            nvtxRangePushA(name);
+#endif
+        }
+        ~NvtxRange() {
+#if LFS_TENSOR_CUDA
+            nvtxRangePop();
+#endif
+        }
         NvtxRange(const NvtxRange&) = delete;
         NvtxRange& operator=(const NvtxRange&) = delete;
     };
@@ -26,9 +37,9 @@ namespace lfs::core::nn {
     // ordered on `stream`; dump() synchronizes once at the end.
     class StageProfile {
     public:
-        explicit StageProfile(cudaStream_t stream) : stream_(stream) {
+        explicit StageProfile(cudaStream_t stream, bool cuda_backend = true) : stream_(stream) {
             const char* env = std::getenv("LFS_NN_PROFILE");
-            on_ = env != nullptr && env[0] != '\0' && env[0] != '0';
+            on_ = LFS_TENSOR_CUDA && cuda_backend && env != nullptr && env[0] != '\0' && env[0] != '0';
             alloc0_ = alloc_counter::snapshot();
             if (on_) {
                 mark("start");
@@ -36,9 +47,11 @@ namespace lfs::core::nn {
         }
 
         ~StageProfile() {
+#if LFS_TENSOR_CUDA
             for (auto& e : events_) {
                 LFS_CUDA_CHECK(cudaEventDestroy(e));
             }
+#endif
         }
 
         StageProfile(const StageProfile&) = delete;
@@ -50,14 +63,17 @@ namespace lfs::core::nn {
             if (!on_) {
                 return;
             }
+#if LFS_TENSOR_CUDA
             cudaEvent_t ev = nullptr;
             LFS_CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDefault));
             LFS_CUDA_CHECK(cudaEventRecord(ev, stream_));
             names_.emplace_back(name);
             events_.push_back(ev);
+#endif
         }
 
         void dump() {
+#if LFS_TENSOR_CUDA
             const auto allocs = alloc_counter::delta_since(alloc0_);
             if (!on_ || events_.size() < 2) {
                 if (on_) {
@@ -83,6 +99,7 @@ namespace lfs::core::nn {
                 std::fprintf(stderr, "  %7.3f  %s\n", static_cast<double>(ms), names_[i].c_str());
             }
             std::fprintf(stderr, "  %7.3f  TOTAL\n", static_cast<double>(total));
+#endif
         }
 
     private:
@@ -90,7 +107,9 @@ namespace lfs::core::nn {
         cudaStream_t stream_ = nullptr;
         alloc_counter::Snapshot alloc0_ = 0;
         std::vector<std::string> names_;
+#if LFS_TENSOR_CUDA
         std::vector<cudaEvent_t> events_;
+#endif
     };
 
 } // namespace lfs::core::nn

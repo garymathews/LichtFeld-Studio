@@ -5,7 +5,9 @@
 #include "visualizer_impl.hpp"
 #include "core/animatable_property.hpp"
 #include "core/crash_handler.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/data_loading_service.hpp"
 #include "core/error.hpp"
 #include "core/error_bus.hpp"
@@ -1071,9 +1073,13 @@ namespace lfs::vis {
         try {
             std::rethrow_exception(eptr);
         } catch (const lfs::core::MemoryAllocationError& e) {
+
+#if LFS_TENSOR_CUDA
             if (lfs::core::cuda_is_unavailable()) {
                 return;
             }
+#endif
+
             const auto fx = frame_state_.on_fault(FrameFault::OomPressure);
             if (fx.run_reclaim_episode) {
                 // GPU memory shortage reached the frame loop. Reclaim render-safe
@@ -2042,6 +2048,7 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::update() {
+        if (trainer_manager_) trainer_manager_->processParameterUpdateResult();
         const auto update_started_at = std::chrono::steady_clock::now();
         const bool preload_running_at_start = python::is_plugin_preload_running();
         update_work_processed_ = false;
