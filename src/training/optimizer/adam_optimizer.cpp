@@ -3,16 +3,23 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "adam_optimizer.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
 #include "adam_api.h"
+#endif
 #include "core/alloc_counter.hpp"
 #include "core/assert.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/cuda/sh_layout.cuh"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/logger.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/splat_exportable_storage.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#endif
 #include "core/tensor/internal/tensor_serialization.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
@@ -21,7 +28,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -94,19 +103,9 @@ namespace lfs::training {
             new_bounds = lfs::core::Tensor::zeros(shape, device);
         }
         if (!zero_all && joint_bounds.is_valid() && joint_bounds.numel() > 0) {
-            // Keep the source alive until the D2D copy finishes. Destroying
-            // joint_bounds immediately after cudaMemcpyAsync races the async read.
-            const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
-            lfs::core::waitForCUDAStream(stream, joint_bounds.stream());
-            lfs::core::waitForCUDAStream(stream, new_bounds.stream());
             const size_t copy_n = std::min(joint_bounds.numel(), new_bounds.numel());
-            auto old_bounds = std::move(joint_bounds);
-            LFS_CUDA_CHECK(cudaMemcpyAsync(
-                new_bounds.ptr<float>(), old_bounds.ptr<float>(),
-                copy_n * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-            LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+            new_bounds.reshape({-1}).slice(0, 0, copy_n).copy_from(joint_bounds.reshape({-1}).slice(0, 0, copy_n));
             joint_bounds = std::move(new_bounds);
-            // old_bounds destroyed after sync
         } else {
             joint_bounds = std::move(new_bounds);
         }
@@ -211,7 +210,10 @@ namespace lfs::training {
                            ? uploaded
                            : uploaded.clone();
         const auto* pointer = storage.ptr<bool>();
-        LFS_VALIDATE_CUDA_DEVICE_POINTER(pointer, "mean_step_far_mask");
+#if LFS_TENSOR_CUDA
+        if (core::gpu_backend_of(storage) == core::GpuBackend::CUDA)
+            LFS_VALIDATE_CUDA_DEVICE_POINTER(pointer, "mean_step_far_mask");
+#endif
         // A raw pointer alone cannot keep a replaced strategy tensor alive.
         mean_step_far_mask_storage_ = std::move(storage);
         mean_step_far_mask_ = pointer;
@@ -251,6 +253,7 @@ namespace lfs::training {
         screen_share_n_ = static_cast<int>(splat_data_._max_screen_share.numel());
     }
 
+#if LFS_TENSOR_CUDA
     void AdamOptimizer::step(const int iteration) {
         LFS_TRACE("kernel.adam.step");
         validate_mean_step_far_mask();
@@ -367,6 +370,7 @@ namespace lfs::training {
         }
         step_param(ParamType::ShN, iteration);
     }
+#endif
 
     size_t AdamOptimizer::compute_state_growth(ParamType type, size_t n_new) const {
         if (type != ParamType::ShN)
@@ -447,8 +451,7 @@ namespace lfs::training {
         }
         for (auto& [_, state] : states_) {
             if (state.grad.is_valid() && state.grad.numel() > 0) {
-                const size_t bytes = state.size * (state.grad.numel() / state.grad.shape()[0]) * sizeof(float);
-                LFS_CUDA_CHECK(cudaMemsetAsync(state.grad.ptr<float>(), 0, bytes, state.grad.stream()));
+                state.grad.zero_();
             }
         }
     }
@@ -677,6 +680,7 @@ namespace lfs::training {
         state.capacity = std::max(state.capacity, alloc_cap);
     }
 
+#if LFS_TENSOR_CUDA
     void AdamOptimizer::step_param(ParamType type, const int iteration) {
         auto& param = get_param(type);
         if (!param.is_valid() || param.numel() == 0) {
@@ -869,7 +873,6 @@ namespace lfs::training {
             "AdamOptimizer::step_param: non-joint state is unsupported "
             "(joint (u,log_s) is the only Adam codec)");
     }
-
     FastGSFusedAdamState AdamOptimizer::prepare_fastgs_fused_adam(
         const int iteration,
         const cudaStream_t execution_stream) {
@@ -1100,7 +1103,8 @@ namespace lfs::training {
                         fused.scaling.enabled || fused.rotation.enabled || fused.opacity.enabled;
         return fused;
     }
-
+#endif
+#if LFS_TENSOR_CUDA
     void AdamOptimizer::commit_fastgs_fused_adam(const int iteration) {
         // Only bump step_count for parameters that prepare_fastgs_fused_adam
         // actually enabled this iteration. During SH warmup prepare disables shN
@@ -1127,7 +1131,6 @@ namespace lfs::training {
         fused_step_iteration_ = iteration;
         last_step_zeroed_gradients_ = true;
     }
-
     void AdamOptimizer::reset_state_at_indices(ParamType type, const std::vector<int64_t>& indices) {
         if (indices.empty())
             return;
@@ -1192,7 +1195,8 @@ namespace lfs::training {
         state.exp_avg.set_stream(stream);
         LFS_CUDA_CHECK(cudaFreeAsync(d_indices, stream));
     }
-
+#endif
+#if LFS_TENSOR_CUDA
     void AdamOptimizer::extend_state_by_gather(ParamType type, const lfs::core::Tensor& indices) {
         const auto name = param_name(type);
         if (!states_.contains(name))
@@ -1301,7 +1305,6 @@ namespace lfs::training {
             "extend_state_by_gather: non-joint Adam state is unsupported "
             "(joint (u,log_s) is the only codec)");
     }
-
     void AdamOptimizer::extend_state_for_new_params(ParamType type, const size_t n_new) {
         const auto name = param_name(type);
         if (!states_.contains(name)) {
@@ -1462,6 +1465,7 @@ namespace lfs::training {
             "extend_state_for_new_params: non-joint Adam state is unsupported "
             "(joint (u,log_s) is the only codec)");
     }
+#endif
 
     size_t AdamOptimizer::compute_new_capacity(const size_t current_capacity, const size_t required_size) const {
         if (current_capacity == 0) {
@@ -1586,6 +1590,7 @@ namespace lfs::training {
         extend_state_for_new_params(type, n_new);
     }
 
+#if LFS_TENSOR_CUDA
     void AdamOptimizer::add_new_params_gather(ParamType type, const lfs::core::Tensor& indices) {
         auto& param = get_param(type);
 
@@ -1776,7 +1781,6 @@ namespace lfs::training {
         param.append_gather(indices);
         extend_state_for_new_params(type, n_new);
     }
-
     void AdamOptimizer::relocate_params_at_indices_gpu(ParamType type, const int64_t* indices_device, const size_t n_indices) {
         if (n_indices == 0)
             return;
@@ -1842,6 +1846,7 @@ namespace lfs::training {
             return;
         }
     }
+#endif
 
     namespace {
         constexpr uint32_t ADAM_STATE_MAGIC = 0x4C464144; // "LFAD"
@@ -2098,9 +2103,10 @@ namespace lfs::training {
             upload(state.exp_avg);
             upload(state.joint_bounds);
         }
-        if (upload_stream != nullptr) {
+#if LFS_TENSOR_CUDA
+        if (upload_stream != nullptr)
             LFS_CUDA_CHECK(cudaStreamSynchronize(upload_stream));
-        }
+#endif
         const auto gpu_upload_finished = std::chrono::steady_clock::now();
 
         config_ = std::move(loaded_config);
@@ -2140,14 +2146,8 @@ namespace lfs::training {
                 return;
             const auto shape = t.shape();
             auto grown = lfs::core::Tensor::zeros_direct(shape, cap_rows, t.device(), t.dtype());
-            if (t.numel() > 0 && t.data_ptr() && grown.data_ptr()) {
-                const size_t elem_bytes = lfs::core::dtype_size(t.dtype());
-                if (elem_bytes > 0) {
-                    LFS_CUDA_CHECK(cudaMemcpy(
-                        grown.data_ptr(), t.data_ptr(),
-                        t.numel() * elem_bytes, cudaMemcpyDeviceToDevice));
-                }
-            }
+            if (t.numel() > 0)
+                grown.copy_from(t);
             if (!t.name().empty())
                 grown.set_name(t.name());
             t = std::move(grown);

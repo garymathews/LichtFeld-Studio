@@ -474,6 +474,8 @@ class TrainingPanel(Panel):
             self._queue_pv_publish(binding)
 
     def _property_view_condition_visible(self, condition_id):
+        if condition_id == "cuda_backend":
+            return lf.get_gpu_backend() == "cuda"
         if str(condition_id) == "has_dataset":
             dataset = lf.dataset_params()
             return bool(dataset and dataset.has_params())
@@ -503,6 +505,7 @@ class TrainingPanel(Panel):
         return bool(conditions.get(str(condition_id), True))
 
     def _bind_visibility(self, model, p, d):
+        model.bind_func("cuda_backend", lambda: lf.get_gpu_backend() == "cuda")
         def _state():
             value = RuntimeState.trainer_state.value
             session = _training_session_state()

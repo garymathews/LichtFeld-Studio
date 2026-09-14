@@ -263,8 +263,8 @@ target_link_libraries(lfs_py PRIVATE
     ${LFS_PY_INTERNAL_LINK_LIBS}
     OpenMeshCore
     OpenMeshTools
-    CUDA::cudart
-    CUDA::curand
+    $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::cudart>
+    $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::curand>
     SDL3::SDL3
     ${CMAKE_DL_LIBS}
     GPUOpen::VulkanMemoryAllocator
@@ -432,6 +432,27 @@ stub_marker.touch()
             )
             add_custom_target(lichtfeld_stub ALL DEPENDS "${GENERATED_STUBS_MARKER}")
         endif()
+    elseif(APPLE)
+        # vcpkg supplies static CPython on macOS. Loading this extension from
+        # its standalone interpreter would create two independent runtimes:
+        # Mach-O binds Python calls in the module to lfs_python_runtime.
+        # Run stubgen with that same runtime, including its CLI entry point.
+        target_link_options(lfs_python_runtime PRIVATE "LINKER:-u,_Py_BytesMain")
+        add_executable(lfs_python_stubgen stubgen_main.cpp)
+        target_link_libraries(lfs_python_stubgen PRIVATE lfs_python_runtime)
+        find_file(LFS_NB_STUBGEN stubgen.py PATHS "${NB_DIR}/src" "${NB_DIR}" NO_DEFAULT_PATH REQUIRED)
+        get_filename_component(_lfs_python_lib_dir "${Python_STDLIB}" DIRECTORY)
+        get_filename_component(_lfs_python_home "${_lfs_python_lib_dir}" DIRECTORY)
+        add_custom_command(
+            OUTPUT "${GENERATED_STUBS_MARKER}"
+            COMMAND ${CMAKE_COMMAND} -E env "PYTHONHOME=${_lfs_python_home}"
+                $<TARGET_FILE:lfs_python_stubgen> "${LFS_NB_STUBGEN}" -q -r
+                -i "${CMAKE_CURRENT_BINARY_DIR}" -M "${GENERATED_STUBS_MARKER}"
+                -m lichtfeld -O "${GENERATED_STUBS_DIR}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+            DEPENDS lfs_py lfs_python_stubgen "${LFS_NB_STUBGEN}"
+            COMMENT "Generating Python stubs with the embedded macOS runtime")
+        add_custom_target(lichtfeld_stub ALL DEPENDS "${GENERATED_STUBS_MARKER}")
     else()
         nanobind_add_stub(lichtfeld_stub
             MODULE lichtfeld
@@ -536,6 +557,23 @@ install_uv()
 # =============================================================================
 set(PYTHON_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/python")
 
+# The built-in histogram uses NumPy; ship its wheel with the macOS Python runtime.
+if(APPLE)
+    set(_lfs_numpy_dir "${CMAKE_CURRENT_BINARY_DIR}/numpy-package")
+    add_custom_command(OUTPUT "${_lfs_numpy_dir}/ready.stamp"
+        COMMAND "${UV_BINARY_PATH}" pip install --python "${Python_EXECUTABLE}"
+            --only-binary :all: --target "${_lfs_numpy_dir}" "numpy==2.2.6"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_lfs_numpy_dir}" "${CMAKE_CURRENT_BINARY_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E touch "${_lfs_numpy_dir}/ready.stamp"
+        COMMENT "Staging NumPy for the macOS Python UI"
+        VERBATIM)
+    add_custom_target(lfs_macos_numpy ALL DEPENDS "${_lfs_numpy_dir}/ready.stamp")
+    add_dependencies(lfs_py lfs_macos_numpy)
+    install(DIRECTORY "${_lfs_numpy_dir}/" DESTINATION "${PYTHON_INSTALL_DIR}"
+        PATTERN "ready.stamp" EXCLUDE PATTERN "bin" EXCLUDE)
+endif()
+
+
 # Install lichtfeld Python module (.so/.pyd) to bin for portable builds
 if(BUILD_PORTABLE)
     install(TARGETS lfs_py
@@ -590,8 +628,8 @@ endif()
 # =============================================================================
 # PORTABLE BUILD - Bundle vcpkg Python interpreter and standard library
 # =============================================================================
-if(BUILD_PORTABLE)
-    message(STATUS "Portable build: bundling Python ${Python_VERSION}")
+if(BUILD_PORTABLE OR APPLE)
+    message(STATUS "Bundling Python ${Python_VERSION}")
 
     # Get vcpkg Python directories
     get_filename_component(VCPKG_PYTHON_TOOLS_DIR "${Python_EXECUTABLE}" DIRECTORY)

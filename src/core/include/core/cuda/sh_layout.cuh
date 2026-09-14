@@ -4,12 +4,33 @@
 
 #pragma once
 
+#include "core/cuda_stream_fwd.hpp"
+#include "core/export.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
 
 namespace lfs::core {
+    class Tensor;
+}
+
+namespace lfs::core {
+
+    // Backend-aware tensor forms. Preserve dtype/backend and zero padding;
+    // callers with raw CUDA allocations retain the overloads below.
+    LFS_CORE_API Tensor reorder_sh_to_swizzled(const Tensor& canonical,
+                                               std::size_t n_primitives,
+                                               std::uint32_t src_coeffs_rest,
+                                               std::uint32_t layout_coeffs_rest);
+    LFS_CORE_API Tensor undo_reorder_sh_from_swizzled(const Tensor& swizzled,
+                                                      std::size_t n_primitives,
+                                                      std::uint32_t dst_coeffs_rest,
+                                                      std::uint32_t layout_coeffs_rest);
+
+    LFS_CORE_API void shN_swizzled_copy_range(
+        const Tensor& source, Tensor& destination, std::size_t source_offset,
+        std::size_t count, std::size_t destination_offset,
+        std::uint32_t source_rest, std::uint32_t destination_rest);
 
     // SH coefficient swizzle layout (vksplat float4 packing, ported from
     // vksplat/vksplat/slang/spherical_harmonics.slang).
@@ -267,17 +288,6 @@ namespace lfs::core {
         std::size_t n_dst,
         std::size_t dst_offset,
         std::uint32_t active_coeffs_rest,
-        cudaStream_t stream = nullptr);
-
-    // Copy the first n_src primitives from one swizzled buffer into dst_offset in another
-    // swizzled buffer. Source and destination may have different padded block boundaries.
-    void shN_swizzled_copy_contiguous(
-        const float* src_swizzled,
-        float* dst_swizzled,
-        std::size_t n_src,
-        std::size_t dst_offset,
-        std::uint32_t src_active_coeffs_rest,
-        std::uint32_t dst_active_coeffs_rest,
         cudaStream_t stream = nullptr);
 
     // Copy n_src primitives starting at src_offset from one swizzled buffer into

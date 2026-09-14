@@ -7,12 +7,15 @@
 #include "core/abi.hpp"
 #include "core/argument_parser.hpp"
 #include "core/crash_handler.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/environment.hpp"
 #include "core/executable_path.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/session_breadcrumb.hpp"
+#include "core/tensor_backend.hpp"
 #include "core/user_paths.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "git_version.h"
@@ -22,7 +25,9 @@
 #include "python/runner.hpp"
 
 #include <cstdlib>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <filesystem>
 #include <print>
 #include <string>
@@ -34,10 +39,13 @@ namespace {
     // committed defaults (1 KiB/thread stack reserve × SMs × max-threads = ~192 MiB on
     // a 4090; eager module loading uploads all kernel cubins on first ctx-init).
     void applyCudaContextTuning() {
+#if LFS_TENSOR_CUDA
 #ifdef _WIN32
         _putenv_s("CUDA_MODULE_LOADING", "LAZY");
 #else
         setenv("CUDA_MODULE_LOADING", "LAZY", /*overwrite=*/0);
+#endif
+
 #endif
     }
 
@@ -74,6 +82,7 @@ namespace {
     // process* (NVML per-PID, not device-wide cudaMemGetInfo). Each phase is the delta
     // against the previous probe so the sum reconstructs the total context cost.
     void analyzeCudaContextDistribution() {
+#if LFS_TENSOR_CUDA
         auto& p = lfs::diagnostics::VramProfiler::instance();
 
         // Phase 1: primary context creation. cudaFree(nullptr) is a documented idiom that
@@ -127,6 +136,8 @@ namespace {
         // Device-wide baseline is cheap and does not load NVML. The per-process
         // measurements and libcurand probe are completed by the warmup worker.
         p.captureCudaDeviceBaseline();
+
+#endif
     }
 
     int run_mode(lfs::core::args::ParsedArgs args) {
@@ -150,7 +161,13 @@ namespace {
                 preflightGpuOrExit(false);
                 return lfs::app::run_mesh2splat(mode.params);
             } else if constexpr (std::is_same_v<T, lfs::core::args::PreprocessMode>) {
-                preflightGpuOrExit(false);
+                // Native inference validates the selected tensor backend. Only
+                // CUDA execution needs the CUDA driver/SM gate; weight downloads
+                // and Vulkan inference must also work without a CUDA device.
+                if (!mode.params.download_only &&
+                    lfs::core::default_gpu_backend() == lfs::core::GpuBackend::CUDA) {
+                    preflightGpuOrExit(false);
+                }
                 return lfs::preprocessing::run_preprocess(mode.params);
             } else if constexpr (std::is_same_v<T, lfs::core::args::PluginMode>) {
                 return lfs::python::run_plugin_command(mode);
@@ -170,7 +187,9 @@ namespace {
                 // GPU app path. CLI-only modes such as --help, convert, preprocess,
                 // plugin, and mesh2splat must not create a CUDA primary context just
                 // for HUD metrics.
-                analyzeCudaContextDistribution();
+                if (lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA)) {
+                    analyzeCudaContextDistribution();
+                }
                 if (mode.params->optimization.debug_python) {
                     lfs::python::start_debugpy(mode.params->optimization.debug_python_port);
                 }
@@ -214,7 +233,18 @@ int main(int argc, char* argv[]) {
 
     lfs::core::install_crash_handlers();
     lfs::core::record_session_start();
+#if LFS_TENSOR_CUDA
     lfs::core::initialize_cuda_diagnostics();
+#endif
+
+#ifdef __APPLE__
+    if (!std::getenv("VK_DRIVER_FILES") && !std::getenv("VK_ICD_FILENAMES")) {
+        const auto manifest = lfs::core::getResourceBaseDir() / "vulkan" / "MoltenVK_icd.json";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(manifest, ec))
+            setenv("VK_DRIVER_FILES", lfs::core::path_to_utf8(manifest).c_str(), 0);
+    }
+#endif
 
     auto result = lfs::core::args::parse_args(argc, argv);
     if (!result) {
@@ -224,6 +254,10 @@ int main(int argc, char* argv[]) {
 
     publishResolvedUserPaths();
 
-    return lfs::core::run_with_exception_firewall(
+    const int exit_code = lfs::core::run_with_exception_firewall(
         [&result] { return run_mode(std::move(*result)); });
+    // CLI modes return here without the viewer's explicit GPU teardown. Drain
+    // their backends before validation layers and driver libraries are unloaded.
+    lfs::core::teardown_gpu_before_exit();
+    return exit_code;
 }

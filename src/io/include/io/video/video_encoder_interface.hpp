@@ -7,6 +7,7 @@
 
 #include <expected>
 #include <filesystem>
+#include <span>
 #include <string>
 
 namespace lfs::io::video {
@@ -18,6 +19,10 @@ namespace lfs::io::video {
         [[nodiscard]] virtual std::expected<void, std::string> open(
             const std::filesystem::path& output_path,
             const VideoExportOptions& options) = 0;
+
+        // Packed RGB24 in host memory. Vulkan exporters must read back explicitly.
+        [[nodiscard]] virtual std::expected<void, std::string> writeFrame(
+            std::span<const uint8_t> rgb, int width, int height) = 0;
 
         [[nodiscard]] virtual std::expected<void, std::string> writeFrameGpu(
             const void* rgba_gpu_ptr, int width, int height, void* cuda_stream = nullptr) = 0;

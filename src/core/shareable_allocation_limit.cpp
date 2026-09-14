@@ -67,10 +67,15 @@ namespace lfs::core {
     }
 
     std::size_t shareable_chunk_bytes(const int device) {
+#if LFS_TENSOR_CUDA
         const std::size_t gran = exportable_allocation_granularity(device);
         const std::size_t limit = max_shareable_allocation_bytes();
         const std::size_t rounded = align_down(limit, gran);
         return rounded < gran ? gran : rounded;
+#else
+        (void)device;
+        throw TensorError("CUDA exportable allocation granularity is unavailable on this build");
+#endif
     }
 
     bool shareable_allocation_limited() {

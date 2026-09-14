@@ -5,12 +5,13 @@
 #include "vulkan_context.hpp"
 
 #include "core/crash_handler.hpp"
-#include "core/cuda_error.hpp"
+#include "core/diagnostic_modes.hpp"
 #include "core/environment.hpp"
 #include "core/exportable_storage.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/shareable_allocation_limit.hpp"
+#include "core/tensor_backend.hpp"
 #include "core/user_paths.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "rendering/vulkan_wait.hpp"
@@ -33,7 +34,9 @@
 #include <utility>
 
 #include <SDL3/SDL_vulkan.h>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -64,7 +67,7 @@ namespace lfs::vis {
             VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
 #endif
         constexpr std::uint64_t kExternalTimelineWaitTimeoutNs = 2'000'000'000ull;
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
         constexpr bool kPromoteExposedResizeGrowthImmediately = true;
         constexpr bool kUseResizeHeadroom = false;
         constexpr bool kRecreateExactAfterInteractiveResize = true;
@@ -136,6 +139,8 @@ namespace lfs::vis {
         }
 
         [[nodiscard]] bool isPreVoltaCudaDevice(const std::array<std::uint8_t, VK_UUID_SIZE>& vk_device_uuid) {
+#if LFS_TENSOR_CUDA
+
             int device_count = 0;
             if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
                 return false;
@@ -151,6 +156,9 @@ namespace lfs::vis {
                 }
             }
             return false;
+        #else
+            return false;
+#endif
         }
 
         // True when the given Vulkan physical device is the same physical GPU as
@@ -160,6 +168,8 @@ namespace lfs::vis {
         // UUID lets pickPhysicalDevice keep the viewer on the same card as the
         // trainer so CUDA<->Vulkan external-memory interop can import the block.
         [[nodiscard]] bool vulkanDeviceMatchesCudaDevice(const VkPhysicalDevice device, const int cuda_device) {
+#if LFS_TENSOR_CUDA
+
             cudaDeviceProp cuda_props{};
             if (cudaGetDeviceProperties(&cuda_props, cuda_device) != cudaSuccess) {
                 return false;
@@ -172,6 +182,9 @@ namespace lfs::vis {
             vkGetPhysicalDeviceProperties2(device, &vk_props2);
             static_assert(sizeof(cuda_props.uuid.bytes) == VK_UUID_SIZE);
             return std::memcmp(cuda_props.uuid.bytes, vk_id.deviceUUID, VK_UUID_SIZE) == 0;
+        #else
+            return false;
+#endif
         }
 
         [[nodiscard]] std::string vulkanApiVersionString(const uint32_t api_version) {
@@ -688,11 +701,15 @@ namespace lfs::vis {
     void VulkanContext::shutdown() {
         // AMB-B3: latch before any device wait so concurrent UI waits observe Shutdown.
         context_shutdown_started_.store(true, std::memory_order_release);
-        lfs::rendering::set_graphics_queue_external_sync(nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        lfs::rendering::set_queue_external_sync(nullptr);
         if (device_ != VK_NULL_HANDLE) {
             // Shutdown is the one place where a whole-device wait is intentional:
             // all swapchain, UI, and external interop resources are about to be destroyed.
             const VkResult idle_result = vkDeviceWaitIdle(device_);
+            if ((idle_result == VK_SUCCESS || idle_result == VK_ERROR_DEVICE_LOST) && retirement_fence_) {
+                vkDestroyFence(device_, retirement_fence_, nullptr);
+                retirement_fence_ = VK_NULL_HANDLE;
+            }
             if (idle_result != VK_SUCCESS) {
                 LOG_ERROR("Vulkan shutdown could not retire device work before destruction (device={:#x}, pending_immediate_submits={}, frame_active={}, frame_slot={}, result={}({}))",
                           vkHandleValue(device_),
@@ -987,6 +1004,16 @@ namespace lfs::vis {
     void VulkanContext::notifyFramebufferResized(const int width,
                                                  const int height,
                                                  const ResizeIntent intent) {
+#ifdef __APPLE__
+        if (width == framebuffer_width_ && height == framebuffer_height_)
+            return;
+        // MoltenVK drawables track the native surface in both resize directions.
+        // Coalesce SDL events, but do not wait for a quiet period before drawing.
+        framebuffer_width_ = width;
+        framebuffer_height_ = height;
+        requireSwapchainRecreateAfterOutOfDate();
+        return;
+#else
         const bool exact_resize = intent == ResizeIntent::Exact;
         const bool exact_extent_mismatch =
             exact_resize &&
@@ -1025,6 +1052,7 @@ namespace lfs::vis {
             framebuffer_resize_last_change_ = std::chrono::steady_clock::now();
             last_error_.clear();
         }
+#endif
     }
 
     bool VulkanContext::presentBootstrapFrame(const float r, const float g, const float b, const float a) {
@@ -1126,7 +1154,8 @@ namespace lfs::vis {
         if (swapchain_images_.empty() ||
             swapchain_image_views_.size() != swapchain_images_.size() ||
             swapchain_images_in_flight_.size() != swapchain_images_.size() ||
-            render_finished_.size() != swapchain_images_.size()) {
+            render_finished_.size() != swapchain_images_.size() ||
+            (!present_fences_.empty() && present_fences_.size() != swapchain_images_.size())) {
             return fail(std::format(
                 "beginFrame swapchain arrays must have one entry per image (images={}, image_views={}, image_fences={}, render_finished={}, swapchain={:#x})",
                 swapchain_images_.size(),
@@ -1283,6 +1312,13 @@ namespace lfs::vis {
                     return false;
                 }
             }
+        }
+
+        if (!present_fences_.empty()) {
+            auto outcome = lfs::rendering::wait_fence_bounded(
+                device_, present_fences_[image_index], {}, {}, makeWaitContext("vulkan.present_reuse"));
+            if (!mapWaitOutcome(std::move(outcome), "presentation fence before image reuse"))
+                return false;
         }
 
         // AMB-B1: acquire SUBOPTIMAL bit (no longer collapsed into image-fence result).
@@ -1722,6 +1758,19 @@ namespace lfs::vis {
                 active_image_index_,
                 vkHandleValue(render_finished)));
         }
+        VkSwapchainPresentFenceInfoEXT present_fence_info{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT};
+        if (!present_fences_.empty()) {
+            const auto fence = present_fences_[active_image_index_];
+            result = vkResetFences(device_, 1, &fence);
+            if (result != VK_SUCCESS) {
+                frame_active_ = false;
+                framebuffer_resized_ = true;
+                return setVkFailure("Could not reset presentation fence", result);
+            }
+            present_fence_info.swapchainCount = 1;
+            present_fence_info.pFences = &present_fences_[active_image_index_];
+            present_info.pNext = &present_fence_info;
+        }
         result = lfs::rendering::vk_queue_present_synced(present_queue_, &present_info);
 
         frame_active_ = false;
@@ -1745,6 +1794,10 @@ namespace lfs::vis {
         }
         frame_suboptimal_ = false;
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+            // The driver may not have enqueued the presentation fence. Do not
+            // retry or retire resources while its completion is unknown.
+            if (!present_fences_.empty())
+                gpu_wait_quarantined_.store(true, std::memory_order_release);
             return setVkFailure(std::format("vkQueuePresentKHR(image {}, frame slot {}) failed: {}",
                                             active_image_index_,
                                             current_frame,
@@ -2170,6 +2223,11 @@ namespace lfs::vis {
     }
 
     bool VulkanContext::createInstance() {
+#ifdef __APPLE__
+        // Addressable-buffer retirement is synchronized with queue submission.
+        // Prefilling Metal commands would capture residency before that boundary.
+        setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "0", 1);
+#endif
         uint32_t extension_count = 0;
         const char* const* sdl_extensions = SDL_Vulkan_GetInstanceExtensions(&extension_count);
         if (!sdl_extensions || extension_count == 0) {
@@ -2268,6 +2326,10 @@ namespace lfs::vis {
         create_info.pApplicationInfo = &app_info;
         create_info.enabledLayerCount = static_cast<uint32_t>(layers.size());
         create_info.ppEnabledLayerNames = layers.data();
+        if (extensionAvailable(available_extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+            appendUniqueExtension(extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
         create_info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         create_info.ppEnabledExtensionNames = extensions.data();
 
@@ -2593,14 +2655,44 @@ namespace lfs::vis {
             transfer_queue_family_ = 0;
             has_dedicated_transfer_queue_ = false;
         }
+        // The tensor backend gets its own queue: the second queue of the compute
+        // family when it has one, else the second queue of the graphics family.
+        std::optional<uint32_t> tensor_queue_family;
+        uint32_t tensor_queue_index = 1;
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan) {
+            uint32_t family_count = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, nullptr);
+            std::vector<VkQueueFamilyProperties> family_props(family_count);
+            vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, family_props.data());
+            for (const uint32_t candidate : {compute_queue_family_, graphics_queue_family_}) {
+                if (candidate < family_count && family_props[candidate].queueCount >= 2 &&
+                    (family_props[candidate].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+                    tensor_queue_family = candidate;
+                    break;
+                }
+            }
+            // MoltenVK exposes one queue per family. Reserve an unused compute
+            // family, with concurrent sharing for tensors consumed by graphics.
+            if (!tensor_queue_family) {
+                for (uint32_t candidate = 0; candidate < family_count; ++candidate) {
+                    if (!unique_families.contains(candidate) && family_props[candidate].queueCount > 0 &&
+                        (family_props[candidate].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+                        tensor_queue_family = candidate;
+                        tensor_queue_index = 0;
+                        unique_families.insert(candidate);
+                        break;
+                    }
+                }
+            }
+        }
         std::vector<VkDeviceQueueCreateInfo> queue_infos;
-        constexpr float queue_priority = 1.0f;
+        static constexpr std::array<float, 2> queue_priorities{1.0f, 1.0f};
         for (const uint32_t family : unique_families) {
             VkDeviceQueueCreateInfo queue_info{};
             queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
             queue_info.queueFamilyIndex = family;
-            queue_info.queueCount = 1;
-            queue_info.pQueuePriorities = &queue_priority;
+            queue_info.queueCount = tensor_queue_family == family ? tensor_queue_index + 1 : 1;
+            queue_info.pQueuePriorities = queue_priorities.data();
             queue_infos.push_back(queue_info);
         }
 
@@ -2626,6 +2718,11 @@ namespace lfs::vis {
         }
 
         std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+        // Required when advertised by portability implementations such as
+        // MoltenVK. The extension name is usable without beta feature structs.
+        if (extensionAvailable(available_extensions, "VK_KHR_portability_subset")) {
+            appendUniqueExtension(extensions, "VK_KHR_portability_subset");
+        }
         const bool has_external_memory =
             instance_external_memory_capabilities_enabled_ &&
             extensionAvailable(available_extensions, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
@@ -2783,6 +2880,7 @@ namespace lfs::vis {
         features12.timelineSemaphore = VK_TRUE;
         features12.shaderFloat16 = supported_features12.shaderFloat16;
         features12.bufferDeviceAddress = supported_features12.bufferDeviceAddress;
+        features12.storageBuffer8BitAccess = supported_features12.storageBuffer8BitAccess;
 
         // Optional feature structs are prepended to the Vulkan 1.2 chain.
         void* enabled_chain_head = features12.pNext;
@@ -2914,6 +3012,23 @@ namespace lfs::vis {
 
         vkGetDeviceQueue(device_, graphics_queue_family_, 0, &graphics_queue_);
         vkGetDeviceQueue(device_, present_queue_family_, 0, &present_queue_);
+        tensor_backend_device_ = {};
+        if (tensor_queue_family.has_value()) {
+            tensor_backend_device_.queue_family = *tensor_queue_family;
+            vkGetDeviceQueue(device_, *tensor_queue_family, tensor_queue_index, &tensor_backend_device_.queue);
+            tensor_backend_device_.shader_atomic_float =
+                atomic_float_features.shaderBufferFloat32AtomicAdd == VK_TRUE;
+            tensor_backend_device_.shader_float16 = features12.shaderFloat16 == VK_TRUE;
+            tensor_backend_device_.complete =
+                tensor_backend_device_.queue != VK_NULL_HANDLE &&
+                features2.features.shaderInt64 == VK_TRUE && features2.features.shaderInt16 == VK_TRUE &&
+                features11.storageBuffer16BitAccess == VK_TRUE && features12.storageBuffer8BitAccess == VK_TRUE &&
+                features12.timelineSemaphore == VK_TRUE && features12.bufferDeviceAddress == VK_TRUE &&
+                features13.synchronization2 == VK_TRUE;
+        }
+        LOG_INFO("Vulkan: tensor backend queue {} (family {})",
+                 tensor_backend_device_.complete ? "available" : "unavailable",
+                 tensor_backend_device_.queue_family);
         if (has_dedicated_compute_queue_) {
             vkGetDeviceQueue(device_, compute_queue_family_, 0, &compute_queue_);
             LOG_INFO("Vulkan: dedicated async-compute queue family {} (graphics family {})",
@@ -2949,8 +3064,7 @@ namespace lfs::vis {
         external_memory_dedicated_allocation_enabled_ = enable_dedicated_allocation;
         sparse_binding_enabled_ = features2.features.sparseBinding == VK_TRUE;
         buffer_device_address_enabled_ = features12.bufferDeviceAddress == VK_TRUE;
-        lfs::rendering::set_graphics_queue_external_sync(
-            &graphics_queue_mutex_, graphics_queue_, present_queue_);
+        lfs::rendering::set_queue_external_sync(&graphics_queue_mutex_);
 
         VkPhysicalDeviceMaintenance3Properties maint3{};
         maint3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
@@ -2979,13 +3093,13 @@ namespace lfs::vis {
         vkGetPhysicalDeviceProperties(physical_device_, &device_properties);
         line_width_range_[0] = device_properties.limits.lineWidthRange[0];
         line_width_range_[1] = device_properties.limits.lineWidthRange[1];
-        if (!external_memory_interop_enabled_) {
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::CUDA && !external_memory_interop_enabled_) {
             return fail("Vulkan external memory interop is required (KHR_external_memory + platform variant); device is missing the extension(s)");
         }
-        if (!external_semaphore_interop_enabled_) {
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::CUDA && !external_semaphore_interop_enabled_) {
             return fail("Vulkan external timeline-semaphore interop is required (KHR_external_semaphore + platform variant); device is missing the extension(s)");
         }
-        LOG_INFO("Vulkan external memory interop enabled{}",
+        LOG_INFO("Vulkan external memory interop {}{}", external_memory_interop_enabled_ ? "enabled" : "disabled",
                  external_memory_dedicated_allocation_enabled_ ? " with dedicated allocations" : "");
         if (lfs::core::shareable_allocation_limited()) {
             LOG_INFO("Vulkan external memory interop shareable ceiling: {} bytes ({})",
@@ -2993,7 +3107,7 @@ namespace lfs::vis {
                      lfs::core::shareable_allocation_limit_from_env() ? "env override"
                                                                       : "platform default");
         }
-        LOG_INFO("Vulkan external timeline semaphore interop enabled");
+        LOG_INFO("Vulkan external timeline semaphore interop {}", external_semaphore_interop_enabled_ ? "enabled" : "disabled");
         LOG_INFO("Vulkan optional features: push_descriptor={} host_image_copy={} swapchain_maintenance1={} fill_mode_non_solid={} wide_lines={}",
                  has_push_descriptor_,
                  has_host_image_copy_,
@@ -3267,7 +3381,7 @@ namespace lfs::vis {
 
         VkPhysicalDeviceImageFormatInfo2 format_info{};
         format_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
-        format_info.pNext = &external_format_info;
+        format_info.pNext = external_memory_interop_enabled_ ? &external_format_info : nullptr;
         format_info.format = format;
         format_info.type = VK_IMAGE_TYPE_2D;
         format_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -3278,7 +3392,7 @@ namespace lfs::vis {
 
         VkImageFormatProperties2 format_properties{};
         format_properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
-        format_properties.pNext = &external_format_properties;
+        format_properties.pNext = external_memory_interop_enabled_ ? &external_format_properties : nullptr;
 
         VkResult result = vkGetPhysicalDeviceImageFormatProperties2(physical_device_, &format_info, &format_properties);
         if (result != VK_SUCCESS) {
@@ -3294,7 +3408,7 @@ namespace lfs::vis {
                 max_extent.height,
                 static_cast<int>(format)));
         }
-        if ((external_format_properties.externalMemoryProperties.externalMemoryFeatures &
+        if (external_memory_interop_enabled_ && (external_format_properties.externalMemoryProperties.externalMemoryFeatures &
              VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) == 0) {
             return fail("External Vulkan image format is not exportable");
         }
@@ -3315,7 +3429,7 @@ namespace lfs::vis {
 
         VkImageCreateInfo image_info{};
         image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        image_info.pNext = &external_image_info;
+        image_info.pNext = external_memory_interop_enabled_ ? &external_image_info : nullptr;
         image_info.imageType = VK_IMAGE_TYPE_2D;
         image_info.extent.width = extent.width;
         image_info.extent.height = extent.height;
@@ -3388,7 +3502,7 @@ namespace lfs::vis {
 
         VkMemoryAllocateInfo allocate_info{};
         allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocate_info.pNext = &export_info;
+        allocate_info.pNext = external_memory_interop_enabled_ ? static_cast<void*>(&export_info) : &dedicated_info;
         allocate_info.allocationSize = memory_requirements.size;
         allocate_info.memoryTypeIndex = findMemoryType(memory_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (allocate_info.memoryTypeIndex == std::numeric_limits<uint32_t>::max()) {
@@ -3416,6 +3530,9 @@ namespace lfs::vis {
             return setVkFailure(std::format("vkBindImageMemory(external image) failed: {}", vkResultToString(result)), result);
         }
 
+        // Native Vulkan consumers need no exported OS handle. Keep the same
+        // image owner, layout tracker and retirement path for both backends.
+        if (external_memory_interop_enabled_) {
 #ifdef _WIN32
         auto get_memory_handle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
             vkGetDeviceProcAddr(device_, "vkGetMemoryWin32HandleKHR"));
@@ -3448,6 +3565,7 @@ namespace lfs::vis {
         if (result != VK_SUCCESS) {
             destroyExternalImage(out);
             return setVkFailure(std::format("Exporting external image memory handle failed: {}", vkResultToString(result)), result);
+        }
         }
 
         VkImageViewCreateInfo view_info{};
@@ -3986,6 +4104,56 @@ namespace lfs::vis {
         return true;
     }
 
+    void VulkanContext::withQueuesIdle(const std::function<void()>& work) {
+        // Tensor recorders are locked by the caller. Queue wrappers never acquire
+        // that lock: the order is tensor recorders, then owner submission mutex.
+        std::lock_guard lock(graphics_queue_mutex_);
+        if (retirement_fence_ != VK_NULL_HANDLE) {
+            throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::DeadlineExceeded,
+                .domain = lfs::ErrorDomain::Vulkan,
+                .user_message = "GPU retirement is quarantined; restart and restore the last checkpoint.",
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }));
+        }
+        const std::set<VkQueue> queues{graphics_queue_, present_queue_, compute_queue_, transfer_queue_};
+        for (const auto queue : queues) {
+            if (!queue)
+                continue;
+            VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            VkFence fence = VK_NULL_HANDLE;
+            auto result = vkCreateFence(device_, &info, nullptr, &fence);
+            if (result != VK_SUCCESS)
+                throw lfs::Exception(lfs::rendering::vulkan_result_to_error(result, "retirement fence", LFS_SOURCE_SITE_CURRENT()));
+            const VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            result = vkQueueSubmit(queue, 1, &submit, fence);
+            if (result != VK_SUCCESS) {
+                vkDestroyFence(device_, fence, nullptr);
+                throw lfs::Exception(lfs::rendering::vulkan_result_to_error(result, "retirement submission", LFS_SOURCE_SITE_CURRENT()));
+            }
+            const auto outcome = lfs::rendering::wait_fence_bounded(
+                device_, fence, {}, {}, makeWaitContext("shared_device.retirement"));
+            if (!outcome || *outcome != lfs::rendering::WaitOutcome::Ready) {
+                // Unknown completion: retain the submitted fence and allocations.
+                retirement_fence_ = fence;
+                gpu_wait_quarantined_.store(true, std::memory_order_release);
+                if (!outcome) {
+                    if (outcome.error().code() == lfs::ErrorCode::DeviceLost)
+                        gpu_device_lost_.store(true, std::memory_order_release);
+                    throw lfs::Exception(outcome.error());
+                }
+                throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
+                    .code = lfs::ErrorCode::DeadlineExceeded,
+                    .domain = lfs::ErrorDomain::Vulkan,
+                    .user_message = "GPU resource retirement stalled; restart and restore the last checkpoint.",
+                    .detection = LFS_SOURCE_SITE_CURRENT(),
+                }));
+            }
+            vkDestroyFence(device_, fence, nullptr);
+        }
+        work();
+    }
+
     void VulkanContext::destroyExternalBuffer(ExternalBuffer& buffer) {
         const bool was_live = buffer.buffer != VK_NULL_HANDLE || buffer.memory != VK_NULL_HANDLE ||
                               !buffer.memories.empty();
@@ -3995,17 +4163,19 @@ namespace lfs::vis {
             recordCurrentVulkanBytes(buffer.diagnostic_scope, buffer.diagnostic_label, 0);
         }
         if (device_) {
-            if (buffer.buffer != VK_NULL_HANDLE) {
-                vkDestroyBuffer(device_, buffer.buffer, nullptr);
-            }
-            if (buffer.memory != VK_NULL_HANDLE) {
-                vkFreeMemory(device_, buffer.memory, nullptr);
-            }
-            for (VkDeviceMemory memory : buffer.memories) {
-                if (memory != VK_NULL_HANDLE) {
-                    vkFreeMemory(device_, memory, nullptr);
+            lfs::core::retire_vulkan_resources(device_, [&] {
+                if (buffer.buffer != VK_NULL_HANDLE) {
+                    vkDestroyBuffer(device_, buffer.buffer, nullptr);
                 }
-            }
+                if (buffer.memory != VK_NULL_HANDLE) {
+                    vkFreeMemory(device_, buffer.memory, nullptr);
+                }
+                for (VkDeviceMemory memory : buffer.memories) {
+                    if (memory != VK_NULL_HANDLE) {
+                        vkFreeMemory(device_, memory, nullptr);
+                    }
+                }
+            });
         }
         closeExternalNativeHandle(buffer.native_handle);
         if (was_live && census_counted) {
@@ -4726,6 +4896,15 @@ namespace lfs::vis {
                                 "swapchain.present[{}]",
                                 i);
         }
+        if (swapchain_maintenance1_enabled_) {
+            present_fences_.assign(image_count, VK_NULL_HANDLE);
+            const VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
+            for (auto& fence : present_fences_) {
+                const auto result = vkCreateFence(device_, &info, nullptr, &fence);
+                if (result != VK_SUCCESS)
+                    return setVkFailure("Could not create presentation fence", result);
+            }
+        }
         next_acquire_index_ = 0;
         active_acquire_index_ = 0;
         swapchain_extent_ = extent;
@@ -5199,6 +5378,11 @@ namespace lfs::vis {
             }
         }
         render_finished_.clear();
+        for (const auto fence : present_fences_) {
+            if (fence != VK_NULL_HANDLE)
+                vkDestroyFence(device_, fence, nullptr);
+        }
+        present_fences_.clear();
         next_acquire_index_ = 0;
         active_acquire_index_ = 0;
         image_barriers_.clearSwapchainOnly();
@@ -5297,80 +5481,70 @@ namespace lfs::vis {
                   framebuffer_resized_,
                   frame_index_);
 
-        // Wait on all in-flight render fences (per-frame + per-image aliases). Once those
-        // are signaled, prior vkQueueSubmit work is complete and the presentation engine
-        // can no longer be reading the swapchain images we are about to destroy. We avoid
-        // vkQueueWaitIdle(present_queue_) because it stalls the entire CPU thread on the
-        // compositor, which can deadlock if the display server is itself blocked.
         if (!waitForFrameFences()) {
             framebuffer_resized_ = true;
             return false;
         }
-        // waitForFrameFences only drains the graphics queue's per-frame fences. The
-        // viewport's shared-scratch rasterizer submits on the async-compute queue,
-        // whose work is not covered by those fences; tearing down swapchain-tied
-        // resources while that work is still in flight loses the device (Xid 109).
-        // vkDeviceWaitIdle drains all queue work (it does not touch presentation, so
-        // it cannot deadlock on the compositor the way vkQueueWaitIdle(present) can).
-        // A bounded wait is not possible here: vkDeviceWaitIdle takes no timeout, and the
-        // async-compute submits are timeline-semaphore gated with no VkFence this context
-        // tracks. The timer below surfaces a pathological stall instead of hiding it.
-        {
-            LOG_TIMER_THRESHOLD("frame_pacing.vulkan_recreateSwapchain.device_wait_idle", 1.0);
-            const auto wait_start = std::chrono::steady_clock::now();
-            const VkResult idle_result = vkDeviceWaitIdle(device_);
-            LOG_DEBUG("Vulkan recreateSwapchain deviceWaitIdle result={} elapsed_ms={:.1f}",
-                      vkResultToString(idle_result),
-                      elapsedMs(wait_start));
-            if (idle_result != VK_SUCCESS) {
-                framebuffer_resized_ = true;
-                return fail(std::format("vkDeviceWaitIdle(swapchain recreate) failed: {}",
-                                        vkResultToString(idle_result)));
-            }
+        for (const auto fence : present_fences_) {
+            auto outcome = lfs::rendering::wait_fence_bounded(
+                device_, fence, {}, {}, makeWaitContext("vulkan.swapchain_retirement"));
+            if (!mapWaitOutcome(std::move(outcome), "presentation completion before swapchain retirement"))
+                return false;
         }
-        // Keep the old swapchain alive across the teardown of its dependent resources so it
-        // can be handed to vkCreateSwapchainKHR as oldSwapchain — letting the driver reuse
-        // images and present-engine state instead of allocating a fresh swapchain cold.
-        // destroySwapchain() skips the handle while swapchain_ is null; we destroy it after
-        // the new one is created (the spec requires the old handle stay valid until then).
-        const VkSwapchainKHR old_swapchain = swapchain_;
-        swapchain_ = VK_NULL_HANDLE;
-        {
-            LOG_TIMER_THRESHOLD("frame_pacing.vulkan_recreateSwapchain.destroy_dependent_resources", 0.25);
-            destroySwapchain();
+        if (!swapchain_maintenance1_enabled_) {
+            // Legacy WSI lacks explicit presentation retirement. Retain its idle
+            // fallback; the bundled MoltenVK uses bounded presentation fences.
+            const auto result = vkDeviceWaitIdle(device_);
+            if (result != VK_SUCCESS)
+                return setVkFailure("Swapchain retirement device wait failed", result);
         }
-        const bool swapchain_created =
-            timed("frame_pacing.vulkan_recreateSwapchain.createSwapchain",
-                  [&] { return createSwapchain(framebuffer_width_, framebuffer_height_, old_swapchain); });
-        const bool created =
-            swapchain_created &&
-            timed("frame_pacing.vulkan_recreateSwapchain.createImageViews",
-                  [&] { return createImageViews(); }) &&
-            timed("frame_pacing.vulkan_recreateSwapchain.createDepthStencilResources",
-                  [&] { return createDepthStencilResources(); });
-        if (swapchain_created && old_swapchain != VK_NULL_HANDLE) {
-            LOG_TIMER_THRESHOLD("frame_pacing.vulkan_recreateSwapchain.destroy_old_swapchain", 0.25);
-            vkDestroySwapchainKHR(device_, old_swapchain, nullptr);
-        }
-        if (!created) {
-            const std::string error = last_error_;
-            if (swapchain_created) {
+        bool recreated = false;
+        withQueuesIdle([&] {
+#ifdef __APPLE__
+            // MoltenVK can leave replacement drawables blank when oldSwapchain is
+            // retained across creation. Retire it completely before replacing it.
+            const VkSwapchainKHR old_swapchain = VK_NULL_HANDLE;
+#else
+            // Other drivers can reuse the retired swapchain's presentation resources.
+            const VkSwapchainKHR old_swapchain = swapchain_;
+            swapchain_ = VK_NULL_HANDLE;
+#endif
+            {
+                LOG_TIMER_THRESHOLD("frame_pacing.vulkan_recreateSwapchain.destroy_dependent_resources", 0.25);
                 destroySwapchain();
-            } else {
-                swapchain_ = old_swapchain;
             }
-            framebuffer_resized_ = true;
-            last_error_ = error;
-            return false;
-        }
-        framebuffer_resized_ = false;
-        LOG_DEBUG("Vulkan recreateSwapchain complete: extent={}x{}, images={}, framebuffer={}x{}",
-                  swapchain_extent_.width,
-                  swapchain_extent_.height,
-                  swapchain_images_.size(),
-                  framebuffer_width_,
-                  framebuffer_height_);
-        return true;
+            const bool swapchain_created =
+                timed("frame_pacing.vulkan_recreateSwapchain.createSwapchain",
+                      [&] { return createSwapchain(framebuffer_width_, framebuffer_height_, old_swapchain); });
+            const bool created =
+                swapchain_created &&
+                timed("frame_pacing.vulkan_recreateSwapchain.createImageViews",
+                      [&] { return createImageViews(); }) &&
+                timed("frame_pacing.vulkan_recreateSwapchain.createDepthStencilResources",
+                      [&] { return createDepthStencilResources(); });
+            if (old_swapchain != VK_NULL_HANDLE) {
+                LOG_TIMER_THRESHOLD("frame_pacing.vulkan_recreateSwapchain.destroy_old_swapchain", 0.25);
+                vkDestroySwapchainKHR(device_, old_swapchain, nullptr);
+            }
+            if (!created) {
+                const std::string error = last_error_;
+                // A failed replacement may still have created resources and
+                // retired oldSwapchain. Retry from a fully cleared swapchain.
+                destroySwapchain();
+                framebuffer_resized_ = true;
+                last_error_ = error;
+                return;
+            }
+            framebuffer_resized_ = false;
+            LOG_DEBUG("Vulkan recreateSwapchain complete: extent={}x{}, images={}, framebuffer={}x{}",
+                      swapchain_extent_.width,
+                      swapchain_extent_.height,
+                      swapchain_images_.size(),
+                      framebuffer_width_,
+                      framebuffer_height_);
+            recreated = true;
+        });
+        return recreated;
     }
 
 } // namespace lfs::vis

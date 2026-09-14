@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/gpu_backend_fwd.hpp"
 #include "core/mesh2splat.hpp"
 
 #include <algorithm>
@@ -101,6 +102,11 @@ namespace lfs::core {
 
         inline constexpr std::string_view kStrategyMCMC = "mcmc";
         inline constexpr std::string_view kStrategyMRNF = "mrnf";
+#if defined(LFS_TENSOR_CUDA) && !LFS_TENSOR_CUDA
+        inline constexpr std::string_view kDefaultTrainingStrategy = kStrategyMCMC;
+#else
+        inline constexpr std::string_view kDefaultTrainingStrategy = kStrategyMRNF;
+#endif
         inline constexpr std::string_view kStrategyMNRFLegacy = "mnrf";
         inline constexpr std::string_view kStrategyLFSLegacy = "lfs";
         inline constexpr std::string_view kStrategyIGSPlus = "igs+";
@@ -183,7 +189,7 @@ namespace lfs::core {
             bool no_splash = false;                            // Skip splash screen on startup
             bool debug_python = false;                         // Start debugpy listener for plugin debugging
             int debug_python_port = 5678;                      // Port for debugpy listener
-            std::string strategy = std::string(kStrategyMRNF); // Optimization strategy: mcmc, mrnf, igs+.
+            std::string strategy = std::string(kDefaultTrainingStrategy); // Optimization strategy: mcmc, mrnf, igs+.
 
             // Mask parameters
             MaskMode mask_mode = MaskMode::None;      // Attention mask mode
@@ -304,6 +310,7 @@ namespace lfs::core {
             void remove_step_scaling();
             [[nodiscard]] int resolved_total_iterations() const;
             [[nodiscard]] bool normal_supervision_active(int iter) const;
+            [[nodiscard]] std::string validate_training_backend(GpuBackend backend) const;
             [[nodiscard]] int resolved_ppisp_controller_activation_step(int total_iterations) const;
 
             nlohmann::json to_json() const;

@@ -192,7 +192,14 @@ namespace lfs::io {
         /**
          * @brief Check if nvImageCodec is available and working
          */
-        static bool is_available();
+        static bool is_available()
+#if LFS_TENSOR_CUDA
+            ;
+#else
+        {
+            return false;
+        }
+#endif
 
     private:
         struct Impl;

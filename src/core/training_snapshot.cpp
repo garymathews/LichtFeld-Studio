@@ -4,7 +4,8 @@
 
 #include "core/training_snapshot.hpp"
 #include "core/path_utils.hpp"
-#include <cuda_runtime.h>
+#include "core/tensor_backend.hpp"
+#include "core/tensor_storage.hpp"
 #include <fstream>
 #include <sstream>
 
@@ -13,11 +14,13 @@ namespace lfs::core::debug {
     MemorySnapshot get_memory_snapshot() {
         MemorySnapshot snapshot;
 
-        size_t free_bytes = 0, total_bytes = 0;
-        if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
-            snapshot.gpu_free_bytes = free_bytes;
-            snapshot.gpu_total_bytes = total_bytes;
-            snapshot.gpu_used_bytes = total_bytes - free_bytes;
+        try {
+            const auto info = gpu_backend_memory_info(default_gpu_backend());
+            snapshot.gpu_free_bytes = info.free_bytes;
+            snapshot.gpu_total_bytes = info.total_bytes;
+            snapshot.gpu_used_bytes = info.total_bytes >= info.free_bytes ? info.total_bytes - info.free_bytes : 0;
+        } catch (const std::exception& error) {
+            LOG_DEBUG("GPU memory snapshot unavailable: {}", error.what());
         }
 
         return snapshot;

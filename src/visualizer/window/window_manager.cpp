@@ -7,6 +7,7 @@
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/tensor_backend.hpp"
 #include "input/input_controller.hpp"
 #include "input/sdl_key_mapping.hpp"
 #include "rendering/cuda_vulkan_interop.hpp"
@@ -29,6 +30,13 @@
 #include <utility>
 
 namespace lfs::vis {
+
+#ifndef __APPLE__
+    void WindowManager::showErrorDialog(const char* title, const char* message) {
+        if (!SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, window_))
+            LOG_ERROR("Could not display GPU failure dialog: {}", SDL_GetError());
+    }
+#endif
 
     namespace {
         constexpr double kPendingResizeMinWaitSeconds = 0.001;
@@ -518,11 +526,13 @@ namespace lfs::vis {
     }
 
     WindowManager::~WindowManager() {
+        setLiveResizeCallback({});
 #if defined(__linux__)
         if (g_x11_error_owner == this) {
             g_x11_error_owner = nullptr;
         }
 #endif
+        releaseTensorBackendDevice();
         vulkan_context_.reset();
         if (window_) {
             SDL_DestroyWindow(window_);
@@ -766,8 +776,11 @@ namespace lfs::vis {
             return false;
         }
         lfs::rendering::setExpectedVulkanDeviceUuid(vulkan_context_->deviceUUID());
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan)
+            adoptTensorBackendDevice();
         if (!vulkan_context_->presentBootstrapFrame(0.11f, 0.11f, 0.14f, 1.0f)) {
             std::cerr << "Failed to present Vulkan bootstrap frame: " << vulkan_context_->lastError() << std::endl;
+            releaseTensorBackendDevice();
             vulkan_context_.reset();
             SDL_DestroyWindow(window_);
             window_ = nullptr;
@@ -851,7 +864,47 @@ namespace lfs::vis {
         return std::chrono::steady_clock::now() - last_window_size_change_time_ <= max_age;
     }
 
+    void WindowManager::setLiveResizeCallback(std::function<void()> callback) {
+#ifdef __APPLE__
+        if (live_resize_callback_)
+            SDL_RemoveEventWatch(liveResizeEventWatch, this);
+#endif
+        live_resize_callback_ = std::move(callback);
+#ifdef __APPLE__
+        if (live_resize_callback_)
+            SDL_AddEventWatch(liveResizeEventWatch, this);
+#endif
+    }
+
+    bool WindowManager::liveResizeEventWatch(void* userdata, SDL_Event* event) {
+        auto& self = *static_cast<WindowManager*>(userdata);
+        // SDL marks Cocoa's live-resize expose events with data1=1. Ordinary
+        // expose events and worker-thread events must use the outer main loop.
+        if (!SDL_IsMainThread() || event->type != SDL_EVENT_WINDOW_EXPOSED || event->window.data1 != 1 ||
+            !self.window_ || event->window.windowID != SDL_GetWindowID(self.window_) ||
+            self.live_resize_rendering_ || !self.live_resize_callback_ ||
+            !self.vulkan_context_ || self.vulkan_context_->hasActiveFrame())
+            return true;
+        self.live_resize_rendering_ = true;
+        auto input = std::move(self.frame_input_);
+        self.frame_input_ = {};
+        self.frame_input_.serial = input.serial;
+        self.frame_input_.beginFrame();
+        SDL_GetWindowSize(self.window_, &self.frame_input_.window_w, &self.frame_input_.window_h);
+        self.frame_input_.mouse_x = input.mouse_x;
+        self.frame_input_.mouse_y = input.mouse_y;
+        self.frame_input_.window_event = true;
+        self.frame_input_.had_event = true;
+        self.live_resize_callback_();
+        input.serial = self.frame_input_.serial;
+        self.frame_input_ = std::move(input);
+        self.live_resize_rendering_ = false;
+        return true;
+    }
+
     void WindowManager::pollEvents() {
+        if (live_resize_rendering_)
+            return;
         frame_input_.beginFrame();
         const SDL_WindowID main_window_id = window_ ? SDL_GetWindowID(window_) : 0;
         SDL_Event event;
@@ -870,6 +923,8 @@ namespace lfs::vis {
     }
 
     void WindowManager::waitEvents(double timeout_seconds) {
+        if (live_resize_rendering_)
+            return;
         frame_input_.beginFrame();
         const SDL_WindowID main_window_id = window_ ? SDL_GetWindowID(window_) : 0;
         SDL_Event event;
@@ -1815,6 +1870,43 @@ namespace lfs::vis {
 
         pending_titlebar_double_click_ = false;
         toggleMaximized();
+    }
+
+    void WindowManager::adoptTensorBackendDevice() {
+        const auto& device = vulkan_context_->tensorBackendDevice();
+        if (!device.complete) {
+            LOG_INFO("Tensor Vulkan backend keeps its own device: the window device has no spare compute queue or lacks a required feature");
+            return;
+        }
+        const lfs::core::VulkanDeviceHandles handles{
+            .instance = vulkan_context_->instance(),
+            .physical_device = vulkan_context_->physicalDevice(),
+            .device = vulkan_context_->device(),
+            .queue = device.queue,
+            .queue_family = device.queue_family,
+            .shader_atomic_float = device.shader_atomic_float,
+            .memory_budget = false,
+            .shader_float16 = device.shader_float16,
+            .shared_buffer_queue_families = {vulkan_context_->graphicsQueueFamily(), vulkan_context_->computeQueueFamily()},
+            .with_other_queues_idle = [this](const auto& work) { vulkan_context_->withQueuesIdle(work); },
+        };
+        if (const auto status = lfs::core::adopt_vulkan_device(handles); !status) {
+            LOG_WARN("Tensor Vulkan backend keeps its own device: {}", lfs::format_for_developer(status.error()));
+            return;
+        }
+        tensor_backend_adopted_ = true;
+        LOG_INFO("Tensor Vulkan backend runs on the window device (queue family {})", device.queue_family);
+    }
+
+    void WindowManager::releaseTensorBackendDevice() {
+        if (!tensor_backend_adopted_) {
+            return;
+        }
+        tensor_backend_adopted_ = false;
+        if (const auto status = lfs::core::shutdown_gpu_backend(lfs::core::GpuBackend::Vulkan); !status) {
+            LOG_WARN("Tensor Vulkan backend shutdown failed before the window device is destroyed: {}",
+                     lfs::format_for_developer(status.error()));
+        }
     }
 
 } // namespace lfs::vis

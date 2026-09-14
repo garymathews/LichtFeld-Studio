@@ -13,8 +13,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
+#include "core/tensor_backend.hpp"
 #include <vector>
+#include <mutex>
 
 namespace lfs::training {
 
@@ -64,10 +68,13 @@ namespace lfs::training {
             const void* key = nullptr;
             size_t n = 0;
             size_t ranges_fp = 0;
+            std::optional<lfs::core::GpuBackend> backend;
+            uint64_t context_id = 0;
             lfs::core::Device device = lfs::core::Device::CUDA;
             lfs::core::Tensor mask;
         };
         FrozenMaskCache g_frozen_mask_cache;
+        std::mutex g_frozen_mask_mutex;
 
         void grow_score_preserving_prefix(
             lfs::core::Tensor& scores,
@@ -88,12 +95,7 @@ namespace lfs::training {
             auto grown = lfs::core::Tensor::zeros_direct(
                 source.shape(), desired_capacity, device, source.dtype());
             if (source.numel() > 0) {
-                const auto stream = grown.stream();
-                source.sync_to_stream(stream);
-                LFS_CUDA_CHECK(cudaMemcpyAsync(
-                    grown.data_ptr(), source.data_ptr(), source.bytes(),
-                    cudaMemcpyDeviceToDevice, stream));
-                LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+                grown.copy_from(source);
             }
             scores = std::move(grown);
         }
@@ -186,9 +188,14 @@ namespace lfs::training {
             return {};
         }
 
+        const auto backend = device == core::Device::GPU ? std::optional(core::gpu_backend_of(splat_data.means()).value_or(core::default_gpu_backend())) : std::nullopt;
+        core::GpuBackendScope scope(backend.value_or(core::default_gpu_backend()));
+        const auto context_id = backend == core::GpuBackend::Vulkan ? core::vulkan_backend_context_id() : 0;
+        const std::lock_guard lock(g_frozen_mask_mutex);
         const size_t ranges_fp = frozen_ranges_fingerprint(splat_data);
         const void* key = static_cast<const void*>(&splat_data);
-        if (g_frozen_mask_cache.key == key &&
+        if (g_frozen_mask_cache.backend == backend && g_frozen_mask_cache.context_id == context_id &&
+            g_frozen_mask_cache.key == key &&
             g_frozen_mask_cache.n == n &&
             g_frozen_mask_cache.ranges_fp == ranges_fp &&
             g_frozen_mask_cache.device == device &&
@@ -209,6 +216,8 @@ namespace lfs::training {
             lfs::core::TensorShape({n}),
             device);
         tensor.set_name("splat.frozen_mask");
+        g_frozen_mask_cache.backend = backend;
+        g_frozen_mask_cache.context_id = context_id;
         g_frozen_mask_cache.key = key;
         g_frozen_mask_cache.n = n;
         g_frozen_mask_cache.ranges_fp = ranges_fp;
@@ -376,14 +385,19 @@ namespace lfs::training {
         assert(rotations.ndim() == 2 && rotations.shape()[1] == 4);
         assert(rotations.shape()[0] == n);
 
-        auto dead_mask = Tensor::empty({n}, Device::CUDA, DataType::Bool);
-        pruning::launch_compute_dead_mask(
-            flat_opacities.ptr<float>(),
-            rotations.ptr<float>(),
-            dead_mask.ptr<uint8_t>(),
-            n,
-            min_opacity);
-        return dead_mask;
+#if LFS_TENSOR_CUDA
+        if (gpu_backend_of(rotations) == GpuBackend::CUDA) {
+            auto dead_mask = Tensor::empty({n}, Device::CUDA, DataType::Bool);
+            pruning::launch_compute_dead_mask(
+                flat_opacities.ptr<float>(),
+                rotations.ptr<float>(),
+                dead_mask.ptr<uint8_t>(),
+                n,
+                min_opacity);
+            return dead_mask;
+        }
+#endif
+        return flat_opacities.le(min_opacity).logical_or(rotations.square().sum(1).lt(1e-8f));
     }
 
     lfs::core::Tensor compute_near_zero_rotation_mask(
@@ -393,12 +407,17 @@ namespace lfs::training {
         const size_t n = rotations.shape()[0];
         assert(rotations.ndim() == 2 && rotations.shape()[1] == 4);
 
-        auto near_zero_mask = Tensor::empty({n}, Device::CUDA, DataType::Bool);
-        pruning::launch_compute_near_zero_rotation_mask(
-            rotations.ptr<float>(),
-            near_zero_mask.ptr<uint8_t>(),
-            n);
-        return near_zero_mask;
+#if LFS_TENSOR_CUDA
+        if (gpu_backend_of(rotations) == GpuBackend::CUDA) {
+            auto near_zero_mask = Tensor::empty({n}, Device::CUDA, DataType::Bool);
+            pruning::launch_compute_near_zero_rotation_mask(
+                rotations.ptr<float>(),
+                near_zero_mask.ptr<uint8_t>(),
+                n);
+            return near_zero_mask;
+        }
+#endif
+        return rotations.square().sum(1).lt(1e-8f);
     }
 
     void DensifyNScratch::ensure_n(const size_t n, const lfs::core::Device device) {
@@ -604,8 +623,7 @@ namespace lfs::training {
                                      ? Tensor::zeros_direct(TensorShape({n}), desired_cap, device)
                                      : Tensor::zeros({n}, device);
                     if (cur > 0) {
-                        cudaMemcpy(fresh.ptr<float>(), scores.ptr<float>(),
-                                   cur * sizeof(float), cudaMemcpyDeviceToDevice);
+                        fresh.slice(0, 0, cur).copy_from(scores);
                     }
                     scores = std::move(fresh);
                     return;
@@ -649,9 +667,20 @@ namespace lfs::training {
                     auto idx_i32 = indices.dtype() == DataType::Int32
                                        ? indices
                                        : indices.to(DataType::Int32);
-                    shN_swizzled_zero_at_indices(
-                        state->grad.ptr<float>(), idx_i32.ptr<int>(),
-                        idx_i32.numel(), shN_layout_rest);
+#if LFS_TENSOR_CUDA
+                    if (gpu_backend_of(state->grad) == GpuBackend::CUDA) {
+                        shN_swizzled_zero_at_indices(
+                            state->grad.ptr<float>(), idx_i32.ptr<int>(),
+                            idx_i32.numel(), shN_layout_rest);
+                    } else
+#endif
+                    {
+                        const size_t slots = sh_float4_slots_for_rest(shN_layout_rest);
+                        const size_t blocks = state->grad.numel() / (slots * 128);
+                        auto rows = state->grad.reshape(TensorShape{blocks, slots, 32, 4}).permute({0, 2, 1, 3}).contiguous().reshape(TensorShape{blocks * 32, slots * 4});
+                        rows.index_put_(indices, Tensor::zeros(TensorShape{indices.numel(), slots * 4}, rows.device()));
+                        state->grad.copy_from(rows.reshape(TensorShape{blocks, 32, slots, 4}).permute({0, 2, 1, 3}).contiguous().reshape(state->grad.shape()));
+                    }
                 }
                 continue;
             }

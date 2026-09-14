@@ -11,7 +11,6 @@
         "avcodec",
         "avfilter",
         "avformat",
-        "nvcodec",
         "swscale",
         "x264"
       ]
@@ -31,7 +30,10 @@
     "libdeflate",
     "libjpeg-turbo",
     "libpng",
-    "libplacebo",
+    {
+      "name": "libplacebo",
+      "platform": "!osx"
+    },
     "libwebp",
     "nanobind",
     {
@@ -78,9 +80,24 @@
         "tools"
       ]
     },
-    "shader-slang",
+    {
+      "name": "shader-slang",
+      "host": true
+    },
     "xxhash",
-    "zstd"
+    "zstd",
+    {
+      "name": "ffmpeg",
+      "features": [
+        "nvcodec"
+      ],
+      "platform": "!osx"
+    },
+    {
+      "name": "vulkan-loader",
+      "platform": "osx"
+    },
+    "spirv-headers"
   ],
   "features": {
     "tests": {

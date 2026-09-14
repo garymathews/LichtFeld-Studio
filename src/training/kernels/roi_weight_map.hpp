@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 #include <glm/glm.hpp>
 
 namespace lfs::training::kernels {

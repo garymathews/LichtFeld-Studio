@@ -3,7 +3,9 @@
 
 #include "ppisp.hpp"
 #include "config_serialization.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/logger.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
 #include <algorithm>
@@ -272,6 +274,7 @@ namespace lfs::training {
     }
 
     void PPISP::allocate_tensors() {
+#if LFS_TENSOR_CUDA
         assert(num_cameras_ > 0 && "num_cameras must be positive");
         assert(num_frames_ > 0 && "num_frames must be positive");
 
@@ -318,6 +321,10 @@ namespace lfs::training {
                                             num_frames_, nullptr);
 
         init_color_pinv_block_diag();
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void PPISP::init_color_pinv_block_diag() {
@@ -345,6 +352,7 @@ namespace lfs::training {
     lfs::core::Tensor PPISP::apply_forward(const lfs::core::Tensor& rgb, int camera_idx, int frame_idx,
                                            const float* exposure, const float* color, int num_frames,
                                            const PPISPRegion& region) {
+#if LFS_TENSOR_CUDA
         const auto& shape = rgb.shape();
         assert(shape.rank() == 3 && shape[0] == 3 && "Expected CHW layout with 3 channels");
 
@@ -361,6 +369,10 @@ namespace lfs::training {
                                                  frame_idx, nullptr);
 
         return output;
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor PPISP::apply(const lfs::core::Tensor& rgb, int camera_id, int uid, const PPISPRegion& region) {
@@ -385,6 +397,7 @@ namespace lfs::training {
                                                                float exposure_ev,
                                                                const PPISPRenderOverrides& ov,
                                                                const PPISPRegion& region) {
+#if LFS_TENSOR_CUDA
         assert(finalized_ && "Must call finalize() before apply_with_exposure_and_overrides()");
         const int camera_idx = translate_camera(camera_id);
 
@@ -455,12 +468,17 @@ namespace lfs::training {
                                                  rgb.ptr<float>(), output.ptr<float>(), h, w, region.y_offset, full_h,
                                                  num_cameras_, 1, camera_idx, 0, nullptr);
         return output;
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor PPISP::apply_with_controller_params(const lfs::core::Tensor& rgb,
                                                           const lfs::core::Tensor& controller_params,
                                                           int camera_idx,
                                                           const PPISPRegion& region) {
+#if LFS_TENSOR_CUDA
         assert(controller_params.shape().rank() == 2 && "Expected [1,9]");
         assert(controller_params.shape()[0] == 1 && controller_params.shape()[1] == 9);
         assert(camera_idx >= 0 && camera_idx < num_cameras_ && "camera_idx out of range");
@@ -486,6 +504,10 @@ namespace lfs::training {
                                                  camera_idx, 0, nullptr);
 
         return output;
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor PPISP::apply_with_controller_params_and_overrides(const lfs::core::Tensor& rgb,
@@ -493,6 +515,7 @@ namespace lfs::training {
                                                                         int camera_idx,
                                                                         const PPISPRenderOverrides& ov,
                                                                         const PPISPRegion& region) {
+#if LFS_TENSOR_CUDA
         assert(controller_params.shape().rank() == 2 && "Expected [1,9]");
         assert(controller_params.shape()[0] == 1 && controller_params.shape()[1] == 9);
         assert(camera_idx >= 0 && camera_idx < num_cameras_ && "camera_idx out of range");
@@ -578,10 +601,15 @@ namespace lfs::training {
                                                  camera_idx, 0, nullptr);
 
         return output;
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor PPISP::apply_with_overrides(const lfs::core::Tensor& rgb, int camera_id, int uid,
                                                   const PPISPRenderOverrides& ov, const PPISPRegion& region) {
+#if LFS_TENSOR_CUDA
         assert(finalized_ && "Must call finalize() before apply_with_overrides()");
         const int camera_idx = translate_camera(camera_id);
         const int frame_idx = translate_frame(uid);
@@ -669,10 +697,15 @@ namespace lfs::training {
                                                  num_cameras_, num_frames_, camera_idx, frame_idx, nullptr);
 
         return output;
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor PPISP::backward(const lfs::core::Tensor& rgb, const lfs::core::Tensor& grad_output, int camera_id,
                                       int uid) {
+#if LFS_TENSOR_CUDA
         assert(finalized_ && "Must call finalize() before backward()");
         const int camera_idx = translate_camera(camera_id);
         const int frame_idx = translate_frame(uid);
@@ -692,12 +725,17 @@ namespace lfs::training {
             w, num_cameras_, num_frames_, camera_idx, frame_idx, nullptr);
 
         return grad_rgb;
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     lfs::core::Tensor PPISP::backward_with_controller_params(const lfs::core::Tensor& rgb,
                                                              const lfs::core::Tensor& grad_output,
                                                              const lfs::core::Tensor& controller_params,
                                                              int camera_idx) {
+#if LFS_TENSOR_CUDA
         assert(finalized_ && "Must call finalize() before backward_with_controller_params()");
         assert(controller_params.shape().rank() == 2 && "Expected [1,9]");
         assert(controller_params.shape()[0] == 1 && controller_params.shape()[1] == 9);
@@ -744,6 +782,10 @@ namespace lfs::training {
             cudaMemcpyDeviceToDevice, nullptr));
 
         return ctrl_bwd_output_.reshape({1, 9});
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     namespace {
@@ -767,6 +809,7 @@ namespace lfs::training {
     } // namespace
 
     lfs::core::Tensor PPISP::reg_loss_gpu() {
+#if LFS_TENSOR_CUDA
         const bool skip_mean = config_.exposure_mean <= 0.0f && config_.color_mean <= 0.0f;
         const bool skip_crf = !config_.train_crf || config_.crf_channel <= 0.0f;
         if (skip_mean && skip_crf) {
@@ -916,9 +959,14 @@ namespace lfs::training {
         // Return as GPU scalar
         auto loss = lfs::core::Tensor::full({1}, total_loss, lfs::core::Device::CUDA);
         return loss;
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void PPISP::reg_backward() {
+#if LFS_TENSOR_CUDA
         const bool skip_mean = config_.exposure_mean <= 0.0f && config_.color_mean <= 0.0f;
         const bool skip_crf = !config_.train_crf || config_.crf_channel <= 0.0f;
         if (skip_mean && skip_crf) {
@@ -1079,9 +1127,14 @@ namespace lfs::training {
         vignetting_grad_ = vignetting_grad_.add(vig_grad_tensor);
         color_grad_ = color_grad_.add(color_grad_tensor);
         crf_grad_ = crf_grad_.add(crf_grad_tensor);
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void PPISP::optimizer_step() {
+#if LFS_TENSOR_CUDA
         float bc1_rcp, bc2_sqrt_rcp;
         compute_bias_corrections(bc1_rcp, bc2_sqrt_rcp);
 
@@ -1104,9 +1157,14 @@ namespace lfs::training {
             {color_params_.ptr<float>(), color_exp_avg_.ptr<float>(), color_exp_avg_sq_.ptr<float>(),
              color_grad_.ptr<float>(), static_cast<int>(color_params_.numel())},
             crf_group, lr, beta1, beta2, bc1_rcp, bc2_sqrt_rcp, eps, nullptr);
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void PPISP::zero_grad() {
+#if LFS_TENSOR_CUDA
         LFS_CUDA_CHECK(cudaMemsetAsync(
             exposure_grad_.ptr<float>(), 0, exposure_grad_.numel() * sizeof(float), nullptr));
         LFS_CUDA_CHECK(cudaMemsetAsync(
@@ -1115,6 +1173,10 @@ namespace lfs::training {
             color_grad_.ptr<float>(), 0, color_grad_.numel() * sizeof(float), nullptr));
         LFS_CUDA_CHECK(cudaMemsetAsync(
             crf_grad_.ptr<float>(), 0, crf_grad_.numel() * sizeof(float), nullptr));
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     void PPISP::scheduler_step() {
@@ -1132,6 +1194,7 @@ namespace lfs::training {
     }
 
     void PPISP::project_mean() {
+#if LFS_TENSOR_CUDA
         assert(finalized_);
         assert(exposure_params_.is_valid());
         assert(color_params_.is_valid());
@@ -1143,6 +1206,10 @@ namespace lfs::training {
 
         kernels::launch_ppisp_project_mean(
             exposure_params_.ptr<float>(), color_params_.ptr<float>(), num_frames_, nullptr);
+
+#else
+        throw std::runtime_error("PPISP compute is unavailable on the Vulkan training backend");
+#endif
     }
 
     float PPISP::mean_exposure_ev() const {

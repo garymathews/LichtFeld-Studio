@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <filesystem>
 #include <format>
 #include <glm/gtc/constants.hpp>
@@ -424,9 +426,14 @@ namespace lfs::rendering {
                 return std::unexpected("Point cloud deleted mask must match point count");
             }
 
+#if LFS_TENSOR_CUDA
+            constexpr auto raster_device = lfs::core::Device::GPU;
+#else
+            constexpr auto raster_device = lfs::core::Device::CPU;
+#endif
             Tensor positions_cuda = positions_source;
-            if (positions_cuda.device() != lfs::core::Device::CUDA) {
-                positions_cuda = positions_cuda.cuda();
+            if (positions_cuda.device() != raster_device) {
+                positions_cuda = positions_cuda.to(raster_device);
             }
             positions_cuda = positions_cuda.contiguous();
 
@@ -437,8 +444,8 @@ namespace lfs::rendering {
             if (colors_cuda.dtype() != lfs::core::DataType::Float32) {
                 colors_cuda = colors_cuda.to(lfs::core::DataType::Float32);
             }
-            if (colors_cuda.device() != lfs::core::Device::CUDA) {
-                colors_cuda = colors_cuda.cuda();
+            if (colors_cuda.device() != raster_device) {
+                colors_cuda = colors_cuda.to(raster_device);
             }
             colors_cuda = colors_cuda.contiguous();
 
@@ -450,8 +457,8 @@ namespace lfs::rendering {
                 if (transform_indices_cuda.dtype() != lfs::core::DataType::Int32) {
                     transform_indices_cuda = transform_indices_cuda.to(lfs::core::DataType::Int32);
                 }
-                if (transform_indices_cuda.device() != lfs::core::Device::CUDA) {
-                    transform_indices_cuda = transform_indices_cuda.cuda();
+                if (transform_indices_cuda.device() != raster_device) {
+                    transform_indices_cuda = transform_indices_cuda.to(raster_device);
                 }
                 transform_indices_cuda = transform_indices_cuda.contiguous();
                 transform_indices_ptr = transform_indices_cuda.ptr<std::int32_t>();
@@ -473,7 +480,7 @@ namespace lfs::rendering {
                                       transforms_host,
                                       {transforms.size(), static_cast<size_t>(16)},
                                       lfs::core::Device::CPU)
-                                      .cuda()
+                                      .to(raster_device)
                                       .contiguous();
                 transforms_device = transforms_cuda.ptr<float>();
             }
@@ -489,7 +496,7 @@ namespace lfs::rendering {
                                       mask_host,
                                       {mask_host.size()},
                                       lfs::core::Device::CPU)
-                                      .cuda()
+                                      .to(raster_device)
                                       .to(lfs::core::DataType::UInt8)
                                       .contiguous();
                 visibility_device = visibility_cuda.ptr<std::uint8_t>();
@@ -502,8 +509,8 @@ namespace lfs::rendering {
                 if (deleted_mask_cuda.dtype() != lfs::core::DataType::Bool) {
                     deleted_mask_cuda = deleted_mask_cuda.to(lfs::core::DataType::Bool);
                 }
-                if (deleted_mask_cuda.device() != lfs::core::Device::CUDA) {
-                    deleted_mask_cuda = deleted_mask_cuda.cuda();
+                if (deleted_mask_cuda.device() != raster_device) {
+                    deleted_mask_cuda = deleted_mask_cuda.to(raster_device);
                 }
                 deleted_mask_cuda = deleted_mask_cuda.contiguous();
                 deleted_mask_device = deleted_mask_cuda.ptr<bool>();
@@ -525,10 +532,10 @@ namespace lfs::rendering {
 
             Tensor image_tensor = Tensor::empty(
                 {static_cast<size_t>(channels), static_cast<size_t>(height), static_cast<size_t>(width)},
-                lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                raster_device, lfs::core::DataType::Float32);
             Tensor depth_tensor = Tensor::empty(
                 {static_cast<size_t>(1), static_cast<size_t>(height), static_cast<size_t>(width)},
-                lfs::core::Device::CUDA, lfs::core::DataType::Float32);
+                raster_device, lfs::core::DataType::Float32);
 
             lfs::core::pin_operands({&positions_cuda, &colors_cuda});
             pcraster::LaunchParams params{};
@@ -587,11 +594,16 @@ namespace lfs::rendering {
             params.depth = depth_tensor.ptr<float>();
             params.stream = image_tensor.stream();
 
+#if LFS_TENSOR_CUDA
             if (const cudaError_t status = pcraster::launchPointCloudRaster(params);
                 status != cudaSuccess) {
                 return std::unexpected(std::format("Point cloud rasterization failed: {}",
                                                    cudaGetErrorString(status)));
             }
+
+#else
+            pcraster::rasterizePointCloudCpu(params);
+#endif
 
             return RasterImageResult{
                 .image = std::move(image_tensor),

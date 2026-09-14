@@ -6,13 +6,17 @@
 # ============================================================================
 
 # Tensor CUDA kernels (STATIC, linked privately)
-add_subdirectory(tensor)
+if(LFS_TENSOR_CUDA)
+    add_subdirectory(tensor)
+    add_subdirectory(nn)
+    add_subdirectory(cuda)
+endif()
 
-# Neural inference kernels (STATIC, linked privately)
-add_subdirectory(nn)
+option(LFS_TENSOR_VULKAN "Build the Vulkan tensor backend" ${APPLE})
+if(LFS_TENSOR_VULKAN)
+    include(tensor/backend/vulkan/CMakeLists.txt)
+endif()
 
-# Core CUDA library (STATIC, linked privately)
-add_subdirectory(cuda)
 
 # Event bridge shared library
 add_subdirectory(event_bridge)
@@ -22,17 +26,16 @@ add_subdirectory(logger)
 
 # Tensor C++ sources (merged from src/core/tensor/)
 set(TENSOR_SOURCES
-        tensor/cuda_event_pool.cpp
-        tensor/cuda_stream_context.cpp
-        tensor/stream_lifetime.cpp
-        tensor/gpu_slab_allocator.cpp
-        tensor/size_bucketed_pool.cpp
+        tensor/joint_moments.cpp
         tensor/lazy_config.cpp
         tensor/lazy_ir.cpp
         tensor/lazy_executor.cpp
+        tensor/tensor_backend.cpp
+        tensor/backend/backend_registry.cpp
         tensor/tensor.cpp
         tensor/tensor_serialization.cpp
         tensor/tensor_factory.cpp
+        tensor/tensor_execution.cpp
         tensor/tensor_utils.cpp
         tensor/tensor_matrix_ops.cpp
         tensor/tensor_unified_ops.cpp
@@ -44,8 +47,6 @@ set(TENSOR_SOURCES
         tensor/tensor_advanced_ops.cpp
         tensor/tensor_row_proxy.cpp
         tensor/tensor_nn_ops.cpp
-        tensor/pinned_memory_allocator.cpp
-        tensor/tensor_exports.cu
         nn/ops.cpp
         nn/weight_file.cpp
         nn/activation_arena.cpp
@@ -53,11 +54,52 @@ set(TENSOR_SOURCES
         nn/models/lpips.cpp
 )
 
+if(LFS_TENSOR_CUDA)
+    list(APPEND TENSOR_SOURCES
+        tensor/cuda_event_pool.cpp
+        tensor/cuda_stream_context.cpp
+        tensor/stream_lifetime.cpp
+        tensor/gpu_slab_allocator.cpp
+        tensor/size_bucketed_pool.cpp
+        tensor/backend/cuda/cuda_ops_pointwise.cpp
+        tensor/backend/cuda/cuda_ops_reduce.cpp
+        tensor/backend/cuda/cuda_ops_scan_sort.cpp
+        tensor/backend/cuda/cuda_ops_matrix_nn.cpp
+        tensor/backend/cuda/cuda_ops_random.cpp
+        tensor/backend/cuda/cuda_ops_index_mask.cpp
+        tensor/backend/cuda/cuda_ops_movement.cpp
+        tensor/backend/cuda/cuda_services.cpp
+        tensor/pinned_memory_allocator.cpp
+        tensor/tensor_exports.cu
+    )
+endif()
+
+if(LFS_TENSOR_VULKAN)
+    list(APPEND TENSOR_SOURCES
+        ../rendering/rasterizer/vulkan/src/vma_implementation.cpp
+        tensor/backend/vulkan/vk_context.cpp
+        tensor/backend/vulkan/vk_memory.cpp
+        tensor/backend/vulkan/vk_recorder.cpp
+        tensor/backend/vulkan/vk_pipelines.cpp
+        tensor/backend/vulkan/vk_ops_pointwise.cpp
+        tensor/backend/vulkan/vk_ops_movement.cpp
+        tensor/backend/vulkan/vk_ops_reduce.cpp
+        tensor/backend/vulkan/vk_ops_index.cpp
+        tensor/backend/vulkan/vk_ops_mask.cpp
+        tensor/backend/vulkan/vk_ops_sort.cpp
+        tensor/backend/vulkan/vk_ops_matrix.cpp
+        tensor/backend/vulkan/vk_ops_nn.cpp
+        tensor/backend/vulkan/vk_ops_random.cpp
+        tensor/backend/vulkan/vk_services.cpp
+    )
+endif()
+
 # Core module sources
 set(CORE_SOURCES
         abi.cpp
         alloc_counter.cpp
         crash_handler.cpp
+        diagnostic_modes.cpp
         training_churn_metrics.cpp
         cuda_error.cpp
         cuda_error_typed.cpp
@@ -79,6 +121,8 @@ set(CORE_SOURCES
         animatable_property.cpp
         argument_parser.cpp
         camera.cpp
+        undistort.cpp
+        prior_resize.cpp
         checkpoint_format.cpp
         image_loader.cpp
         cuda_version.cpp
@@ -101,6 +145,7 @@ set(CORE_SOURCES
         splat_data_transform.cpp
         splat_exportable_storage.cpp
         sh_value_quant.cpp
+        sh_layout.cpp
         shareable_allocation_limit.cpp
         tensor_debug.cpp
         training_snapshot.cpp
@@ -110,10 +155,27 @@ set(CORE_SOURCES
         legacy_settings_migration.cpp
 )
 
+if(NOT LFS_TENSOR_CUDA)
+    list(REMOVE_ITEM CORE_SOURCES cuda/memory_arena_owner.cpp cuda/vmm_device_buffer.cpp cuda_error_typed.cpp cuda_error.cpp device_fault.cpp)
+    list(APPEND CORE_SOURCES cuda/selection_attribute_ops.cpp cuda/selection_morphology_cpu.cpp)
+endif()
+
 add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
+if(NOT LFS_TENSOR_CUDA)
+    # The vendored NVTX API supports disabled instrumentation without CUDA.
+    target_include_directories(lfs_core SYSTEM PUBLIC
+        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/external/nvImageCodec/external/NVTX/c/include>")
+    target_compile_definitions(lfs_core PUBLIC NVTX_DISABLE)
+endif()
 
 add_dependencies(lfs_core lfs_core_abi_stamp)
 target_include_directories(lfs_core BEFORE PRIVATE "${LFS_CORE_ABI_INCLUDE_DIR}")
+
+if(LFS_TENSOR_VULKAN)
+    add_dependencies(lfs_core lfs_tensor_vulkan_shaders)
+    target_sources(lfs_core PRIVATE ${LFS_TENSOR_SHADER_TABLE} nn/vulkan_ops.cpp)
+    target_compile_definitions(lfs_core PRIVATE LFS_TENSOR_VULKAN=1)
+endif()
 
 target_compile_definitions(lfs_core PRIVATE LFS_CORE_EXPORTS)
 
@@ -142,13 +204,15 @@ target_link_libraries(lfs_core
         nlohmann_json::nlohmann_json
         glm::glm
         Threads::Threads
-        CUDA::cudart
-        CUDA::curand
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::cudart>
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::curand>
         spdlog::spdlog
+        Vulkan::Vulkan
+        GPUOpen::VulkanMemoryAllocator
     PRIVATE
-        lfs_core_cuda
-        lfs_tensor_kernels
-        lfs_nn_kernels
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:lfs_core_cuda>
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:lfs_tensor_kernels>
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:lfs_nn_kernels>
         taywee::args
         JPEG::JPEG
         PNG::PNG

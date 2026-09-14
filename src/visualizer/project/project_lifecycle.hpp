@@ -682,6 +682,7 @@ namespace lfs::vis::project {
         std::atomic<bool> payload_dirty_{false};
         std::chrono::steady_clock::time_point
             last_autosave_at_;
+        std::chrono::steady_clock::time_point next_training_checkpoint_at_{};
         std::chrono::steady_clock::time_point
             last_mutation_at_;
         std::chrono::steady_clock::time_point

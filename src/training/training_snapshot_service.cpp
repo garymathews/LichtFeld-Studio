@@ -4,6 +4,7 @@
  */
 
 #include "training_snapshot_service.hpp"
+#include "snapshot_counting_stream.hpp"
 
 #include "checkpoint.hpp"
 #include "core/cuda/sh_layout.cuh"
@@ -78,19 +79,15 @@ namespace lfs::training {
             }
         }
 
-        class SnapshotReplanRequired final
-            : public std::runtime_error {
-        public:
-            using std::runtime_error::runtime_error;
-        };
-
         [[nodiscard]] lfs::Error snapshot_error(
             const lfs::ErrorCode code,
             std::string detail,
-            const lfs::core::SourceSite source) {
+            const lfs::core::SourceSite source,
+            const lfs::Retryability retry = lfs::Retryability::NotRetryable) {
             return lfs::make_error(lfs::ErrorInit{
                 .code = code,
                 .domain = lfs::ErrorDomain::Training,
+                .retryability = retry,
                 .user_message =
                     "The training snapshot could not be captured.",
                 .detail = std::move(detail),
@@ -292,85 +289,6 @@ namespace lfs::training {
             lfs::core::TensorSerializationDescriptor descriptor;
             std::uint64_t payload_offset = 0;
             std::uint64_t payload_bytes = 0;
-        };
-
-        class CountingStreamBuffer final
-            : public std::streambuf {
-        public:
-            [[nodiscard]] std::uint64_t size() const noexcept {
-                return high_water_;
-            }
-
-        protected:
-            std::streamsize xsputn(
-                const char*,
-                const std::streamsize count) override {
-                if (count < 0) {
-                    return 0;
-                }
-                advance(static_cast<std::uint64_t>(count));
-                return count;
-            }
-
-            int_type overflow(const int_type character) override {
-                if (traits_type::eq_int_type(
-                        character, traits_type::eof())) {
-                    return traits_type::not_eof(character);
-                }
-                advance(1);
-                return character;
-            }
-
-            pos_type seekoff(
-                const off_type offset,
-                const std::ios_base::seekdir direction,
-                const std::ios_base::openmode mode) override {
-                if ((mode & std::ios_base::out) == 0) {
-                    return pos_type(off_type(-1));
-                }
-                std::int64_t base = 0;
-                if (direction == std::ios_base::beg) {
-                    base = 0;
-                } else if (direction == std::ios_base::cur) {
-                    base = static_cast<std::int64_t>(cursor_);
-                } else if (direction == std::ios_base::end) {
-                    base = static_cast<std::int64_t>(high_water_);
-                }
-                if (offset < -base) {
-                    return pos_type(off_type(-1));
-                }
-                const auto next =
-                    static_cast<std::uint64_t>(base + offset);
-                cursor_ = next;
-                high_water_ =
-                    std::max(high_water_, cursor_);
-                return pos_type(
-                    static_cast<off_type>(cursor_));
-            }
-
-            pos_type seekpos(
-                const pos_type position,
-                const std::ios_base::openmode mode) override {
-                return seekoff(
-                    static_cast<off_type>(position),
-                    std::ios_base::beg, mode);
-            }
-
-        private:
-            void advance(const std::uint64_t bytes) {
-                if (bytes >
-                    std::numeric_limits<std::uint64_t>::max() -
-                        cursor_) {
-                    throw std::overflow_error(
-                        "Checkpoint byte count overflows");
-                }
-                cursor_ += bytes;
-                high_water_ =
-                    std::max(high_water_, cursor_);
-            }
-
-            std::uint64_t cursor_ = 0;
-            std::uint64_t high_water_ = 0;
         };
 
         class CountingTensorSink final
@@ -580,125 +498,6 @@ namespace lfs::training {
         }
 
     } // namespace
-
-    TrainingStepRegressionTracker::
-        TrainingStepRegressionTracker(
-            const std::size_t window_size)
-        : window_size_(window_size) {
-        if (window_size_ == 0) {
-            throw std::invalid_argument(
-                "Training step regression window must be non-zero");
-        }
-    }
-
-    TrainingStepWindowMetrics
-    TrainingStepRegressionTracker::summarize(
-        const std::deque<Sample>& samples) const noexcept {
-        TrainingStepWindowMetrics result;
-        if (samples.empty()) {
-            return result;
-        }
-        result.first_iteration =
-            samples.front().iteration;
-        result.last_iteration =
-            samples.back().iteration;
-        result.sample_count = samples.size();
-        result.mean_ms =
-            std::accumulate(
-                samples.begin(), samples.end(), 0.0,
-                [](const double sum,
-                   const Sample& sample) {
-                    return sum + sample.elapsed_ms;
-                }) /
-            static_cast<double>(samples.size());
-        return result;
-    }
-
-    void TrainingStepRegressionTracker::observe(
-        const int iteration,
-        const double elapsed_ms,
-        const bool topology_changed) {
-        if (!(elapsed_ms >= 0.0) ||
-            !std::isfinite(elapsed_ms)) {
-            return;
-        }
-        if (topology_changed) {
-            steady_run_.clear();
-            if (armed_ &&
-                iteration > snapshot_iteration_ &&
-                !metrics_.gate_evaluated) {
-                post_resume_run_.clear();
-                metrics_.post_resume = {};
-            }
-            return;
-        }
-
-        steady_run_.push_back({
-            .iteration = iteration,
-            .elapsed_ms = elapsed_ms,
-        });
-        if (steady_run_.size() > window_size_) {
-            steady_run_.pop_front();
-        }
-        if (steady_run_.size() == window_size_) {
-            latest_steady_window_ =
-                summarize(steady_run_);
-        }
-
-        if (!armed_ ||
-            iteration <= snapshot_iteration_ ||
-            metrics_.gate_evaluated) {
-            return;
-        }
-        post_resume_run_.push_back({
-            .iteration = iteration,
-            .elapsed_ms = elapsed_ms,
-        });
-        metrics_.post_resume =
-            summarize(post_resume_run_);
-        if (post_resume_run_.size() != window_size_) {
-            return;
-        }
-        if (metrics_.pre_snapshot.sample_count !=
-                window_size_ ||
-            !(metrics_.pre_snapshot.mean_ms > 0.0)) {
-            return;
-        }
-        metrics_.regression_percent =
-            (metrics_.post_resume.mean_ms /
-                 metrics_.pre_snapshot.mean_ms -
-             1.0) *
-            100.0;
-        metrics_.gate_evaluated = true;
-        metrics_.within_gate =
-            metrics_.regression_percent <= 10.0;
-    }
-
-    void TrainingStepRegressionTracker::arm_after_snapshot(
-        const int snapshot_iteration) {
-        snapshot_iteration_ = snapshot_iteration;
-        post_resume_run_.clear();
-        metrics_ = {};
-        if (latest_steady_window_) {
-            metrics_.pre_snapshot =
-                *latest_steady_window_;
-        }
-        armed_ = true;
-    }
-
-    TrainingStepRegressionMetrics
-    TrainingStepRegressionTracker::metrics() const noexcept {
-        return metrics_;
-    }
-
-    void TrainingStepRegressionTracker::reset() noexcept {
-        steady_run_.clear();
-        latest_steady_window_.reset();
-        post_resume_run_.clear();
-        metrics_ = {};
-        snapshot_iteration_ = 0;
-        armed_ = false;
-    }
 
     struct PreparedTrainingSnapshot::Impl {
         lfs::core::Uuid snapshot_uuid;
@@ -1590,8 +1389,7 @@ namespace lfs::training {
                 const lfs::core::TensorSerializationDescriptor&
                     descriptor) override {
                 if (index_ >= layout_.size()) {
-                    throw std::runtime_error(
-                        "Snapshot layout gained a tensor");
+                    throw lfs::Exception(snapshot_error(lfs::ErrorCode::FailedPrecondition, "Snapshot layout gained a tensor", LFS_SOURCE_SITE_CURRENT(), lfs::Retryability::Retryable));
                 }
                 CountingTensorSink::validate_tensor_source(
                     source, auxiliary_source, descriptor);
@@ -1643,8 +1441,7 @@ namespace lfs::training {
                         expected.descriptor) ||
                     offset != expected.payload_offset ||
                     bytes != expected.payload_bytes) {
-                    throw SnapshotReplanRequired(
-                        "Snapshot layout changed after preparation; request must be coalesced and replanned");
+                    throw lfs::Exception(snapshot_error(lfs::ErrorCode::FailedPrecondition, "Snapshot layout changed after preparation; request must be coalesced and replanned", LFS_SOURCE_SITE_CURRENT(), lfs::Retryability::Retryable));
                 }
 
                 if (source.device() ==
@@ -2292,25 +2089,13 @@ namespace lfs::training {
                         serialized.error();
                     // serialize_checkpoint() maps layout-change
                     // exceptions to a Result; restore the type.
-                    if (error.code() ==
-                            lfs::ErrorCode::
-                                FailedPrecondition ||
-                        error.detail().find(
-                            "layout changed") !=
-                            std::string_view::npos) {
-                        throw SnapshotReplanRequired(
-                            std::string(error.detail()));
-                    }
-                    throw std::runtime_error(
-                        lfs::format_for_developer(
-                            error));
+                    throw lfs::Exception(error);
                 }
                 if (serialized->bytes !=
                         prepared.impl_
                             ->checkpoint_bytes ||
                     !sink.complete()) {
-                    throw SnapshotReplanRequired(
-                        "Checkpoint layout changed after preparation");
+                    throw lfs::Exception(snapshot_error(lfs::ErrorCode::FailedPrecondition, "Checkpoint layout changed after preparation", LFS_SOURCE_SITE_CURRENT(), lfs::Retryability::Retryable));
                 }
                 sink.finish();
             }
@@ -2462,17 +2247,10 @@ namespace lfs::training {
                     lock,
                     [&] { return pending->drained; });
             }
-            const bool requires_replan =
-                dynamic_cast<
-                    const SnapshotReplanRequired*>(
-                    &error) != nullptr;
-            return snapshot_error(
-                requires_replan
-                    ? lfs::ErrorCode::
-                          FailedPrecondition
-                    : lfs::ErrorCode::Internal,
-                pending->error,
-                LFS_SOURCE_SITE_CURRENT());
+            if (const auto* typed = dynamic_cast<const lfs::Exception*>(&error))
+                return typed->error();
+            return snapshot_error(dynamic_cast<const std::bad_alloc*>(&error) ? lfs::ErrorCode::ResourceExhausted : lfs::ErrorCode::Internal,
+                                  pending->error, LFS_SOURCE_SITE_CURRENT());
         }
     }
 

@@ -4,11 +4,12 @@
 
 #pragma once
 
+#include "core/cuda_stream_fwd.hpp"
 #include "core/splat_data.hpp"
+#include "joint_adam_tensor.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cuda_runtime_api.h>
 #include <string>
 #include <unordered_map>
 
@@ -189,6 +190,7 @@ namespace lfs::training {
         /// `n_new` rows BEFORE any free_mask / param mutation. Returns false when
         /// capacity-ensure fails so callers can abort with zero torn state.
         [[nodiscard]] bool preflight_grow_capacity(size_t n_new);
+        void relocate_params_at_indices(ParamType type, const lfs::core::Tensor& indices);
         void relocate_params_at_indices_gpu(ParamType type, const int64_t* indices_device, size_t n_indices);
 
         // Low-level state manipulation
@@ -208,6 +210,11 @@ namespace lfs::training {
         void adopt_checkpoint_state(AdamOptimizer& loaded) noexcept;
         void reserve_capacity(size_t capacity);
 
+#if !LFS_TENSOR_CUDA
+        void permute_rows(const lfs::core::Tensor& permutation);
+        std::unique_ptr<AdamOptimizer> clone_for_model(lfs::core::SplatData& model) const;
+        void adopt_training_update(AdamOptimizer& prepared) noexcept;
+#endif
         // Control notifications for external mutations
         void reset_state(ParamType type);
 
@@ -217,6 +224,13 @@ namespace lfs::training {
         static void reset_slow_path_grow_count() noexcept;
 
     private:
+#if !LFS_TENSOR_CUDA
+        joint_adam::TensorMoments read_moment_rows(ParamType type, size_t primitives,
+                                                  size_t offset = 0, size_t count = 0);
+        static void write_moment_range(AdamParamState& state, size_t slots, const joint_adam::TensorMoments& rows, size_t offset);
+        void remap_moment_rows(ParamType type, size_t previous_primitives, size_t primitives,
+                                const lfs::core::Tensor& mapping, bool append);
+#endif
         static void note_slow_path_grow(const char* site, const std::string& name);
         AdamConfig config_;
         lfs::core::SplatData& splat_data_;

@@ -1,0 +1,40 @@
+#include "float_math.slangh"
+
+struct ChainOp
+{
+    uint kind;
+    float scalar;
+    uint64_t rhsAddress;
+};
+
+float applyChainOp(float value, ChainOp op, uint index)
+{
+    if (op.kind == 0) return value + op.scalar;
+    if (op.kind == 1) return value - op.scalar;
+    if (op.kind == 2) return value * op.scalar;
+    if (op.kind == 3) return value / op.scalar;
+    if (op.kind >= 4 && op.kind <= 7)
+    {
+        const float rhs = ((Ptr<float, Access.Read>)op.rhsAddress)[index];
+        if (op.kind == 4) return value + rhs;
+        if (op.kind == 5) return value - rhs;
+        if (op.kind == 6) return value * rhs;
+        return value / rhs;
+    }
+    if (op.kind == 10) return abs(value);
+    if (op.kind == 11) return -value;
+    if (op.kind == 12) return exp(value);
+    if (op.kind == 13) return log(value);
+    if (op.kind == 14) return sqrt(value);
+    if (op.kind == 15) return 1.0f / (1.0f + exp(-value));
+    if (op.kind == 16) return isnan(value) ? value : ieeeMaximum(value, 0.0f);
+    if (op.kind == 17) return value * value;
+    if (op.kind == 18) return tanh(value);
+    if (op.kind == 19) return rsqrt(value);
+    if (op.kind == 20) return float((value > 0.0f) - (value < 0.0f));
+    if (op.kind == 21) return 1.0f / value;
+    if (op.kind == 22) return floor(value);
+    if (op.kind == 23) return ceil(value);
+    if (op.kind == 24) return ieeeRound(value);
+    return value;
+}

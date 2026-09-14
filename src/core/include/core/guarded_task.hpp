@@ -9,6 +9,9 @@
 
 #include <atomic>
 #include <functional>
+#ifndef __cpp_lib_move_only_function
+#include <itlib/ufunction.hpp>
+#endif
 #include <memory>
 #include <optional>
 #include <string>
@@ -120,8 +123,13 @@ namespace lfs::core {
         std::shared_ptr<TaskSettlement> settlement = {};
     };
 
+#ifdef __cpp_lib_move_only_function
     template <class T>
     using TaskBody = std::move_only_function<Result<T>()>;
+#else
+    template <class T>
+    using TaskBody = itlib::ufunction<Result<T>()>;
+#endif
 
     // NOT noexcept-qualified — spec Section 0.3 records this as an
     // owner-approved amendment to 7.3's original noexcept-qualified alias,
@@ -129,8 +137,13 @@ namespace lfs::core {
     // call signature terminates the process before run_guarded's own
     // try/catch could run, making "route to the fixed fallback" and
     // "process does not terminate" both false at once).
+#ifdef __cpp_lib_move_only_function
     template <class T>
     using TaskCompletion = std::move_only_function<void(Result<T>&&)>;
+#else
+    template <class T>
+    using TaskCompletion = itlib::ufunction<void(Result<T>&&)>;
+#endif
 
     // Wraps error in Result<T>'s failure state, dispatching on whether T is
     // void (Result<void>::failure(...)) or a value type (Result<T>(Error)) —

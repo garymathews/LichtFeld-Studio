@@ -197,7 +197,7 @@ namespace lfs::python {
 
         core::param::OptimizationParameters& get_default_params() {
             static core::param::OptimizationParameters default_params =
-                core::param::OptimizationParameters::mrnf_defaults();
+                core::param::OptimizationParameters::defaults_for_strategy(core::param::kDefaultTrainingStrategy);
             return default_params;
         }
 

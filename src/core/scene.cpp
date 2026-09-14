@@ -4,21 +4,25 @@
 
 #include "core/scene.hpp"
 #include "core/camera.hpp"
-#include "core/cuda/memory_arena.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/splat_data_transform.hpp"
-#include "core/tensor/internal/cuda_event_pool.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/tensor_impl.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
+#include "core/cuda/memory_arena.hpp"
+#include "core/tensor/internal/cuda_event_pool.hpp"
+#include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
-#include <cuda_runtime.h>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -165,6 +169,11 @@ namespace lfs::core {
                 order(*build.visible_selection_indices);
             }
 
+            if (build.model && gpu_backend_of(build.model->means_raw()) == GpuBackend::Vulkan) {
+                internal::backend_ops_for(build.model->means_raw()).synchronize_device();
+                return;
+            }
+#if LFS_TENSOR_CUDA
             cudaEvent_t ready = CudaEventPool::instance().acquire();
             if (ready && cudaEventRecord(ready, build.worker_stream) == cudaSuccess) {
                 build.ready_event = std::shared_ptr<void>(
@@ -187,6 +196,7 @@ namespace lfs::core {
                 LOG_ERROR("Combined model worker stream fence failed: {} ({})",
                           cudaGetErrorName(sync_status), cudaGetErrorString(sync_status));
             }
+#endif
         }
     } // namespace
 
@@ -787,9 +797,13 @@ namespace lfs::core {
         training_model_uuid_ = {};
         training_model_node_.clear();
 
-        cudaDeviceSynchronize();
-        lfs::core::Tensor::trim_memory_pool();
-        lfs::core::GlobalArenaManager::instance().get_arena().full_reset();
+        Tensor::trim_memory_pool();
+#if LFS_TENSOR_CUDA
+        if (gpu_backend_available(GpuBackend::CUDA)) {
+            cudaDeviceSynchronize();
+            lfs::core::GlobalArenaManager::instance().get_arena().full_reset();
+        }
+#endif
 
         notifyMutation(MutationType::CLEARED);
     }
@@ -1085,22 +1099,9 @@ namespace lfs::core {
                             model.get_scene_scale(),
                             SplatData::ShNLayout::Canonical);
                         float_piece->set_active_sh_degree(model.get_active_sh_degree());
-                        shN_swizzled_copy_contiguous(
-                            float_piece->shN_raw().ptr<float>(),
-                            shN.ptr<float>(),
-                            size,
-                            offset,
-                            static_cast<std::uint32_t>(float_piece->max_sh_coeffs_rest()),
-                            dst_layout_rest,
-                            shN.stream());
+                        lfs::core::shN_swizzled_copy_range(float_piece->shN_raw(), shN, 0, size, offset, static_cast<std::uint32_t>(float_piece->max_sh_coeffs_rest()), dst_layout_rest);
                     } else {
-                        shN_swizzled_copy_contiguous(model.shN_raw().ptr<float>(),
-                                                     shN.ptr<float>(),
-                                                     size,
-                                                     offset,
-                                                     model_layout_rest,
-                                                     dst_layout_rest,
-                                                     shN.stream());
+                        lfs::core::shN_swizzled_copy_range(model.shN_raw(), shN, 0, size, offset, model_layout_rest, dst_layout_rest);
                     }
                 }
             }
@@ -1197,21 +1198,24 @@ namespace lfs::core {
         combined_model_build_thread_.reset();
         {
             if (completed) {
+                bool ready = true;
+#if LFS_TENSOR_CUDA
                 if (completed->ready_event) {
                     const auto status = cudaEventSynchronize(
                         reinterpret_cast<cudaEvent_t>(completed->ready_event.get()));
-                    if (status != cudaSuccess) {
+                    ready = status == cudaSuccess;
+                    if (!ready) {
                         LOG_ERROR("Combined model worker result dropped: event wait failed: {} ({})",
                                   cudaGetErrorName(status), cudaGetErrorString(status));
-                    } else if (!completed->model) {
+                    }
+                }
+#endif
+                if (ready) {
+                    if (!completed->model) {
                         LOG_ERROR("Combined model worker result dropped: no model was produced");
                     } else if (!installCombinedModelCache(std::move(*completed))) {
                         LOG_DEBUG("Combined model worker result dropped: cache generation is stale");
                     }
-                } else if (!completed->model) {
-                    LOG_ERROR("Combined model worker result dropped: no model was produced");
-                } else if (!installCombinedModelCache(std::move(*completed))) {
-                    LOG_DEBUG("Combined model worker result dropped: cache generation is stale");
                 }
             }
         }
@@ -1569,14 +1573,13 @@ namespace lfs::core {
             }
             for (const auto& range : live_ranges) {
                 lfs::core::shN_swizzled_copy_range(
-                    source->shN_raw().ptr<float>(),
-                    shN.ptr<float>(),
+                    source->shN_raw(),
+                    shN,
                     range.src_start,
                     range.count,
                     range.dst_start,
                     layout_rest,
-                    layout_rest,
-                    shN.stream());
+                    layout_rest);
             }
         } else {
             shN = Tensor::zeros({0}, Device::CUDA);
@@ -1631,7 +1634,7 @@ namespace lfs::core {
             compacted->set_frozen_ranges(std::move(remapped_ranges));
         }
 
-        cudaDeviceSynchronize();
+        internal::backend_ops_for(compacted->means_raw()).synchronize_device();
 
         LOG_INFO("Consolidated compaction removed {} gaussians ({} -> {})",
                  old_size - new_size,
@@ -2460,10 +2463,8 @@ namespace lfs::core {
         // Otherwise post-refine trim_memory_pool can decommit a float workspace
         // still referenced by in-flight rebuild kernels.
         if (liveModelMutex() != nullptr) {
-            const cudaError_t sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) {
-                LOG_ERROR("rebuildModelCacheIfNeeded stream fence failed: {} ({})",
-                          cudaGetErrorName(sync_err), cudaGetErrorString(sync_err));
+            if (cached_combined_) {
+                internal::backend_ops_for(cached_combined_->means_raw()).synchronize_device();
             }
         }
 
@@ -4454,7 +4455,7 @@ namespace lfs::core {
         // SH, then rebuilds with Canonical layout.
         const auto shN_requires_float_materialize = [](const lfs::core::SplatData& src) {
             return src.shN_raw().is_valid() && src.shN_raw().numel() > 0 &&
-                   (src.shN_raw().dtype() != lfs::core::DataType::Float32 ||
+                   (gpu_backend_of(src.shN_raw()) != GpuBackend::CUDA || src.shN_raw().dtype() != lfs::core::DataType::Float32 ||
                     src.shN_value_quantized() || src.shN_ieee_f16());
         };
 
@@ -4511,6 +4512,7 @@ namespace lfs::core {
             }
 
             lfs::core::Tensor shN;
+#if LFS_TENSOR_CUDA
             if (layout_rest > 0 && src.shN_raw().is_valid() && src.shN_raw().numel() > 0) {
                 auto kept_indices = keep_mask.nonzero();
                 if (kept_indices.ndim() == 2) {
@@ -4530,6 +4532,7 @@ namespace lfs::core {
                     layout_rest,
                     shN.stream());
             }
+#endif
 
             auto result = std::make_unique<lfs::core::SplatData>(
                 src.get_max_sh_degree(),
@@ -4638,14 +4641,7 @@ namespace lfs::core {
                 if (shN.is_valid() && src_layout_rest > 0 && piece->shN_raw().is_valid() &&
                     piece->shN_raw().numel() > 0) {
                     // piece is Float32 float4-swizzle after ensure_float_swizzled_shN.
-                    lfs::core::shN_swizzled_copy_contiguous(
-                        piece->shN_raw().ptr<float>(),
-                        shN.ptr<float>(),
-                        visible,
-                        offset,
-                        src_layout_rest,
-                        dst_layout_rest,
-                        shN.stream());
+                    lfs::core::shN_swizzled_copy_range(piece->shN_raw(), shN, 0, visible, offset, src_layout_rest, dst_layout_rest);
                 }
 
                 offset += visible;
@@ -4735,14 +4731,7 @@ namespace lfs::core {
                 const size_t count = shN_sizes[i];
                 const auto src_layout_rest = shN_layout_rests[i];
                 if (src_layout_rest > 0 && shN_list[i].is_valid() && shN_list[i].numel() > 0) {
-                    lfs::core::shN_swizzled_copy_contiguous(
-                        shN_list[i].ptr<float>(),
-                        merged_shN.ptr<float>(),
-                        count,
-                        offset,
-                        src_layout_rest,
-                        static_cast<std::uint32_t>(shN_coeffs),
-                        merged_shN.stream());
+                    lfs::core::shN_swizzled_copy_range(shN_list[i], merged_shN, 0, count, offset, src_layout_rest, static_cast<std::uint32_t>(shN_coeffs));
                 }
                 offset += count;
             }

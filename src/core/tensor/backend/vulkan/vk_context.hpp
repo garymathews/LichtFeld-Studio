@@ -1,0 +1,184 @@
+/* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
+ * SPDX-License-Identifier: GPL-3.0-or-later */
+#pragma once
+
+#include "core/error.hpp"
+#include "core/export.hpp"
+
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <vulkan/vulkan.h>
+
+struct VmaAllocator_T;
+using VmaAllocator = VmaAllocator_T*;
+struct VmaAllocation_T;
+using VmaAllocation = VmaAllocation_T*;
+
+namespace lfs::core::internal {
+
+    class VulkanMemory;
+    class VulkanPipelines;
+    class VulkanRecorderRegistry;
+
+    struct VkDeviceCaps {
+        std::array<uint8_t, VK_UUID_SIZE> device_uuid{};
+        std::array<uint8_t, VK_UUID_SIZE> driver_uuid{};
+        std::array<uint32_t, 3> max_workgroup_count{};
+        uint32_t subgroup_size = 0;
+        bool shader_float16 = false;
+        bool shader_atomic_float = false;
+        bool float_controls_fp16 = false;
+        bool memory_budget = false;
+    };
+
+    // A device the application created and keeps alive; the backend runs on it
+    // instead of creating its own. The queue is the backend's alone.
+    struct AdoptedDevice {
+        VkInstance instance = VK_NULL_HANDLE;
+        VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+        VkDevice device = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        uint32_t queue_family = 0;
+        bool shader_atomic_float = false;
+        bool memory_budget = false;
+        bool shader_float16 = false;
+        std::vector<uint32_t> shared_buffer_queue_families;
+        // Block submission/encoding on the owner's other queues, drain them,
+        // and run retirement before reopening admission. Must not call Tensor APIs.
+        std::function<void(const std::function<void()>&)> with_other_queues_idle;
+    };
+
+    class VulkanContext final {
+    public:
+        VulkanContext();
+        explicit VulkanContext(const AdoptedDevice& adopted);
+        ~VulkanContext();
+
+        VulkanContext(const VulkanContext&) = delete;
+        VulkanContext& operator=(const VulkanContext&) = delete;
+
+        [[nodiscard]] VkInstance instance() const noexcept { return instance_; }
+        [[nodiscard]] VkPhysicalDevice physical_device() const noexcept {
+            return physical_device_;
+        }
+        [[nodiscard]] VkDevice device() const noexcept { return device_; }
+        [[nodiscard]] VkQueue queue() const noexcept { return queue_; }
+        [[nodiscard]] uint32_t queue_family() const noexcept { return queue_family_; }
+        [[nodiscard]] const std::vector<uint32_t>& shared_buffer_queue_families() const noexcept { return shared_buffer_queue_families_; }
+        [[nodiscard]] VkSemaphore timeline() const noexcept { return timeline_; }
+        [[nodiscard]] VkPipelineCache pipeline_cache() const noexcept {
+            return pipeline_cache_;
+        }
+        [[nodiscard]] VmaAllocator allocator() const noexcept { return allocator_; }
+        [[nodiscard]] const VkDeviceCaps& caps() const noexcept { return caps_; }
+        [[nodiscard]] const VkPhysicalDeviceMemoryProperties& memory_properties() const noexcept {
+            return memory_properties_;
+        }
+        [[nodiscard]] uint32_t device_index() const noexcept { return device_index_; }
+        [[nodiscard]] uint64_t context_id() const noexcept { return context_id_; }
+        [[nodiscard]] bool accepting_work() const noexcept {
+            return accepting_work_.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] bool dead() const noexcept {
+            return dead_.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] bool adopted() const noexcept { return !owns_device_; }
+
+        void require_work();
+        [[nodiscard]] uint64_t reserve_timeline_value();
+        void submit(VkCommandBuffer command, uint64_t signal_value);
+        void wait(uint64_t value);
+        void run_external(const std::function<void()>& work);
+        void retire_resources(const std::function<void()>& work);
+        [[nodiscard]] uint64_t completed_timeline() const;
+        // Shaders record an out-of-range index as {code, index, extent, op}; the
+        // adapter that owns the launch reads and clears the record after its wait.
+        [[nodiscard]] uint64_t fault_address() const noexcept { return fault_address_; }
+        void mark_device_lost_once();
+        void quarantine() noexcept { accepting_work_.store(false, std::memory_order_release); }
+
+        [[nodiscard]] VulkanMemory& memory();
+        [[nodiscard]] VulkanRecorderRegistry& recorders();
+        [[nodiscard]] VulkanPipelines& pipelines();
+
+        void shutdown();
+        uint64_t register_external_resource(const std::function<void()>& initialize, std::function<void()> cleanup);
+        void release_external_resource(uint64_t id) noexcept;
+
+    private:
+        friend class VulkanRecorderRegistry;
+        void check_fault_buffer();
+        [[nodiscard]] std::array<uint32_t, 4> consume_fault_record() noexcept;
+        void create_instance();
+        void select_physical_device();
+        void create_device();
+        void adopt_device(const AdoptedDevice& adopted);
+        void initialize_runtime();
+        void create_allocator();
+        void create_pipeline_cache();
+        void create_fault_buffer();
+        void save_pipeline_cache() noexcept;
+        void destroy_fault_buffer() noexcept;
+
+        bool owns_device_ = true;
+        VkInstance instance_ = VK_NULL_HANDLE;
+        VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
+        VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
+        VkDevice device_ = VK_NULL_HANDLE;
+        VkQueue queue_ = VK_NULL_HANDLE;
+        uint32_t queue_family_ = 0;
+        std::vector<uint32_t> shared_buffer_queue_families_;
+        std::function<void(const std::function<void()>&)> with_other_queues_idle_;
+        uint32_t device_index_ = 0;
+        uint64_t context_id_ = 0;
+        VkSemaphore timeline_ = VK_NULL_HANDLE;
+        VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+        VmaAllocator allocator_ = nullptr;
+        VmaAllocation fault_allocation_ = nullptr;
+        VkBuffer fault_buffer_ = VK_NULL_HANDLE;
+        void* fault_mapped_ = nullptr;
+        uint64_t fault_address_ = 0;
+        VkPhysicalDeviceProperties properties_{};
+        VkPhysicalDeviceMemoryProperties memory_properties_{};
+        VkDeviceCaps caps_{};
+        std::atomic<uint64_t> next_timeline_{0};
+        std::atomic<bool> accepting_work_{true};
+        std::atomic<bool> dead_{false};
+        std::atomic<bool> device_loss_reported_{false};
+        std::mutex queue_mutex_;
+        std::mutex shutdown_mutex_;
+        uint64_t next_external_resource_ = 1;
+        std::unique_ptr<std::map<uint64_t, std::function<void()>>> external_resources_ =
+            std::make_unique<std::map<uint64_t, std::function<void()>>>();
+        std::unique_ptr<VulkanMemory> memory_;
+        std::unique_ptr<VulkanRecorderRegistry> recorders_;
+        std::unique_ptr<VulkanPipelines> pipelines_;
+        std::string pipeline_cache_path_;
+    };
+
+    [[nodiscard]] bool vulkan_backend_probe_available() noexcept;
+    // True while a live context exists whose device was lost: new work is
+    // refused with a DeviceLost error until the backend is shut down.
+    [[nodiscard]] bool vulkan_backend_lost() noexcept;
+    // True while a live, healthy context exists; never initializes one.
+    [[nodiscard]] bool vulkan_backend_live() noexcept;
+
+    // Installs a context on an application device as the process context. Fails
+    // when a context already exists or the device lacks a required feature.
+    [[nodiscard]] lfs::Status adopt_vulkan_context(const AdoptedDevice& adopted);
+    [[nodiscard]] bool vulkan_context_adopted() noexcept;
+    [[nodiscard]] std::shared_ptr<VulkanContext> acquire_vulkan_context();
+    [[nodiscard]] std::shared_ptr<VulkanContext> try_live_vulkan_context() noexcept;
+    void shutdown_vulkan_context();
+
+    void vk_check(VulkanContext* context, VkResult result, const char* operation);
+
+} // namespace lfs::core::internal

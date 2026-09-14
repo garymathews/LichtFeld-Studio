@@ -31,28 +31,10 @@ namespace lfs::python {
 
 #ifdef _WIN32
         constexpr const char* UV_BINARY = "uv.exe";
-        constexpr size_t MAX_PATH_LEN = MAX_PATH;
 #else
         constexpr const char* UV_BINARY = "uv";
-        constexpr size_t MAX_PATH_LEN = 4096;
 #endif
         constexpr const char* PYTORCH_INDEX = "https://download.pytorch.org/whl/";
-
-        std::filesystem::path get_executable_dir() {
-#ifdef _WIN32
-            wchar_t path[MAX_PATH_LEN];
-            GetModuleFileNameW(nullptr, path, MAX_PATH_LEN);
-            return std::filesystem::path(path).parent_path();
-#else
-            char path[MAX_PATH_LEN];
-            const ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
-            if (len != -1) {
-                path[len] = '\0';
-                return std::filesystem::path(path).parent_path();
-            }
-            return std::filesystem::current_path();
-#endif
-        }
 
         std::pair<int, std::string> execute_process_capture(
             const std::filesystem::path& program,
@@ -251,7 +233,7 @@ namespace lfs::python {
             return cached;
         searched = true;
 
-        const auto exe_dir = get_executable_dir();
+        const auto exe_dir = lfs::core::getExecutableDir();
         bool bundled = false;
 
         if (const auto p = exe_dir / "bin" / UV_BINARY; std::filesystem::exists(p)) {

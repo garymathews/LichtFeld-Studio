@@ -46,6 +46,7 @@ namespace lfs::training {
             };
         }
 
+#if LFS_TENSOR_CUDA
         [[nodiscard]] ADMMSparsityOptimizer::Config sparsity_config_from_params(
             const lfs::core::param::OptimizationParameters& params) {
             const int start_iteration = static_cast<int>(params.iterations);
@@ -58,6 +59,7 @@ namespace lfs::training {
             };
         }
 
+#endif
         [[nodiscard]] lfs::Error checkpoint_stream_error(
             const lfs::ErrorCode code,
             std::string detail,
@@ -114,6 +116,7 @@ namespace lfs::training {
                     "Cannot serialize checkpoint: Gaussian count is out of bounds",
                     LFS_SOURCE_SITE_CURRENT());
             }
+#if LFS_TENSOR_CUDA
             const bool save_sparsity =
                 sparsity_optimizer &&
                 sparsity_optimizer->is_initialized();
@@ -126,6 +129,12 @@ namespace lfs::training {
                     model.size());
             }
 
+#else
+            if (bilateral_grid || ppisp || ppisp_controller_pool || sparsity_optimizer)
+                return checkpoint_stream_error(lfs::ErrorCode::FailedPrecondition,
+                                               "This Vulkan training build cannot save appearance or sparsity state", LFS_SOURCE_SITE_CURRENT());
+            const bool save_sparsity = false;
+#endif
             CheckpointHeader header{};
             header.iteration = iteration;
             header.num_gaussians =
@@ -179,6 +188,7 @@ namespace lfs::training {
             model.serialize(destination);
             strategy.serialize(destination);
 
+#if LFS_TENSOR_CUDA
             if (bilateral_grid) {
                 bilateral_grid->serialize(destination);
                 LOG_DEBUG(
@@ -205,6 +215,7 @@ namespace lfs::training {
                     sparsity_optimizer->state_size());
             }
 
+#endif
             const auto params_pos = destination.tellp();
             if (params_pos == std::streampos(-1)) {
                 return checkpoint_stream_error(
@@ -294,15 +305,14 @@ namespace lfs::training {
                 .bytes = static_cast<std::uint64_t>(
                     static_cast<std::streamoff>(end_pos)),
             };
+        } catch (const lfs::Exception& error) {
+            return error.error();
+        } catch (const std::bad_alloc& error) {
+            return checkpoint_stream_error(lfs::ErrorCode::ResourceExhausted, error.what(), LFS_SOURCE_SITE_CURRENT());
         } catch (const std::exception& error) {
             // LFS-CENSUS-OK(empty-catch): normalize the exception into a typed checkpoint error.
-            const bool layout_changed =
-                std::string_view(error.what()).find("layout changed") !=
-                std::string_view::npos;
             return checkpoint_stream_error(
-                layout_changed
-                    ? lfs::ErrorCode::FailedPrecondition
-                    : lfs::ErrorCode::Internal,
+                lfs::ErrorCode::Internal,
                 std::string("Serialize checkpoint failed: ") +
                     error.what(),
                 LFS_SOURCE_SITE_CURRENT());
@@ -364,6 +374,10 @@ namespace lfs::training {
                 return std::unexpected("Invalid checkpoint: truncated header");
             if (auto validation = lfs::core::validate_checkpoint_header(header, file_size); !validation)
                 return std::unexpected(validation.error());
+#if !LFS_TENSOR_CUDA
+            if (header.flags != CheckpointFlags::NONE || bilateral_grid || ppisp || ppisp_controller_pool || sparsity_optimizer)
+                return std::unexpected("This Vulkan training build cannot restore appearance or sparsity state");
+#endif
 
             // Verify strategy compatibility
             uint32_t type_len = 0;
@@ -536,6 +550,7 @@ namespace lfs::training {
                 loaded_strategy->get_optimizer().set_frozen_lr_scale(loaded_params.freeze_lr_scale);
             }
 
+#if LFS_TENSOR_CUDA
             std::unique_ptr<BilateralGrid> loaded_bilateral_grid;
             std::unique_ptr<PPISP> loaded_ppisp;
             std::unique_ptr<PPISPControllerPool> loaded_ppisp_controller_pool;
@@ -600,6 +615,7 @@ namespace lfs::training {
                 }
             }
 
+#endif
             // Reserve capacity for densification after the checkpoint params are resolved.
             if (header.params_json_size > 0) {
                 const auto serialized_state_end = file.tellg();
@@ -619,6 +635,7 @@ namespace lfs::training {
                 loaded_strategy->reserve_optimizer_capacity(max_cap);
             }
 
+#if LFS_TENSOR_CUDA
             if (bilateral_grid && loaded_bilateral_grid &&
                 bilateral_grid->parameterization() != loaded_bilateral_grid->parameterization()) {
                 throw std::runtime_error(
@@ -628,6 +645,7 @@ namespace lfs::training {
                     bilateral_grid_parameterization_name(bilateral_grid->parameterization()));
             }
 
+#endif
             static_assert(std::is_nothrow_swappable_v<lfs::core::param::TrainingParameters>);
             static_assert(std::is_nothrow_move_assignable_v<lfs::core::SplatData>);
 
@@ -636,6 +654,7 @@ namespace lfs::training {
             std::swap(params, loaded_params);
             strategy.get_model() = std::move(loaded_model);
             checkpoint_adopter->adopt_checkpoint_state(*loaded_strategy);
+#if LFS_TENSOR_CUDA
             if (loaded_bilateral_grid) {
                 bilateral_grid->adopt_checkpoint_state(*loaded_bilateral_grid);
                 LOG_INFO("Bilateral grid restored (step={}, lr={:.2e})",
@@ -658,6 +677,7 @@ namespace lfs::training {
                 sparsity_optimizer->reset();
             }
 
+#endif
             LOG_INFO("Checkpoint loaded: {} ({} Gaussians, iter {})",
                      source_name, header.num_gaussians, header.iteration);
             LOG_DEBUG(

@@ -3,15 +3,20 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "rendering/export_post_process.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/memory_pool.hpp"
-#include "environment_image.hpp"
 #include "export_post_process_kernels.cuh"
+#include <cuda_runtime.h>
+#endif
+#include "environment_image.hpp"
+#include "environment_math.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <cuda_runtime.h>
 #include <format>
 #include <mutex>
+#include <vector>
 
 namespace lfs::rendering {
 
@@ -21,15 +26,22 @@ namespace lfs::rendering {
             if (stream != nullptr) {
                 return stream;
             }
+#if LFS_TENSOR_CUDA
             return lfs::core::getCurrentCUDAStream();
+#else
+            return nullptr;
+#endif
         }
 
+#if LFS_TENSOR_CUDA
         [[nodiscard]] ExportResult<void> launchStatus(const char* const kernel_name, const cudaError_t status) {
             if (status != cudaSuccess) {
                 return std::unexpected(std::format("{}: {}", kernel_name, cudaGetErrorString(status)));
             }
             return {};
         }
+
+#endif
 
         struct CudaEnvironmentMapCache {
             std::mutex mutex;
@@ -46,7 +58,7 @@ namespace lfs::rendering {
             if (!band.is_valid() || band.device() != lfs::core::Device::CUDA ||
                 band.dtype() != lfs::core::DataType::UInt8 || band.ndim() != 3 || !band.is_contiguous() ||
                 (band.size(2) != 3 && band.size(2) != 4) || band.size(0) <= 0 || band.size(1) <= 0) {
-                return std::unexpected(std::format("{} must be a contiguous CUDA u8 HWC RGB/RGBA tensor", what));
+                return std::unexpected(std::format("{} must be a contiguous GPU u8 HWC RGB/RGBA tensor", what));
             }
             return {};
         }
@@ -55,7 +67,7 @@ namespace lfs::rendering {
             if (!rgb.is_valid() || rgb.device() != lfs::core::Device::CUDA ||
                 rgb.dtype() != lfs::core::DataType::Float32 || rgb.ndim() != 3 || !rgb.is_contiguous() ||
                 rgb.size(0) != 3 || rgb.size(1) <= 0 || rgb.size(2) <= 0) {
-                return std::unexpected(std::format("{} must be a contiguous CUDA float [3,H,W] tensor", what));
+                return std::unexpected(std::format("{} must be a contiguous GPU float [3,H,W] tensor", what));
             }
             return {};
         }
@@ -78,6 +90,7 @@ namespace lfs::rendering {
         auto map = std::make_shared<CudaEnvironmentMap>();
         map->width = (*image)->width;
         map->height = (*image)->height;
+#if LFS_TENSOR_CUDA
         cudaStream_t upload_stream = nullptr;
         cudaError_t status = cudaStreamCreateWithFlags(&upload_stream, cudaStreamNonBlocking);
         if (status != cudaSuccess) {
@@ -128,6 +141,12 @@ namespace lfs::rendering {
                                                cudaGetErrorString(destroy_status)));
         }
 
+#else
+        map->pixels = lfs::core::Tensor::from_vector(
+            (*image)->pixels, {static_cast<size_t>(map->height), static_cast<size_t>(map->width), size_t{3}},
+            lfs::core::Device::CPU).to(lfs::core::Device::GPU);
+#endif
+
         cache.path = (*image)->path;
         cache.map = map;
         return cache.map;
@@ -156,6 +175,7 @@ namespace lfs::rendering {
         const auto height = band_u8_hwc.size(0);
         const auto width = band_u8_hwc.size(1);
         const int channels = static_cast<int>(band_u8_hwc.size(2));
+#if LFS_TENSOR_CUDA
         const int num_pixels = static_cast<int>(height * width);
 
         rgb_chw_out = lfs::core::Tensor::empty(
@@ -183,6 +203,23 @@ namespace lfs::rendering {
                             exportpp::launchUnpackU8Hwc(band_u8_hwc.ptr<unsigned char>(), num_pixels, channels,
                                                         rgb_chw_out.ptr<float>(), alpha_ptr,
                                                         resolveExportStream(stream)));
+#else
+        const cudaStream_t execution_stream = resolveExportStream(stream);
+        band_u8_hwc.sync_to_stream(execution_stream);
+        const lfs::core::Tensor chw =
+            band_u8_hwc.to(lfs::core::DataType::Float32).mul(1.0f / 255.0f).permute({2, 0, 1});
+        rgb_chw_out = chw.slice(0, 0, 3).contiguous();
+        rgb_chw_out.sync_to_stream(execution_stream);
+        if (alpha_out != nullptr) {
+            *alpha_out = lfs::core::Tensor{};
+            if (channels == 4) {
+                *alpha_out = chw.slice(0, 3, 4).contiguous().reshape(
+                    {static_cast<int>(height), static_cast<int>(width)});
+                alpha_out->sync_to_stream(execution_stream);
+            }
+        }
+        return {};
+#endif
     }
 
     ExportResult<void> packChwFloatBandToU8Hwc(const lfs::core::Tensor& rgb_chw,
@@ -200,8 +237,9 @@ namespace lfs::rendering {
         if (has_alpha &&
             (alpha->device() != lfs::core::Device::CUDA || alpha->dtype() != lfs::core::DataType::Float32 ||
              !alpha->is_contiguous() || alpha->numel() != static_cast<size_t>(num_pixels))) {
-            return std::unexpected("pack alpha must be a contiguous CUDA float tensor matching the band");
+            return std::unexpected("pack alpha must be a contiguous GPU float tensor matching the band");
         }
+#if LFS_TENSOR_CUDA
         const int channels = has_alpha ? 4 : 3;
 
         band_u8_hwc_out = lfs::core::Tensor::empty(
@@ -216,6 +254,23 @@ namespace lfs::rendering {
                                                          has_alpha ? alpha->ptr<float>() : nullptr,
                                                          band_u8_hwc_out.ptr<unsigned char>(), num_pixels, channels,
                                                          resolveExportStream(stream)));
+#else
+        const cudaStream_t execution_stream = resolveExportStream(stream);
+        rgb_chw.sync_to_stream(execution_stream);
+        std::vector<lfs::core::Tensor> planes{rgb_chw};
+        if (has_alpha) {
+            alpha->sync_to_stream(execution_stream);
+            planes.push_back(alpha->reshape({1, static_cast<int>(height), static_cast<int>(width)}));
+        }
+        const lfs::core::Tensor bytes = lfs::core::Tensor::cat(planes, 0)
+                                            .clamp(0.0f, 1.0f)
+                                            .mul(255.0f)
+                                            .add(0.5f)
+                                            .to(lfs::core::DataType::UInt8);
+        band_u8_hwc_out = bytes.permute({1, 2, 0}).contiguous();
+        band_u8_hwc_out.sync_to_stream(execution_stream);
+        return {};
+#endif
     }
 
     ExportResult<void> compositeEnvironmentBand(const CudaEnvironmentMap& env,
@@ -230,7 +285,7 @@ namespace lfs::rendering {
         if (env.width <= 0 || env.height <= 0 || !env.pixels.is_valid() ||
             env.pixels.device() != lfs::core::Device::CUDA ||
             env.pixels.dtype() != lfs::core::DataType::Float32) {
-            return std::unexpected("composite environment map is not resident on CUDA");
+            return std::unexpected("composite environment map is not resident on the GPU");
         }
 
         const auto height = rgb_chw.size(1);
@@ -239,13 +294,14 @@ namespace lfs::rendering {
         if (!alpha.is_valid() || alpha.device() != lfs::core::Device::CUDA ||
             alpha.dtype() != lfs::core::DataType::Float32 || !alpha.is_contiguous() ||
             alpha.numel() != static_cast<size_t>(num_pixels)) {
-            return std::unexpected("composite alpha must be a contiguous CUDA float tensor matching the band");
+            return std::unexpected("composite alpha must be a contiguous GPU float tensor matching the band");
         }
         if (params.full_size.x != static_cast<int>(width) || params.y_offset < 0 ||
             params.y_offset + static_cast<int>(height) > params.full_size.y) {
             return std::unexpected("composite band region does not match the full image size");
         }
 
+#if LFS_TENSOR_CUDA
         band_u8_hwc_out = lfs::core::Tensor::empty(
             {static_cast<size_t>(height), static_cast<size_t>(width), size_t{3}},
             lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
@@ -287,6 +343,38 @@ namespace lfs::rendering {
                                                      alpha.ptr<float>(),
                                                      band_u8_hwc_out.ptr<unsigned char>(),
                                                      execution_stream));
+#else
+        // Export already operates in bounded bands. Reuse the CPU environment
+        // sampler until an equivalent Vulkan environment kernel is available.
+        const auto pixels = env.pixels.to_vector();
+        const auto rgb = rgb_chw.to_vector();
+        const auto coverage = alpha.to_vector();
+        auto host = lfs::core::Tensor::empty({height, width, size_t{3}}, lfs::core::Device::CPU, lfs::core::DataType::UInt8);
+        auto* bytes = host.ptr<uint8_t>();
+        const float rotation = glm::radians(params.rotation_degrees);
+        const float exposure = std::exp2(params.exposure);
+        const auto fetch = [&](int x, int y) -> envmath::Vec3 {
+            const size_t offset = (static_cast<size_t>(y) * env.width + x) * 3;
+            return {pixels[offset], pixels[offset + 1], pixels[offset + 2]};
+        };
+        for (int i = 0; i < num_pixels; ++i) {
+            auto direction = envmath::environmentWorldDirection(
+                static_cast<float>(i % width), static_cast<float>(params.y_offset + i / width),
+                static_cast<float>(params.full_size.x), static_cast<float>(params.full_size.y),
+                params.equirectangular_view, params.focal_x, params.focal_y,
+                params.center_x, params.center_y, &params.camera_rotation[0][0]);
+            direction = envmath::normalized(envmath::rotateAroundY(direction, rotation));
+            const auto uv = envmath::equirectUvForDirection(direction);
+            const auto hdr = envmath::sampleEnvironmentBilinear(fetch, uv.u, uv.v, env.width, env.height);
+            const auto background = envmath::shadeEnvironmentRadiance(hdr, exposure);
+            const auto color = envmath::mix(background, {rgb[i], rgb[num_pixels + i], rgb[2 * num_pixels + i]}, coverage[i]);
+            bytes[3 * i] = static_cast<uint8_t>(std::clamp(color.x, 0.0f, 1.0f) * 255.0f + 0.5f);
+            bytes[3 * i + 1] = static_cast<uint8_t>(std::clamp(color.y, 0.0f, 1.0f) * 255.0f + 0.5f);
+            bytes[3 * i + 2] = static_cast<uint8_t>(std::clamp(color.z, 0.0f, 1.0f) * 255.0f + 0.5f);
+        }
+        band_u8_hwc_out = host.to(lfs::core::Device::GPU);
+        return {};
+#endif
     }
 
 } // namespace lfs::rendering

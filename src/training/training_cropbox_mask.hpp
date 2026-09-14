@@ -12,6 +12,7 @@
 namespace lfs::core {
     class Scene;
     class SplatData;
+    class Camera;
 } // namespace lfs::core
 
 namespace lfs::training {
@@ -30,6 +31,9 @@ namespace lfs::training {
     [[nodiscard]] std::optional<TrainingCropBoxGeometry> resolve_training_cropbox_loss_geom(
         const core::Scene& scene,
         float outside_weight);
+
+    [[nodiscard]] core::Tensor compute_cropbox_loss_weight(
+        const core::Camera& camera, const TrainingCropBoxGeometry& geometry, float outside_weight);
 
     [[nodiscard]] std::optional<core::Tensor> compute_cropbox_remove_mask(
         const core::Tensor& means,

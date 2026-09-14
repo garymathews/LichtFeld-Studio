@@ -656,11 +656,11 @@ namespace lfs::core {
         return output;
     }
 
-    Tensor resize_depth_prior(const Tensor& input, int output_h, int output_w, cudaStream_t stream) {
+    Tensor resize_depth_prior_cuda(const Tensor& input, int output_h, int output_w, cudaStream_t stream) {
         return resize_prior<1>(input, output_h, output_w, stream);
     }
 
-    Tensor resize_normal_prior(const Tensor& input, int output_h, int output_w, cudaStream_t stream) {
+    Tensor resize_normal_prior_cuda(const Tensor& input, int output_h, int output_w, cudaStream_t stream) {
         return resize_prior<3>(input, output_h, output_w, stream);
     }
 

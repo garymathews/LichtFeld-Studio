@@ -1,0 +1,29 @@
+// Uses the kWide, kHalf and kByte element width constants of index and mask.
+// Moves element payloads as bits.
+void copyElement(uint64_t source, uint64_t sourceIndex, uint64_t destination, uint64_t destinationIndex)
+{
+    if (kWide)
+        ((Ptr<uint64_t, Access.ReadWrite>)destination)[destinationIndex] =
+            ((Ptr<uint64_t, Access.Read>)source)[sourceIndex];
+    else if (!kByte && !kHalf)
+        ((Ptr<uint, Access.ReadWrite>)destination)[destinationIndex] =
+            ((Ptr<uint, Access.Read>)source)[sourceIndex];
+    else if (kHalf)
+        ((Ptr<uint16_t, Access.ReadWrite>)destination)[destinationIndex] =
+            ((Ptr<uint16_t, Access.Read>)source)[sourceIndex];
+    else
+        storeByte(destination, destinationIndex, loadByte(source, sourceIndex));
+}
+
+void storeFill(uint64_t destination, uint64_t destinationIndex, uint low, uint high)
+{
+    if (kWide)
+        ((Ptr<uint64_t, Access.ReadWrite>)destination)[destinationIndex] =
+            (uint64_t(high) << 32) | uint64_t(low);
+    else if (!kByte && !kHalf)
+        ((Ptr<uint, Access.ReadWrite>)destination)[destinationIndex] = low;
+    else if (kHalf)
+        ((Ptr<uint16_t, Access.ReadWrite>)destination)[destinationIndex] = uint16_t(low);
+    else
+        storeByte(destination, destinationIndex, low);
+}

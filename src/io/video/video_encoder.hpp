@@ -30,11 +30,11 @@ namespace lfs::io::video {
             const std::filesystem::path& output_path,
             const VideoExportOptions& options) override;
 
-        // Write RGBA frame from CPU memory
+        // Write packed RGB24 frame from CPU memory
         [[nodiscard]] std::expected<void, std::string> writeFrame(
-            std::span<const uint8_t> rgba_data,
+            std::span<const uint8_t> rgb_data,
             int width,
-            int height);
+            int height) override;
 
         [[nodiscard]] std::expected<void, std::string> writeFrameGpu(
             const void* rgba_gpu_ptr,

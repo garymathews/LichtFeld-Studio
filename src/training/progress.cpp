@@ -20,6 +20,7 @@ namespace lfs::training {
         std::chrono::steady_clock::time_point start_time;
         int total_iterations;
         int update_frequency;
+        bool completed = false;
     };
 
     namespace {
@@ -112,16 +113,17 @@ namespace lfs::training {
         update(current_iteration, loss, splat_count, phase);
     }
 
-    void TrainingProgress::complete(const bool user_stopped, const int actual_iterations) {
-        if (!impl_->progress_bar->is_completed()) {
-            const int iterations = actual_iterations > 0 ? actual_iterations : impl_->total_iterations;
+    void TrainingProgress::complete(const bool user_stopped, const int actual_iterations, const bool failed) {
+        if (!impl_->completed) {
+            impl_->completed = true;
+            const int iterations = actual_iterations >= 0 ? actual_iterations : impl_->total_iterations;
             const float fraction = impl_->total_iterations > 0
                                        ? static_cast<float>(iterations) / impl_->total_iterations
                                        : 0.0f;
             impl_->progress_bar->set_progress(static_cast<size_t>(std::clamp(fraction, 0.0f, 1.0f) * 100.0f));
-            if (user_stopped) {
+            if (user_stopped || failed) {
                 impl_->progress_bar->set_option(indicators::option::PostfixText(
-                    "Stopped by user at " + std::to_string(iterations) + "/" +
+                    std::string(failed ? "Failed at " : "Stopped by user at ") + std::to_string(iterations) + "/" +
                     std::to_string(impl_->total_iterations)));
             }
             impl_->progress_bar->mark_as_completed();
@@ -135,7 +137,7 @@ namespace lfs::training {
 
         const auto end_time = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration<double>(end_time - impl_->start_time).count();
-        const int iterations_used = actual_iterations > 0 ? actual_iterations : impl_->total_iterations;
+        const int iterations_used = actual_iterations >= 0 ? actual_iterations : impl_->total_iterations;
 
         std::ostringstream summary;
         summary << std::fixed << std::setprecision(3);
@@ -147,7 +149,7 @@ namespace lfs::training {
                                  : "✓ Training completed in ");
 #endif
         if (user_stopped) {
-            summary << iterations_used << " (checkpoint saved)";
+            summary << iterations_used;
         } else {
             summary << elapsed << "s (avg " << std::setprecision(1)
                     << (elapsed > 0.0 ? iterations_used / elapsed : 0.0) << " iter/s)";

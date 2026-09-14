@@ -83,6 +83,7 @@ namespace lfs::vis::project {
 
 namespace lfs::training {
     class AdamOptimizer;
+    class VulkanTrainingRasterizer;
     struct TrainerRetryTestAccess;
     struct TrainerCropboxMaskTestAccess;
     struct PPISPFileMetadata;
@@ -161,6 +162,8 @@ namespace lfs::training {
             TrainingSnapshotServiceMetrics capture;
             std::filesystem::path last_path;
             std::string last_writer_error;
+            int last_checkpoint_iteration = -1;
+            lfs::core::Uuid last_checkpoint_uuid{};
             double pre_snapshot_step_mean_ms = 0.0;
             double post_resume_step_mean_ms = 0.0;
             double post_resume_step_regression_percent = 0.0;
@@ -249,6 +252,7 @@ namespace lfs::training {
                 std::move(session));
         }
         void request_stop() { stop_requested_ = true; }
+        void request_stop(lfs::Error error);
 
         bool is_paused() const { return is_paused_.load(); }
         bool is_running() const { return is_running_.load(); }
@@ -302,7 +306,9 @@ namespace lfs::training {
         // timeline imported into CUDA, plus the latest timeline value covering
         // submits that bound live training storage. The trainer waits the value
         // on its stream before the next step's in-place writes.
+#if LFS_TENSOR_CUDA
         void setViewerReleaseFence(cudaExternalSemaphore_t semaphore);
+#endif
         void publishViewerBorrow(uint64_t value);
 
         lfs::core::param::TrainingParameters getParams() const {
@@ -505,7 +511,10 @@ namespace lfs::training {
         };
 
         // Returns the background color to use at a given iteration
+        std::array<float, 3> background_color_for_step(int iter);
+#if LFS_TENSOR_CUDA
         lfs::core::Tensor& background_for_step(int iter);
+#endif
 
         // Returns the resized background image for the given camera dimensions
         // Returns empty tensor if no background image is set
@@ -645,6 +654,11 @@ namespace lfs::training {
 
         // Handle control requests
         void handle_control_requests(int iter, std::stop_token stop_token = {});
+#if !LFS_TENSOR_CUDA
+        void drain_control_commands();
+        double active_step_ms_ = 0.0;
+#endif
+        std::optional<std::uint64_t> project_snapshot_retry_id_;
         void prepare_project_snapshot_at_safe_point(
             int capture_iteration,
             const std::filesystem::path& path,
@@ -661,6 +675,7 @@ namespace lfs::training {
         [[nodiscard]] lfs::Result<void>
         initialize_project_snapshot_service();
         void capture_project_snapshot_at_safe_point(int iteration);
+        void capture_scheduled_project_snapshot(int iter);
         void consume_requested_project_snapshot(int iteration);
         [[nodiscard]] int project_snapshot_iteration() const;
         void attach_live_document_context(
@@ -741,6 +756,11 @@ namespace lfs::training {
         uint64_t bg_image_cache_clock_ = 0;
         lfs::core::Tensor random_bg_buffer_{}; // Reusable buffer for random background
         std::unique_ptr<TrainingProgress> progress_;
+#if !LFS_TENSOR_CUDA
+        std::unique_ptr<VulkanTrainingRasterizer> vulkan_rasterizer_;
+        std::unique_ptr<VulkanTrainingRasterizer> metrics_rasterizer_;
+        std::mutex metrics_rasterizer_mutex_;
+#endif
         size_t train_dataset_size_ = 0;
         size_t total_cameras_count_ = 0;
         std::shared_ptr<CameraLossHeatmapState> camera_loss_heatmap_;
@@ -932,6 +952,9 @@ namespace lfs::training {
         // Control flags for thread communication
         std::atomic<bool> pause_requested_{false};
         std::atomic<bool> stop_requested_{false};
+        int last_checkpoint_iteration_ = -1; // Guarded by project_snapshot_mutex_.
+        lfs::core::Uuid last_checkpoint_uuid_{};
+        std::optional<lfs::Error> stop_error_; // Guarded by params_mutex_.
         std::atomic<bool> is_paused_{false};
         std::atomic<bool> is_running_{false};
         std::atomic<bool> training_complete_{false};
@@ -942,6 +965,8 @@ namespace lfs::training {
 
         // Current training state
         std::atomic<int> current_iteration_{0};
+        std::atomic<int> completed_iteration_{0};
+        std::uint64_t completed_mutation_epoch_ = 0;
         std::atomic<float> current_loss_{0.0f};
 
         // Monotonic, never rolls back. Incremented at the frozen persistent
@@ -976,7 +1001,9 @@ namespace lfs::training {
         std::array<cudaEvent_t, READER_DONE_RING> reader_done_events_{};
         uint32_t reader_done_head_ = 0;
         uint32_t reader_done_pending_ = 0;
+#if LFS_TENSOR_CUDA
         cudaExternalSemaphore_t viewer_release_semaphore_ = nullptr;
+#endif
         std::atomic<uint64_t> viewer_borrow_value_{0};
         uint64_t viewer_borrow_waited_ = 0;
         mutable std::mutex stream_sync_mutex_;
@@ -1003,6 +1030,9 @@ namespace lfs::training {
         static constexpr size_t LOSS_RING = 4;
         struct LossReadbackSlot {
             float* pinned = nullptr;
+#if !LFS_TENSOR_CUDA
+            float host_value = 0.f;
+#endif
             cudaEvent_t done = nullptr;
             int iter = 0;
             bool in_flight = false;
@@ -1013,9 +1043,12 @@ namespace lfs::training {
         // Always-compiled fault-injection seam used only by the OOM
         // recovery tests. Empty in production, where cudaDeviceSynchronize is
         // called directly.
+#if LFS_TENSOR_CUDA
         std::function<cudaError_t()> recovery_sync_for_testing_;
+#endif
 
-        void submitLossReadback(const lfs::core::Tensor& total_loss, int iter);
+        void submitLossReadback(const lfs::core::Tensor& total_loss, int iter,
+                                std::optional<float> host_loss = std::nullopt);
         std::expected<void, std::string> harvestLossReadbacks(bool drain, bool in_controller_phase);
 
         // Python control scripts (file paths) to execute before training starts

@@ -516,6 +516,8 @@ namespace lfs::mcp {
                          {"writer_error",
                           snapshot
                               .project_snapshot_writer_error},
+                         {"recoverable_iteration", snapshot.recoverable_iteration},
+                         {"recoverable_snapshot_uuid", snapshot.recoverable_snapshot_uuid.to_string()},
                          {"snapshot_uuid",
                           project_capture.snapshot_uuid
                               .to_string()},

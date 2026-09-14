@@ -22,26 +22,7 @@ static_assert(static_cast<uint8_t>(lfs::core::internal::LazyPointwiseOpKind::Rou
 
 namespace lfs::core::tensor_ops {
 
-    namespace {
-
-        constexpr int BLOCK_SIZE = 256;
-
-        std::atomic<uint64_t> g_tensor_kernel_launch_count{0};
-
-    } // namespace
-
-    void reset_tensor_kernel_launch_count() noexcept {
-        g_tensor_kernel_launch_count.store(0, std::memory_order_relaxed);
-    }
-
-    uint64_t tensor_kernel_launch_count() noexcept {
-        return g_tensor_kernel_launch_count.load(std::memory_order_relaxed);
-    }
-
-    void record_tensor_kernel_launch(uint64_t n) noexcept {
-        g_tensor_kernel_launch_count.fetch_add(n, std::memory_order_relaxed);
-        internal::telemetry_record_kernel_launch(n);
-    }
+    namespace { constexpr int BLOCK_SIZE = 256; }
 
     namespace {
 

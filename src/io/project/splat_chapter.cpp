@@ -7,18 +7,27 @@
 #include "span_streambuf.hpp"
 
 #include "core/cuda/sh_layout.cuh"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error_typed.hpp"
+#endif
 #include "core/logger.hpp"
 #include "core/memory_pressure.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/pinned_memory_allocator.hpp"
+#endif
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/memory_pool.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime_api.h>
+#endif
 #include <exception>
 #include <format>
 #include <functional>
@@ -304,12 +313,15 @@ namespace lfs::io::project {
     struct AsyncSplatCapture::Impl {
         std::unique_ptr<lfs::core::SplatData> snapshot;
         cudaStream_t stream = nullptr;
+#if LFS_TENSOR_CUDA
         cudaEvent_t ready = nullptr;
+#endif
         SplatSourceKind source_kind = SplatSourceKind::Generated;
         bool is_training_model = false;
         std::chrono::steady_clock::time_point clone_started;
 
         ~Impl() {
+#if LFS_TENSOR_CUDA
             if (stream) {
                 cudaStreamSynchronize(stream);
             }
@@ -321,6 +333,7 @@ namespace lfs::io::project {
                 lfs::core::CudaMemoryPool::instance().release_stream(stream);
                 cudaStreamDestroy(stream);
             }
+#endif
         }
     };
 
@@ -338,6 +351,7 @@ namespace lfs::io::project {
                 "The asynchronous splat capture is no longer available.",
                 "capture completion was requested more than once");
         }
+#if LFS_TENSOR_CUDA
         if (const auto status = cudaEventSynchronize(impl_->ready);
             status != cudaSuccess) {
             auto error = splat_error(
@@ -348,6 +362,7 @@ namespace lfs::io::project {
             impl_.reset();
             return error;
         }
+#endif
         const auto clone_finished = std::chrono::steady_clock::now();
         const auto worker_download_started = clone_finished;
         auto result = SplatChapterPayload::capture(
@@ -451,6 +466,11 @@ namespace lfs::io::project {
                 "Live RAD nodes remain external REFS records until explicitly baked");
         }
 
+#if !LFS_TENSOR_CUDA
+        return std::unique_ptr<AsyncSplatCapture>{};
+#else
+        if (lfs::core::gpu_backend_of(model.means_raw()) != lfs::core::GpuBackend::CUDA)
+            return std::unique_ptr<AsyncSplatCapture>{};
         const auto tensors = std::array<const lfs::core::Tensor*, 10>{
             &model.means(), &model.sh0(), &model.shN(),
             &model.shN_value_bounds(), &model.scaling_raw(),
@@ -557,6 +577,7 @@ namespace lfs::io::project {
             tensors.size(), device_bytes);
         return std::unique_ptr<AsyncSplatCapture>(
             new AsyncSplatCapture(std::move(impl)));
+#endif
     }
 
     lfs::Result<SplatChapterPayload> SplatChapterPayload::capture(
@@ -576,6 +597,7 @@ namespace lfs::io::project {
                 "Live RAD nodes remain external REFS records until explicitly baked");
         }
         try {
+#if LFS_TENSOR_CUDA
             struct StreamGuard {
                 cudaStream_t stream = nullptr;
 
@@ -587,6 +609,7 @@ namespace lfs::io::project {
                 }
             } stream_guard;
 
+#endif
             struct SourceTensor {
                 std::uint32_t id;
                 lfs::core::Tensor tensor;
@@ -608,7 +631,7 @@ namespace lfs::io::project {
             source.push_back(describe(0, model.means().contiguous()));
             source.push_back(describe(1, model.sh0().contiguous()));
             const auto& resident_sh = model.shN();
-            if (resident_sh.device() == lfs::core::Device::CUDA &&
+            if (lfs::core::gpu_backend_of(resident_sh) == lfs::core::GpuBackend::CUDA &&
                 resident_sh.dtype() == lfs::core::DataType::Float32) {
                 SourceTensor item;
                 item.id = 2;
@@ -672,9 +695,10 @@ namespace lfs::io::project {
             }
 
             constexpr std::size_t window_bytes = 64ull * 1024ull * 1024ull;
+#if LFS_TENSOR_CUDA
             const bool has_cuda_source = std::ranges::any_of(
                 source, [](const SourceTensor& item) {
-                    return item.tensor.device() == lfs::core::Device::CUDA;
+                    return lfs::core::gpu_backend_of(item.tensor) == lfs::core::GpuBackend::CUDA;
                 });
             if (has_cuda_source) {
                 const auto status = cudaStreamCreateWithFlags(
@@ -748,6 +772,7 @@ namespace lfs::io::project {
                 slot.pending = false;
                 return {};
             };
+#endif
             data_offset = data_start;
             std::size_t staging_index = 0;
             for (const auto& item : source) {
@@ -758,7 +783,8 @@ namespace lfs::io::project {
                         count -= count % sizeof(float);
                     auto* const destination =
                         result.data() + data_offset + offset;
-                    if (item.tensor.device() == lfs::core::Device::CUDA) {
+#if LFS_TENSOR_CUDA
+                    if (lfs::core::gpu_backend_of(item.tensor) == lfs::core::GpuBackend::CUDA) {
                         auto& slot = staging[staging_index++ % staging.size()];
                         if (auto flushed = flush_slot(slot); !flushed)
                             return std::move(flushed).error();
@@ -798,6 +824,14 @@ namespace lfs::io::project {
                         slot.destination = destination;
                         slot.count = count;
                         slot.pending = true;
+                    } else
+#endif
+                        if (item.tensor.device() == lfs::core::Device::GPU) {
+                        const auto element_bytes = lfs::core::dtype_size(item.tensor.dtype());
+                        auto host = item.tensor.reshape(lfs::core::TensorShape{item.tensor.numel()})
+                                        .slice(0, offset / element_bytes, (offset + count) / element_bytes)
+                                        .cpu();
+                        std::memcpy(destination, host.data_ptr(), count);
                     } else {
                         std::memcpy(destination,
                                     static_cast<const std::byte*>(item.tensor.data_ptr()) + offset,
@@ -807,10 +841,12 @@ namespace lfs::io::project {
                 }
                 data_offset += item.bytes;
             }
+#if LFS_TENSOR_CUDA
             for (auto& slot : staging) {
                 if (auto flushed = flush_slot(slot); !flushed)
                     return std::move(flushed).error();
             }
+#endif
             const auto finished = std::chrono::steady_clock::now();
             LOG_DEBUG(
                 "Project SPLT serialization stages: tensors={} bytes={} source_prepare={:.3f} ms manifest_memcpy={:.3f} ms total={:.3f} ms",

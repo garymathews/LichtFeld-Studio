@@ -3,8 +3,8 @@
 
 #pragma once
 
+#include "core/cuda_stream_fwd.hpp"
 #include <cstdint>
-#include <cuda_runtime.h>
 
 namespace lfs::io::cuda {
 

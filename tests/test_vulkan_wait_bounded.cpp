@@ -1092,6 +1092,17 @@ TEST(FrameTimelineWaitCursor, WithinFrameDuplicateIsAlreadySatisfied) {
 
 namespace lfs::vis {
     struct VulkanContextTestAccess {
+        static void primeFixedSurface(VulkanContext& context) {
+            context.swapchain_ = fake_swapchain();
+            context.swapchain_extent_ = {1280, 720};
+            context.framebuffer_width_ = 1280;
+            context.framebuffer_height_ = 720;
+            context.swapchain_extent_fixed_to_surface_ = true;
+            context.framebuffer_resized_ = false;
+        }
+        static bool promoteResize(VulkanContext& context) {
+            return context.promoteDeferredSwapchainResizeIfSettled();
+        }
         static void loseDevice(VulkanContext& context) {
             (void)context.mapWaitOutcome(lfs::make_error({.code = ErrorCode::DeviceLost, .domain = ErrorDomain::Vulkan, .detail = "injected device loss", .detection = LFS_SOURCE_SITE_CURRENT()}), "test fence");
         }
@@ -1128,3 +1139,29 @@ TEST(VulkanContextTerminalTest, LostOrQuarantinedDeviceStopsFramesAndFenceRetrie
                                                         : lfs::vis::RendererTerminalState::Quarantined);
     }
 }
+
+#ifdef __APPLE__
+TEST(VulkanContextResizeTest, ContinuousShrinkAndGrowthStayRenderable) {
+    lfs::vis::VulkanContext context;
+    lfs::vis::VulkanContextTestAccess::primeFixedSurface(context);
+    for (const int delta : {-1, -100, -200, 100, 200, -50}) {
+        context.notifyFramebufferResized(1280 + delta, 720 + delta,
+                                         lfs::vis::VulkanContext::ResizeIntent::Interactive);
+        EXPECT_TRUE(context.hasPendingSwapchainResize());
+        EXPECT_TRUE(context.pendingSwapchainResizeReady());
+        EXPECT_TRUE(lfs::vis::VulkanContextTestAccess::promoteResize(context));
+    }
+}
+
+TEST(VulkanContextResizeTest, UnchangedSizeDoesNotRecreateAndRestoreWakesRendering) {
+    lfs::vis::VulkanContext context;
+    lfs::vis::VulkanContextTestAccess::primeFixedSurface(context);
+    context.notifyFramebufferResized(1280, 720);
+    EXPECT_FALSE(context.hasPendingSwapchainResize());
+    context.notifyFramebufferResized(0, 0);
+    EXPECT_FALSE(context.hasPendingSwapchainResize());
+    context.notifyFramebufferResized(1280, 720);
+    EXPECT_TRUE(context.hasPendingSwapchainResize());
+    EXPECT_TRUE(context.pendingSwapchainResizeReady());
+}
+#endif

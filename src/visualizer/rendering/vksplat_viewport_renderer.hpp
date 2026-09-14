@@ -22,7 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 #include <expected>
 #include <glm/glm.hpp>
 #include <memory>
@@ -163,10 +163,15 @@ namespace lfs::vis {
         // timeline imported into CUDA, and the latest completion value covering
         // submits that bound live training storage. The trainer enqueues
         // "wait fence >= value" on its stream before in-place writes.
+#if LFS_TENSOR_CUDA
         [[nodiscard]] cudaExternalSemaphore_t renderCompleteFence() const {
             return render_complete_cuda_.handle();
         }
+#endif
         [[nodiscard]] std::uint64_t renderCompleteValue() const { return last_submitted_render_value_; }
+        // Native tensor writers must not race the viewport's separate queue.
+        // Called while the live model's read lock is still held.
+        [[nodiscard]] lfs::Status waitForModelReads();
 
         // Eagerly create the render stream + completion fence so the trainer↔viewer
         // handshake can be installed before the first live frame submits (covers
@@ -393,6 +398,13 @@ namespace lfs::vis {
             std::shared_ptr<lfs::core::ExportableBlock> block;
             VulkanContext::ExternalBuffer buffer{};
             lfs::core::Tensor copy_keep_alive;
+            lfs::core::Tensor vulkan_selection_mask;
+            lfs::core::Tensor vulkan_preview_mask;
+            lfs::core::Tensor vulkan_selection_colors;
+            lfs::core::Tensor vulkan_transform_indices;
+            lfs::core::Tensor vulkan_node_mask;
+            lfs::core::Tensor vulkan_overlay_params;
+            lfs::core::Tensor vulkan_model_transforms;
             std::array<std::size_t, kOverlayRegionCount> region_offset{};
             std::array<std::size_t, kOverlayRegionCount> region_bytes{};
             lfs::core::Tensor selection_source;
@@ -426,6 +438,13 @@ namespace lfs::vis {
             std::shared_ptr<lfs::core::ExportableBlock> block;
             VulkanContext::ExternalBuffer buffer{};
             lfs::core::Tensor copy_keep_alive;
+            lfs::core::Tensor vulkan_transform_indices;
+            lfs::core::Tensor vulkan_node_mask;
+            lfs::core::Tensor vulkan_primitives;
+            lfs::core::Tensor vulkan_model_transforms;
+            lfs::core::Tensor vulkan_polygon_vertices;
+            lfs::core::Tensor vulkan_polygon_mask;
+            lfs::core::Tensor vulkan_ring_pick;
             std::array<std::size_t, kSelectionQueryRegionCount> region_offset{};
             std::array<std::size_t, kSelectionQueryRegionCount> region_bytes{};
             std::array<std::size_t, kSelectionQueryRegionCount> region_capacity_bytes{};
@@ -748,6 +767,8 @@ namespace lfs::vis {
         // borrow value" GPU-side before its next in-place parameter writes.
         VulkanContext::ExternalSemaphore render_complete_external_{};
         lfs::rendering::CudaTimelineSemaphore render_complete_cuda_{};
+        VkSemaphore vulkan_query_complete_timeline_ = VK_NULL_HANDLE;
+        std::uint64_t vulkan_query_complete_value_ = 0;
 
         // The last completion value whose frame read the persistent (non-ring)
         // lod_page_inputs_ buffer; next-frame page uploads wait on it GPU-side.
@@ -756,10 +777,11 @@ namespace lfs::vis {
         // Zero-copy input storages bound to in-flight frames, keyed by the
         // completion value at which the GPU is done reading them. Keeps
         // VkBuffer + external memory + CUDA allocation alive across trainer
-        // topology reallocations.
+        // topology reallocations. Vulkan-backend tensors pin the same way
+        // through TensorVulkanBuffer::keep_alive.
         std::vector<std::pair<std::uint64_t, std::vector<std::shared_ptr<void>>>>
             retired_input_storages_;
-
+        std::uint64_t last_vulkan_tensor_input_wait_value_ = 0;
         // Async RAD page streaming: decoded pages are packed and copied on the
         // engine's own thread/stream; render frames only publish completions.
         CudaTimelineHandoff lod_engine_timeline_{};

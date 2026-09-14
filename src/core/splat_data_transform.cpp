@@ -432,7 +432,7 @@ namespace lfs::core {
         const size_t layout_rest = splat_data.max_sh_coeffs_rest();
         const bool use_canonical_shN =
             splat_data._shN.is_valid() && splat_data._shN.numel() > 0 && layout_rest > 0 &&
-            (splat_data._shN.dtype() != DataType::Float32 || splat_data.shN_value_quantized() ||
+            (gpu_backend_of(splat_data._shN) != GpuBackend::CUDA || splat_data._shN.dtype() != DataType::Float32 || splat_data.shN_value_quantized() ||
              splat_data.shN_ieee_f16());
         if (use_canonical_shN) {
             // q16 / IEEE-f16: dequant to [N,K,3] then index_select (no ptr<float> on codes).
@@ -446,6 +446,8 @@ namespace lfs::core {
                 indices_for_select = indices_for_select.to(DataType::Int32);
             }
             cropped_shN = canon.index_select(0, indices_for_select).contiguous();
+
+#if LFS_TENSOR_CUDA
         } else if (splat_data._shN.is_valid() && splat_data._shN.numel() > 0 && layout_rest > 0) {
             cropped_shN = Tensor::empty({static_cast<size_t>(points_selected), layout_rest, 3},
                                         splat_data._shN.device());
@@ -469,6 +471,8 @@ namespace lfs::core {
                     static_cast<uint32_t>(layout_rest),
                     static_cast<uint32_t>(layout_rest));
             }
+
+#endif
         }
         auto cropped_scaling = splat_data._scaling.index_select(0, indices).contiguous();
         auto cropped_rotation = splat_data._rotation.index_select(0, indices).contiguous();
@@ -664,7 +668,7 @@ namespace lfs::core {
         const auto layout_rest = static_cast<uint32_t>(splat_data.max_sh_coeffs_rest());
         const bool q16_or_f16 =
             splat_data._shN.is_valid() && splat_data._shN.numel() > 0 && layout_rest > 0 &&
-            (splat_data._shN.dtype() != DataType::Float32 || splat_data.shN_value_quantized() ||
+            (gpu_backend_of(splat_data._shN) != GpuBackend::CUDA || splat_data._shN.dtype() != DataType::Float32 || splat_data.shN_value_quantized() ||
              splat_data.shN_ieee_f16());
         if (q16_or_f16) {
             Tensor canon = splat_data.shN_canonical();
@@ -672,6 +676,8 @@ namespace lfs::core {
                 canon = canon.to(splat_data._means.device());
             }
             shN_selected_canonical = canon.index_select(0, indices_tensor).contiguous();
+
+#if LFS_TENSOR_CUDA
         } else if (splat_data._shN.is_valid() && splat_data._shN.numel() > 0 &&
                    layout_rest > 0) {
             shN_selected_swizzled = Tensor::zeros_direct(
@@ -688,6 +694,8 @@ namespace lfs::core {
                 static_cast<size_t>(num_required_splat),
                 0,
                 layout_rest);
+
+#endif
         }
 
         splat_data._means = splat_data._means.index_select(0, indices_tensor).contiguous();
@@ -889,7 +897,7 @@ namespace lfs::core {
         const size_t layout_rest = splat_data.max_sh_coeffs_rest();
         const bool use_canonical_shN =
             splat_data._shN.is_valid() && splat_data._shN.numel() > 0 && layout_rest > 0 &&
-            (splat_data._shN.dtype() != DataType::Float32 || splat_data.shN_value_quantized() ||
+            (gpu_backend_of(splat_data._shN) != GpuBackend::CUDA || splat_data._shN.dtype() != DataType::Float32 || splat_data.shN_value_quantized() ||
              splat_data.shN_ieee_f16());
         if (use_canonical_shN) {
             Tensor canon = splat_data.shN_canonical();
@@ -902,6 +910,8 @@ namespace lfs::core {
                 indices_for_select = indices_for_select.to(DataType::Int32);
             }
             shN_selected = canon.index_select(0, indices_for_select).contiguous();
+
+#if LFS_TENSOR_CUDA
         } else if (splat_data._shN.is_valid() && splat_data._shN.numel() > 0 && layout_rest > 0) {
             shN_selected = Tensor::empty({static_cast<size_t>(count), layout_rest, 3},
                                          splat_data._shN.device());
@@ -925,6 +935,8 @@ namespace lfs::core {
                     static_cast<uint32_t>(layout_rest),
                     static_cast<uint32_t>(layout_rest));
             }
+
+#endif
         }
 
         SplatData result(

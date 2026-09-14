@@ -49,7 +49,9 @@
 #include <nlohmann/json.hpp>
 #include <stb_image_write.h>
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1183,7 +1185,9 @@ namespace lfs::vis::project {
                         false, std::memory_order_release);
                     return;
                 }
+#if LFS_TENSOR_CUDA
                 (void)cudaSetDevice(0);
+#endif
                 auto* scene_manager =
                     viewer_.getSceneManager();
                 if (!scene_manager || !document_) {
@@ -1800,9 +1804,7 @@ namespace lfs::vis::project {
                         path, error);
                 if (!error) {
                     const auto system_time =
-                        std::chrono::clock_cast<
-                            std::chrono::system_clock>(
-                            file_time);
+                        std::chrono::time_point_cast<std::chrono::system_clock::duration>(std::chrono::file_clock::to_sys(file_time));
                     unix_seconds =
                         std::chrono::system_clock::to_time_t(
                             system_time);
@@ -5389,6 +5391,24 @@ namespace lfs::vis::project {
                 ->isTrainingActive();
         if (!training) {
             autosave_memory_warning_published_ = false;
+            next_training_checkpoint_at_ = now + std::chrono::seconds(30);
+        } else if (now >= next_training_checkpoint_at_ && document_->source_path() &&
+                   !isBackgroundAutosaveSuppressed()) {
+            auto* trainer = viewer_.getTrainer();
+            if (trainer && trainer->is_running() &&
+                !trainer->get_project_snapshot_metrics().request_pending) {
+                // Recovery checkpoints are explicit, durable project generations.
+                // Metadata autosave remains lightweight. Retry failures next interval.
+                next_training_checkpoint_at_ = now + std::chrono::minutes(5);
+                if (auto started = startLiveTrainingSnapshotWrite(ProjectWritePurpose::TrainingExplicitSave, false); !started) {
+                    LOG_WARN("Recovery checkpoint could not start: {}", developerError(started.error()));
+                    last_project_write_error_ = developerError(started.error());
+                } else {
+                    project_write_automatic_ = true;
+                    LOG_INFO("Recovery checkpoint requested at iteration {}", trainer->project_snapshot_iteration());
+                }
+                return;
+            }
         }
         const bool training_write_window =
             isTrainingWriteWindowOpen();

@@ -3,8 +3,9 @@
 
 #pragma once
 
+#include "core/cuda_stream_fwd.hpp"
+#include "core/tensor_fwd.hpp"
 #include <cstddef>
-#include <cuda_runtime.h>
 #include <vector>
 
 namespace lfs::training::kernels {
@@ -66,6 +67,16 @@ namespace lfs::training::kernels {
         DepthAnchorCandidate depth;
     };
 
+    struct DepthAnchorSample {
+        float x;
+        float y;
+    }; // prior value, camera-space depth
+
+    [[nodiscard]] std::vector<DepthAnchorSample> collect_depth_anchor_samples(
+        const lfs::core::Tensor& points, const lfs::core::Tensor& world_to_camera,
+        float fx, float fy, float cx, float cy, const lfs::core::Tensor& prior,
+        float near_plane, const float aabb_lo[3], const float aabb_hi[3]);
+
     // Projects sparse points into the camera, samples the prior, and fits both
     // affine models (prior -> inverse depth, prior -> depth) with one trimmed
     // refit. Synchronizes the stream; startup use only.
@@ -90,7 +101,7 @@ namespace lfs::training::kernels {
     // GPU half of fit_depth_anchor: projects the anchor cloud into the prior and
     // returns the raw (prior value, camera-space depth) sample pairs. Empty when
     // too few samples land in view. Synchronizes the stream; startup use only.
-    [[nodiscard]] std::vector<float2> collect_depth_anchor_samples(
+    [[nodiscard]] std::vector<DepthAnchorSample> collect_depth_anchor_samples(
         const float* points_xyz, // [N,3] CUDA
         size_t num_points,
         const float* w2c, // [16] CUDA row-major world-to-camera
@@ -108,7 +119,7 @@ namespace lfs::training::kernels {
 
     // CPU half of fit_depth_anchor: robust affine fits over collected samples.
     // Pure host work — safe to run across a worker thread pool.
-    [[nodiscard]] DepthAnchor fit_depth_anchor_from_samples(const std::vector<float2>& pairs);
+    [[nodiscard]] DepthAnchor fit_depth_anchor_from_samples(const std::vector<DepthAnchorSample>& pairs);
 
     [[nodiscard]] size_t depth_loss_partial_count(size_t num_pixels);
 
