@@ -8,6 +8,7 @@
 #include "core/guarded_task.hpp"
 #include "core/logger.hpp"
 #include "core/user_paths.hpp"
+#include "core/vulkan_phase_timing.hpp"
 #include "vk_memory.hpp"
 #include "vk_pipelines.hpp"
 #include "vk_recorder.hpp"
@@ -856,6 +857,11 @@ namespace lfs::core::internal {
         if (value == 0) {
             return;
         }
+        // Time blocked here is the training loop's pacing cost: the allocator, the recorder's
+        // in-flight limit and every explicit flush all wait on this timeline (plan §81 phase 0).
+        // The scope also covers the poll spin below: CPU-busy, but still host time not making
+        // forward progress, so it belongs in the wait metric.
+        const lfs::core::VulkanHostWaitScope host_wait_scope;
         if (dead()) {
             vk_check(this, VK_ERROR_DEVICE_LOST, "vkWaitSemaphores");
         }

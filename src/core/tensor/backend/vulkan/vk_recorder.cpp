@@ -3,6 +3,8 @@
 
 #include "vk_recorder.hpp"
 
+#include "vk_phase_timing.hpp"
+
 #include "core/assert.hpp"
 #include "core/tensor_storage.hpp"
 #include "vk_context.hpp"
@@ -10,10 +12,12 @@
 
 #include <algorithm>
 #include <array>
+#include <ranges>
 #include <cstdio>
 #include <deque>
 #include <limits>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,6 +87,49 @@ namespace lfs::core::internal {
         uint64_t submitted_value = 0;
         uint32_t command_count = 0;
         bool owner_alive = true;
+        // Storages read and written by the commands recorded since the last emitted
+        // barrier, plus whether this command buffer already opens with one. Commands
+        // that share no storage have no data dependency and may overlap on the device;
+        // ordering them anyway costs a Metal encoder per dispatch and serializes the
+        // whole pipeline (measured: ~1000 compute encoders per iteration at 1M
+        // Gaussians, with no idle time to recover and ~83 GB/s effective). Hazards
+        // still get exactly the barrier they had before.
+        //
+        // Reads are tracked separately because read-after-read needs no
+        // synchronization, and many ops in the optimizer step share read-only masks
+        // and gradients. A barrier is required when this command writes anything
+        // already accessed, or reads something written since the last barrier.
+        std::unordered_set<const StorageMeta*> read_since_barrier;
+        std::unordered_set<const StorageMeta*> written_since_barrier;
+        bool buffer_ordered = false;
+
+        [[nodiscard]] bool conflicts(const std::span<const StorageRef> reads,
+                                     const std::span<const StorageRef> writes) const {
+            const auto any_in = [](const std::span<const StorageRef> storages,
+                                   const std::unordered_set<const StorageMeta*>& set) {
+                return std::ranges::any_of(storages, [&set](const StorageRef storage) {
+                    return storage.meta != nullptr && set.contains(storage.meta);
+                });
+            };
+            const bool write_conflict =
+                any_in(writes, written_since_barrier) || any_in(writes, read_since_barrier);
+            const bool read_after_write = any_in(reads, written_since_barrier);
+            return write_conflict || read_after_write;
+        }
+
+        void note_access(const std::span<const StorageRef> reads,
+                         const std::span<const StorageRef> writes) {
+            for (const auto* storages : {&reads, &writes}) {
+                for (const StorageRef ref : *storages) {
+                    if (ref.meta != nullptr)
+                        read_since_barrier.insert(ref.meta);
+                }
+            }
+            for (const StorageRef ref : writes) {
+                if (ref.meta != nullptr)
+                    written_since_barrier.insert(ref.meta);
+            }
+        }
     };
 
     namespace {
@@ -166,6 +213,9 @@ namespace lfs::core::internal {
             throw;
         }
         recorder.command_count = 0;
+        recorder.buffer_ordered = false;
+        recorder.read_since_barrier.clear();
+        recorder.written_since_barrier.clear();
     }
 
     void VulkanRecorderRegistry::stamp(const StorageRef storage,
@@ -218,8 +268,24 @@ namespace lfs::core::internal {
             flush_foreign_access(storage);
         }
         begin_locked(recorder);
-        global_barrier(recorder.command);
+        // Timestamp any phase boundary announced since the last command. The write is
+        // ordered after everything submitted before it, so it lands exactly where the
+        // announced phase ended rather than where the host happened to reach the boundary.
+        vk_phase_timing_write_pending(recorder.command);
+        vk_phase_timing_note_command();
+        // A device-wide barrier before every dispatch used to be the only ordering
+        // rule. It covers every hazard conservatively, but it also prevents
+        // independent dispatches from overlapping, so keep it only where the command
+        // can actually communicate with what came before, plus once at the start of
+        // each command buffer to stay ordered against earlier submissions.
+        if (!recorder.buffer_ordered || recorder.conflicts(reads, writes)) {
+            global_barrier(recorder.command);
+            recorder.buffer_ordered = true;
+            recorder.read_since_barrier.clear();
+            recorder.written_since_barrier.clear();
+        }
         command(recorder.command);
+        recorder.note_access(reads, writes);
         if (writes_fault) {
             const VkMemoryBarrier2 host_read{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,

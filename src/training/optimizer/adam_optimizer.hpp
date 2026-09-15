@@ -50,6 +50,14 @@ namespace lfs::training {
         //   joint_bounds holds float4 per 256-splat block.
         lfs::core::Tensor exp_avg;
         lfs::core::Tensor joint_bounds; // [n_bounds, 4] fp32; joint codec only
+        // Vulkan keeps the Adam moments in fp32 as well as in the packed codec form.
+        // The fp32 form is authoritative while training, so the packed form is refreshed
+        // only when something outside the update path needs it (checkpoint, reorder,
+        // compaction, relocation). That removes the per-step moment decode and encode
+        // from the optimizer step entirely.
+        lfs::core::Tensor moments_first;  // {n, attributes} fp32, rows-major
+        lfs::core::Tensor moments_second;
+        bool packed_current = true; // false once the fp32 moments have moved ahead
         int joint_bits = 0;             // 0=legacy, 8=SH, 16=non-SH
         int64_t step_count = 0;
         size_t capacity = 0; // Allocated capacity (moment rows / float cells)
@@ -205,7 +213,12 @@ namespace lfs::training {
         const AdamConfig& get_config() const { return config_; }
 
         // Serialization
-        void serialize(std::ostream& os) const;
+        // Write any fp32-resident moment state back into the packed representation before
+        // a caller outside the update path touches it. No-op on CUDA.
+        void sync_moments_for_external_access();
+        // Drop the fp32 moments so the next update re-derives them from the packed form.
+        void invalidate_fp32_moments();
+        void serialize(std::ostream& os);
         void deserialize(std::istream& is);
         void adopt_checkpoint_state(AdamOptimizer& loaded) noexcept;
         void reserve_capacity(size_t capacity);
@@ -230,6 +243,10 @@ namespace lfs::training {
         static void write_moment_range(AdamParamState& state, size_t slots, const joint_adam::TensorMoments& rows, size_t offset);
         void remap_moment_rows(ParamType type, size_t previous_primitives, size_t primitives,
                                 const lfs::core::Tensor& mapping, bool append);
+        // fp32 moments: (re)derive them from the packed form, and write the packed form
+        // back out before anything outside the update path reads it.
+        void ensure_fp32_moments(ParamType type);
+        void flush_moments_to_packed();
 #endif
         static void note_slow_path_grow(const char* site, const std::string& name);
         AdamConfig config_;

@@ -739,9 +739,11 @@ layout(binding=3) StructuredBuffer<float4> rotations;
 layout(binding=4) StructuredBuffer<float> scaling_raw;
 layout(binding=5) StructuredBuffer<float> opacity_raw;
 layout(binding=6) StructuredBuffer<int> out_tiles_touched;
-layout(binding=7) StructuredBuffer<float2> v_output_xy_vs;
-layout(binding=8) StructuredBuffer<float4> v_output_inv_cov_vs;
-layout(binding=9) StructuredBuffer<float> v_output_rgb;
+// The alpha-blend backward accumulates these as pairs of scaled int32 words (high at 2^12, low
+// at 2^30), two words per value, so the sums cannot depend on atomic ordering. See the writer.
+layout(binding=7) StructuredBuffer<int> v_output_xy_vs;
+layout(binding=8) StructuredBuffer<int> v_output_inv_cov_vs;
+layout(binding=9) StructuredBuffer<int> v_output_rgb;
 layout(binding=10) RWStructuredBuffer<float> v_xyz_ws;
 layout(binding=11) RWStructuredBuffer<float> v_sh0;
 layout(binding=12) RWStructuredBuffer<float4> v_shN;
@@ -919,12 +921,21 @@ void main(
   #endif
   #else
     // backward
-    float2 v_out_xy_vs = is_zero_grad ? float2(0) : v_output_xy_vs[g_idx];
+    float2 v_out_xy_vs = float2(0);
     float v_out_depths = 0.0;
-    float4 v_out_inv_cov_vs_opac = is_zero_grad ? float4(0) :
-      v_output_inv_cov_vs[g_idx];
-    float3 v_out_rgb = is_zero_grad ? float3(0) :
-      float3(read_t3_float3(g_idx, v_output_rgb));
+    float4 v_out_inv_cov_vs_opac = float4(0);
+    float3 v_out_rgb = float3(0);
+    if (!is_zero_grad) {
+      #define _REFINED_ADJOINT(buffer, words_per_splat, values, index)                     \
+        for (uint _c = 0; _c < values; ++_c)                                               \
+            index[_c] = float(buffer[words_per_splat * g_idx + 2 * _c]) * (1.0 / 4096.0) +  \
+                        float(buffer[words_per_splat * g_idx + 2 * _c + 1]) *              \
+                            (1.0 / 1073741824.0);
+        _REFINED_ADJOINT(v_output_xy_vs, 4, 2, v_out_xy_vs)
+        _REFINED_ADJOINT(v_output_inv_cov_vs, 8, 4, v_out_inv_cov_vs_opac)
+        _REFINED_ADJOINT(v_output_rgb, 6, 3, v_out_rgb)
+      #undef _REFINED_ADJOINT
+    }
 
     Splat_2D_Vertex v_splat = {
         float3(v_out_xy_vs, v_out_depths),  // xyz_vs

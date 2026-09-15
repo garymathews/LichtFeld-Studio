@@ -24,7 +24,13 @@ namespace PerfTimer {
     _(ApplyDepthOrdering)         \
     _(PrepareTileSort)            \
     _(CullSplats)                 \
-    _(ProjectionSurvivors)
+    _(ProjectionSurvivors)        \
+    _(TrainingVisibilityCopy)     \
+    _(TrainingInstanceGate)       \
+    _(TrainingWavePartition)      \
+    _(BackwardAdjointClear)       \
+    _(RasterizeBackward)          \
+    _(ProjectionBackward)
 
 #define _(name) name,
     enum TrainStage {

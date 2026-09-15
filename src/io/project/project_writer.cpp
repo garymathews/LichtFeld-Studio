@@ -206,7 +206,13 @@ namespace lfs::io::project {
                 return requested;
             }
             try {
-                return lfs::core::generate_uuid_v4();
+                // In reproducible mode every generated identity is derived from the destination,
+                // the field it belongs to and the assignment's position in the run - identical
+                // across identical invocations, distinct for each assignment within one.
+                static std::uint64_t reproducible_assignment = 0;
+                return lfs::core::reproducible_artifact_uuid(std::format(
+                    "lfs.assigned|{}|{}|{}", path.generic_string(), field,
+                    ++reproducible_assignment));
             } catch (const std::exception& exception) {
                 // LFS-CENSUS-OK(empty-catch): translate the UUID boundary to lfs::Error.
                 return writer_error(

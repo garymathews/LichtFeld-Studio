@@ -27,6 +27,7 @@ add_subdirectory(logger)
 # Tensor C++ sources (merged from src/core/tensor/)
 set(TENSOR_SOURCES
         tensor/joint_moments.cpp
+        tensor/mcmc_noise.cpp
         tensor/lazy_config.cpp
         tensor/lazy_ir.cpp
         tensor/lazy_executor.cpp
@@ -79,6 +80,7 @@ if(LFS_TENSOR_VULKAN)
         ../rendering/rasterizer/vulkan/src/vma_implementation.cpp
         tensor/backend/vulkan/vk_context.cpp
         tensor/backend/vulkan/vk_memory.cpp
+        tensor/backend/vulkan/vk_phase_timing.cpp
         tensor/backend/vulkan/vk_recorder.cpp
         tensor/backend/vulkan/vk_pipelines.cpp
         tensor/backend/vulkan/vk_ops_pointwise.cpp

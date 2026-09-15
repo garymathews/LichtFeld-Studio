@@ -227,9 +227,13 @@ target_include_directories(lichtfeld_backend_tests PRIVATE
 )
 target_link_libraries(lichtfeld_backend_tests PRIVATE lfs_core GTest::gtest_main)
 if(LFS_TENSOR_VULKAN)
-    target_sources(lichtfeld_backend_tests PRIVATE test_tensor_vulkan_regressions.cpp)
+    target_sources(lichtfeld_backend_tests PRIVATE
+        test_tensor_vulkan_regressions.cpp
+        test_vulkan_backward_gradients.cpp
+        ${CMAKE_SOURCE_DIR}/src/training/kernels/mcmc_tensor.cpp)
     target_compile_definitions(lichtfeld_backend_tests PRIVATE LFS_TENSOR_VULKAN=1)
     target_link_libraries(lichtfeld_backend_tests PRIVATE Vulkan::Vulkan)
+    target_link_libraries(lichtfeld_backend_tests PRIVATE lfs_training lfs_vulkan_rasterizer lfs_training_kernels)
 endif()
 if(TARGET lfs_visualizer)
     add_executable(lichtfeld_vulkan_wait_tests test_vulkan_wait_bounded.cpp)
@@ -248,6 +252,28 @@ if(APPLE AND LFS_TENSOR_VULKAN)
     set_tests_properties(lichtfeld_backend_tests PROPERTIES
         ENVIRONMENT "VK_ICD_FILENAMES=${CMAKE_BINARY_DIR}/resources/vulkan/MoltenVK_icd.json"
     )
+endif()
+# Reproducibility: two identical pinned-SOURCE_DATE_EPOCH runs must produce byte-identical checkpoints.
+# Needs a dataset and a checkpoint, so it only registers when both are provided in the environment:
+#   LFS_REPRO_DATASET=/path/to/dataset LFS_REPRO_RESUME=/path/to/project.licht ctest -R lichtfeld.reproducibility
+# Optional overrides: LFS_REPRO_ITERATIONS (default 8030) and LFS_REPRO_TIMEOUT (default 1800 s).
+if(DEFINED ENV{LFS_REPRO_DATASET} AND DEFINED ENV{LFS_REPRO_RESUME})
+    set(_lfs_repro_iterations 8030)
+    if(DEFINED ENV{LFS_REPRO_ITERATIONS})
+        set(_lfs_repro_iterations $ENV{LFS_REPRO_ITERATIONS})
+    endif()
+    set(_lfs_repro_timeout 1800)
+    if(DEFINED ENV{LFS_REPRO_TIMEOUT})
+        set(_lfs_repro_timeout $ENV{LFS_REPRO_TIMEOUT})
+    endif()
+    add_test(NAME lichtfeld.reproducibility
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/check_reproducibility.py
+                --binary ${CMAKE_BINARY_DIR}/LichtFeld-Studio
+                --dataset $ENV{LFS_REPRO_DATASET}
+                --resume $ENV{LFS_REPRO_RESUME}
+                --icd ${CMAKE_BINARY_DIR}/resources/vulkan/MoltenVK_icd.json
+                --iterations ${_lfs_repro_iterations})
+    set_tests_properties(lichtfeld.reproducibility PROPERTIES LABELS "backend;slow" TIMEOUT ${_lfs_repro_timeout})
 endif()
 if(NOT LFS_TENSOR_CUDA)
     return()

@@ -1856,7 +1856,10 @@ namespace lfs::training {
         constexpr uint32_t ADAM_STATE_VERSION = 3;
     } // namespace
 
-    void AdamOptimizer::serialize(std::ostream& os) const {
+    void AdamOptimizer::serialize(std::ostream& os) {
+        // The packed form is the durable representation; make sure it reflects the fp32
+        // moments that the update path has been using.
+        sync_moments_for_external_access();
         os.write(reinterpret_cast<const char*>(&ADAM_STATE_MAGIC), sizeof(ADAM_STATE_MAGIC));
         os.write(reinterpret_cast<const char*>(&ADAM_STATE_VERSION), sizeof(ADAM_STATE_VERSION));
 
@@ -2111,6 +2114,9 @@ namespace lfs::training {
 
         config_ = std::move(loaded_config);
         states_ = std::move(loaded_states);
+        // The packed form is authoritative after a load; the fp32 moments are derived on
+        // first use.
+        invalidate_fp32_moments();
 
         // Gradient buffers are transient and allocated lazily by get_grad().
         const auto milliseconds = [](const auto begin, const auto end) {

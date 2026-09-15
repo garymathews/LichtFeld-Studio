@@ -31,6 +31,10 @@ layout(binding=11) StructuredBuffer<float> pixel_error;
 layout(binding=12) RWByteAddressBuffer densification_info;
 #endif
 
+// Scale for the integer accumulation of densification statistics. Matched pair with
+// kDensificationStatScale in the Vulkan training rasterizer's backward(); keep them equal.
+static const int kDensificationStatScale = 65536;
+
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
 void main(
@@ -153,13 +157,20 @@ void main(
             weighted_error = WaveActiveSum(weighted_error);
 #endif
           #endif
-          #if USE_EMULATED_F32_ATOMIC
-            #define _ATOMIC_ADD(buffer, address, value) \
-                ifNonZero(value) AtomicAddFloat(buffer, (address)*sizeof(float), value);
-          #else
-            #define _ATOMIC_ADD(buffer, address, value) \
-                ifNonZero(value) buffer.InterlockedAddF32((address)*sizeof(float), value);
-          #endif
+            // Each adjoint is accumulated as two scaled int32 words: a high part at 2^12 and a low
+            // part at 2^30 carrying the residual. Both sums are exact integer additions, so neither
+            // can depend on atomic scheduling order. A single int32 would need a scale coarse
+            // enough to flush the smallest gradients to zero; the pair keeps a ~1e-9 floor and uses
+            // the native integer atomic the count/index shaders already use, since no 64-bit
+            // integer atomic is dependable on this backend.
+            #define _ATOMIC_ADD_REFINED(buffer, address, value)                          \
+                if (value != 0.0) {                                                       \
+                    const int refined_hi = int(round(value * 4096.0));                    \
+                    const int refined_lo = int(round((value - float(refined_hi) *         \
+                                                       (1.0 / 4096.0)) * 1073741824.0));   \
+                    buffer.InterlockedAdd(8u * (address), refined_hi);                    \
+                    buffer.InterlockedAdd(8u * (address) + 4u, refined_lo);               \
+                }
             // WaveActiveSum broadcasts each result; spread independent atomics across lanes.
           #if SUBGROUP_REDUCE_BEFORE_ATOMIC
             const uint lane = WaveGetLaneIndex(), lane_stride = WaveGetLaneCount();
@@ -167,18 +178,21 @@ void main(
             const uint lane = 0, lane_stride = 1;
           #endif
             for (uint c = lane; c < 2; c += lane_stride) {
-                _ATOMIC_ADD(v_xy_vs, 2*g_idx+c, d_xy_vs[c]);
+                _ATOMIC_ADD_REFINED(v_xy_vs, 2*g_idx+c, d_xy_vs[c]);
             }
             for (uint c = lane; c < 4; c += lane_stride) {
-                _ATOMIC_ADD(v_inv_cov_vs_opacity, 4*g_idx+c, d_inv_cov_vs_opacity[c]);
+                _ATOMIC_ADD_REFINED(v_inv_cov_vs_opacity, 4*g_idx+c, d_inv_cov_vs_opacity[c]);
             }
             for (uint c = lane; c < 3; c += lane_stride) {
-                _ATOMIC_ADD(v_rgb, 3*g_idx+c, d_rgb[c]);
+                _ATOMIC_ADD_REFINED(v_rgb, 3*g_idx+c, d_rgb[c]);
             }
 #if DENSIFICATION_MCMC
             for (uint c = lane; c < 2; c += lane_stride) {
                 const float2 gradient = float2(blend_weight, weighted_error);
-                _ATOMIC_ADD(densification_info, c*uniforms.num_splats+g_idx, gradient[c]);
+                // Integer accumulation so the statistics cannot depend on atomic ordering; the host
+                // divides by kDensificationStatScale after the backward. Matched pair.
+                const int scaled = int(round(gradient[c] * float(kDensificationStatScale)));
+                densification_info.InterlockedAdd(4u * (c * uniforms.num_splats + g_idx), scaled);
             }
 #endif
 

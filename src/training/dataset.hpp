@@ -452,7 +452,27 @@ namespace lfs::training {
             prefetch_next_batch();
 
             try {
-                auto ready = loader_->get();
+                // Requests complete in decode order, not camera order: with several prefetches in
+                // flight `get()` returns whichever picture finished first. That permutes the first
+                // iterations after a build or a resume-time rebuild and makes otherwise identical
+                // runs diverge. Consume in sequence order instead, holding out-of-order arrivals
+                // until their turn. Ordering is what the sampler's seed and offset already promise.
+                lfs::io::ReadyImage ready;
+                for (;;) {
+                    if (const auto buffered = pending_.find(next_expected_sequence_);
+                        buffered != pending_.end()) {
+                        ready = std::move(buffered->second);
+                        pending_.erase(buffered);
+                        break;
+                    }
+                    auto obtained = loader_->get();
+                    if (obtained.sequence_id == next_expected_sequence_) {
+                        ready = std::move(obtained);
+                        break;
+                    }
+                    pending_.emplace(obtained.sequence_id, std::move(obtained));
+                }
+                ++next_expected_sequence_;
                 const auto it = sequence_to_camera_.find(ready.sequence_id);
                 if (it == sequence_to_camera_.end()) {
                     LOG_ERROR("[PipelinedDataLoader] Unknown sequence_id: {}", ready.sequence_id);
@@ -520,6 +540,8 @@ namespace lfs::training {
             sampler_.reset();
             sequence_to_camera_.clear();
             next_sequence_id_ = 0;
+            pending_.clear();
+            next_expected_sequence_ = 0;
             prefetch_next_batch();
         }
 
@@ -616,6 +638,9 @@ namespace lfs::training {
         std::shared_ptr<lfs::io::PipelinedImageLoader> loader_;
 
         std::unordered_map<size_t, size_t> sequence_to_camera_;
+        /// Arrivals whose sequence id is ahead of the next one to hand out.
+        std::unordered_map<size_t, lfs::io::ReadyImage> pending_;
+        size_t next_expected_sequence_ = 0;
         size_t next_sequence_id_ = 0;
 
         bool shutdown_ = false;

@@ -507,6 +507,12 @@ namespace lfs::app {
                 checkpoint_params.optimization.iterations =
                     cli_params.optimization.iterations;
             }
+            // Runtime-only CLI controls are not part of the serialized
+            // training state. Preserve them when a resume is requested so
+            // --perf-bench (and its warmup) still applies to the resumed run.
+            checkpoint_params.optimization.perf_bench = cli_params.optimization.perf_bench;
+            checkpoint_params.optimization.perf_bench_warmup =
+                cli_params.optimization.perf_bench_warmup;
             checkpoint_params.optimization.headless =
                 cli_params.optimization.headless;
             checkpoint_params.optimization.auto_train =

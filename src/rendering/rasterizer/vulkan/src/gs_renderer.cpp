@@ -1429,18 +1429,25 @@ VulkanGSRenderer::TileInstanceGate VulkanGSRenderer::executeTrainingForward(
     const auto& dummy = clearDeviceBuffer(buffers.scales_opacs,
                                           lfs::rendering::vulkan::ParamCount * 4);
     executeProjectionForward(uniforms, buffers, dummy, dummy, dummy, dummy, 0, false, {}, {}, {}, {}, {}, false);
-    const DeclaredAccess copy_access[] = {
-        {.buffer = &buffers.tiles_touched.deviceBuffer, .use = BufferUse::TransferRead},
-        {.buffer = &projection_visibility, .use = BufferUse::TransferWrite}};
-    planTransfer(copy_access);
-    const VkBufferCopy copy{buffers.tiles_touched.deviceBuffer.offset, projection_visibility.offset,
-                            size_t{uniforms.num_splats} * sizeof(int32_t)};
-    vkCmdCopyBuffer(activeCommandBuffer(), buffers.tiles_touched.deviceBuffer.buffer, projection_visibility.buffer, 1, &copy);
+    {
+        PerfTimer::Timer<PerfTimer::TrainingVisibilityCopy> timer(this);
+        const DeclaredAccess copy_access[] = {
+            {.buffer = &buffers.tiles_touched.deviceBuffer, .use = BufferUse::TransferRead},
+            {.buffer = &projection_visibility, .use = BufferUse::TransferWrite}};
+        planTransfer(copy_access);
+        const VkBufferCopy copy{buffers.tiles_touched.deviceBuffer.offset, projection_visibility.offset,
+                                size_t{uniforms.num_splats} * sizeof(int32_t)};
+        vkCmdCopyBuffer(activeCommandBuffer(), buffers.tiles_touched.deviceBuffer.buffer, projection_visibility.buffer, 1, &copy);
+    }
     uniforms.sort_capacity = HIGS_DEPTH_WAVE_INSTANCES;
     executeSortPrimitivesByDepth(uniforms, buffers);
     executeApplyDepthOrdering(uniforms, buffers);
     executeCalculateIndexBufferOffset(uniforms, buffers);
-    const auto gate = synchronizeTileInstanceGate(buffers);
+    TileInstanceGate gate{};
+    {
+        PerfTimer::Timer<PerfTimer::TrainingInstanceGate> timer(this);
+        gate = synchronizeTileInstanceGate(buffers);
+    }
     if (gate.count_overflow || gate.raw_count > HIGS_DEPTH_WAVE_INSTANCES) {
         return gate;
     }
@@ -1448,7 +1455,10 @@ VulkanGSRenderer::TileInstanceGate VulkanGSRenderer::executeTrainingForward(
     size_t tiles = size_t{uniforms.grid_width} * uniforms.grid_height;
     int bits = 0;
     for (size_t value = tiles; value; value >>= 1) ++bits;
-    executeWavePartition(uniforms, buffers, 1, false);
+    {
+        PerfTimer::Timer<PerfTimer::TrainingWavePartition> timer(this);
+        executeWavePartition(uniforms, buffers, 1, false);
+    }
     const bool previous_capture = std::exchange(depth_capture_, true);
     try {
         executeLegacyDepthWaves(uniforms, buffers, 1, std::max(bits, 1), dummy, dummy, dummy, dummy, dummy, dummy, dummy, false, false, false);
@@ -1525,8 +1535,11 @@ void VulkanGSRenderer::executeProjectionBackward(
         {gradients.rotations.deviceBuffer, BufferUse::ComputeWrite},
         {gradients.scaling_raw.deviceBuffer, BufferUse::ComputeWrite},
         {gradients.opacity_raw.deviceBuffer, BufferUse::ComputeWrite}};
-    executeCompute({{n, SUBGROUP_SIZE}}, &uniforms, sizeof(uniforms),
-                   pipeline_projection_backward, bindings);
+    {
+        PerfTimer::Timer<PerfTimer::ProjectionBackward> timer(this);
+        executeCompute({{n, SUBGROUP_SIZE}}, &uniforms, sizeof(uniforms),
+                       pipeline_projection_backward, bindings);
+    }
 }
 
 void VulkanGSRenderer::executeRasterizationBackward(
@@ -1578,9 +1591,13 @@ void VulkanGSRenderer::executeRasterizationBackward(
     validateBufferRange(forward.pixel_state.deviceBuffer, 0, 4 * pixels * sizeof(float), "raster final pixel state");
     validateBufferRange(forward.n_contributors.deviceBuffer, 0, pixels * sizeof(int32_t), "raster contributors");
     validateBufferRange(gradients.pixel_state.deviceBuffer, 0, 4 * pixels * sizeof(float), "raster pixel adjoint");
-    clearDeviceBuffer(gradients.xy_vs, 2 * n);
-    clearDeviceBuffer(gradients.inv_cov_vs_opacity, 4 * n);
-    clearDeviceBuffer(gradients.rgb, 3 * n);
+    // Each adjoint value is two scaled int32 words, so the clear covers twice the value count.
+    {
+        PerfTimer::Timer<PerfTimer::BackwardAdjointClear> timer(this);
+        clearDeviceBuffer(gradients.xy_vs, 4 * n);
+        clearDeviceBuffer(gradients.inv_cov_vs_opacity, 8 * n);
+        clearDeviceBuffer(gradients.rgb, 6 * n);
+    }
     std::vector<TaggedBinding> bindings{
             {forward.sorted_gauss_idx().deviceBuffer, BufferUse::ComputeRead},
             {forward.tile_ranges.deviceBuffer, BufferUse::ComputeRead},
@@ -1597,8 +1614,11 @@ void VulkanGSRenderer::executeRasterizationBackward(
         bindings.push_back({error_map, BufferUse::ComputeRead});
         bindings.push_back({densification_info, BufferUse::ComputeReadWrite});
     }
-    executeCompute({{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
-        &uniforms, sizeof(uniforms), pipeline, bindings);
+    {
+        PerfTimer::Timer<PerfTimer::RasterizeBackward> timer(this);
+        executeCompute({{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
+            &uniforms, sizeof(uniforms), pipeline, bindings);
+    }
 }
 
 void VulkanGSRenderer::executeLegacyDepthWaves(

@@ -87,6 +87,7 @@ namespace lfs::core {
         uint64_t context_id = 0;
     };
     LFS_CORE_API void with_idle_vulkan_device(const std::function<void(const VulkanExternalDevice&)>& work);
+
     // Initialize a native consumer while the device is idle. Its non-throwing
     // cleanup runs when the token is released, or before backend shutdown,
     // whichever happens first. Neither callback may call Tensor/backend APIs.

@@ -5,6 +5,7 @@
 #include "core/scene.hpp"
 #include "core/tensor_backend.hpp"
 #include "lfs/training/live_model_mutation_guard.hpp"
+#include "lfs/training/perf_bench.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "rasterization/vulkan_rasterizer.hpp"
 #include "trainer.hpp"
@@ -78,6 +79,9 @@ namespace lfs::training {
             if (auto error = opt.validate_training_backend(core::GpuBackend::Vulkan); !error.empty())
                 throw std::runtime_error(error);
             const auto active_begin = std::chrono::steady_clock::now();
+            if (PerfBenchCollector::enabled())
+                PerfBenchCollector::instance().on_step_begin(iter, strategy_->is_refining(iter));
+            PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::StepBegin, iter);
             CommandCenter::instance().set_phase(TrainingPhase::Forward);
             {
                 // Hold the existing live-model lock through forward and backward:
@@ -101,6 +105,7 @@ namespace lfs::training {
                 if (background_image.is_valid())
                     background.fill(0.f);
                 phase = "Forward";
+                PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::FwdBegin, iter);
                 auto rendered = vulkan_rasterizer_->forward(*camera, model,
                                                             background, opt.mip_filter);
                 if (background_image.is_valid())
@@ -108,6 +113,7 @@ namespace lfs::training {
                 rendered.camera = camera;
                 rendered.target_image = gt_image;
                 phase = "Loss";
+                PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::LossBegin, iter);
                 core::Tensor roi_weight;
                 if (scene_) {
                     if (const auto geometry = resolve_training_cropbox_loss_geom(*scene_, opt.cropbox_loss_weight))
@@ -142,6 +148,7 @@ namespace lfs::training {
                     error_map = (map.mean(1).squeeze(0).neg() + 1.f).clamp_min(0.f);
                 }
                 phase = "Backward";
+                PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::BwdBegin, iter);
                 // Backward commits screen-share and densification statistics,
                 // so even a later loss/regularizer failure invalidates a save.
                 ++mutation_epoch_;
@@ -172,7 +179,9 @@ namespace lfs::training {
                 ControlBoundary::instance().notify(ControlHook::PreOptimizerStep, context);
                 const auto previous_size = model.size();
                 phase = "RefinementCommit";
+                PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::OptBegin, iter);
                 strategy_->post_backward(iter, rendered);
+                PerfBenchCollector::phase_mark_sub(iter, 0);
                 phase = "OptimizerCommit";
                 strategy_->step(iter);
                 maybe_morton_reorder(iter);
@@ -190,6 +199,9 @@ namespace lfs::training {
                 }
             }
             active_step_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - active_begin).count();
+            PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::StepEnd, iter);
+            if (PerfBenchCollector::enabled())
+                PerfBenchCollector::instance().on_step_end(iter, current_loss_.load(), strategy_->get_model().size());
             phase = "Publish";
             maybe_publish_camera_loss_heatmap(iter);
             if (evaluator_ && evaluator_->should_evaluate(iter)) {

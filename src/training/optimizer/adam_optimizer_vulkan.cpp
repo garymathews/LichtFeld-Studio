@@ -10,6 +10,7 @@
 #if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
 #endif
+#include "core/logger.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
 #include <algorithm>
 #include <cmath>
@@ -37,6 +38,12 @@ namespace lfs::training {
         auto& state = states_.at(param_name(type));
         if (!state.exp_avg.is_valid() || !state.exp_avg.numel())
             return;
+        // Relocation rebuilds the packed state from scratch, so bring it up to date and
+        // let the next update re-derive the fp32 moments.
+        flush_moments_to_packed();
+        state.moments_first = {};
+        state.moments_second = {};
+        state.packed_current = true;
         const size_t n = splat_data_.size();
         core::internal::assert_index_tensor(indices, n, "Adam reset", true);
         const auto selected = (indices.device() == Device::GPU ? indices : indices.to(Device::GPU)).to(DataType::Int32);
@@ -208,7 +215,60 @@ namespace lfs::training {
         joint_adam::encode_tensor({first, second}, packed, bounds, state.joint_bits, 256 * attributes, valid.is_valid() ? &valid : nullptr);
     }
 
+    void AdamOptimizer::ensure_fp32_moments(ParamType type) {
+        auto* state = get_state_mutable(type);
+        if (state == nullptr || !state->is_joint() || !state->exp_avg.is_valid())
+            return;
+        const size_t n = splat_data_.size();
+        const size_t slots = slots_for(type, splat_data_);
+        const size_t attributes = slots
+                                      ? slots * 4
+                                      : state->exp_avg.numel() / (n * joint_adam::bytes_per_cell(state->joint_bits));
+        // Geometry check instead of an invalidation call at every grow site: any
+        // reallocation changes the row count, which forces a fresh decode.
+        if (state->moments_first.is_valid() && state->moments_first.shape() == TensorShape{n, attributes} &&
+            state->moments_second.is_valid())
+            return;
+        auto decoded = read_moment_rows(type, n, 0, n);
+        state->moments_first = decoded.first.contiguous();
+        state->moments_second = decoded.second.contiguous();
+    }
+
+    void AdamOptimizer::invalidate_fp32_moments() {
+        for (const auto type : all_param_types()) {
+            auto* state = get_state_mutable(type);
+            if (state == nullptr)
+                continue;
+            state->moments_first = {};
+            state->moments_second = {};
+            state->packed_current = true;
+        }
+    }
+
+    void AdamOptimizer::sync_moments_for_external_access() {
+        flush_moments_to_packed();
+    }
+
+    void AdamOptimizer::flush_moments_to_packed() {
+        for (const auto type : all_param_types()) {
+            auto* state = get_state_mutable(type);
+            if (state == nullptr || !state->is_joint() || !state->exp_avg.is_valid() ||
+                !state->moments_first.is_valid() || !state->moments_second.is_valid() ||
+                state->packed_current)
+                continue;
+            const size_t n = splat_data_.size();
+            if (state->moments_first.shape() != TensorShape{n, state->moments_first.shape()[1]}) {
+                // Moments do not cover the current model; let the next update rebuild them.
+                continue;
+            }
+            write_moment_range(*state, slots_for(type, splat_data_),
+                               {state->moments_first, state->moments_second}, 0);
+            state->packed_current = true;
+        }
+    }
+
     void AdamOptimizer::remap_moment_rows(ParamType type, size_t old_n, size_t n, const Tensor& mapping, bool append) {
+        flush_moments_to_packed();
         auto& state = states_.at(param_name(type));
         const auto slots = slots_for(type, splat_data_);
         const size_t bpc = joint_adam::bytes_per_cell(state.joint_bits);
@@ -272,6 +332,9 @@ namespace lfs::training {
         }
         prepared.size = logical;
         prepared.capacity = capacity;
+        prepared.moments_first = {};
+        prepared.moments_second = {};
+        prepared.packed_current = true;
         state = AdamParamState{};
         state = std::move(prepared);
     }
@@ -305,6 +368,10 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::step_param(ParamType type, int) {
+        // Opt-in per-stage attribution (--log-level perf). The optimizer step is
+        // the largest single phase of a mature Vulkan iteration, and the Adam
+        // arithmetic is a minority of it, so the surrounding stages need names.
+        LOG_TIMER("adam_step_param");
         auto& param = get_param(type);
         if (!param.is_valid() || !param.numel() ||
             (type == ParamType::ShN && !splat_data_.active_sh_coeffs_rest()))
@@ -331,12 +398,42 @@ namespace lfs::training {
         const size_t attributes = slots ? slots * 4 : param.numel() / n;
         constexpr size_t chunk_cells = 3 * 1024 * 1024;
         const size_t chunk_rows = n <= 131072 ? 131072 : std::min(size_t{1048576}, chunk_cells / attributes / 256 * 256);
+        ensure_fp32_moments(type);
         for (size_t offset = 0; offset < n; offset += chunk_rows) {
             const size_t count = std::min(chunk_rows, n - offset);
-            const auto old = read_moment_rows(type, n, offset, count);
+            // Fast path: the moments live in fp32 in memory, so the chunk needs no decode
+            // and no encode at all. Whole 32-row blocks only so each slice lines up with
+            // the stored rows. Everything else falls back to the fused decode, which reads
+            // the packed form directly in the Adam shader.
+            const bool fp32_moments = slots != 0 && count % 32 == 0 && state.moments_first.is_valid() &&
+                                      state.moments_first.shape() == TensorShape{n, attributes} &&
+                                      state.moments_second.is_valid();
+            const bool fused = !fp32_moments && slots != 0 && count % 32 == 0;
+            const auto old = [&] {
+                LOG_TIMER("adam_read_moments");
+                if (fp32_moments) {
+                    return joint_adam::TensorMoments{state.moments_first.slice(0, offset, offset + count),
+                                                     state.moments_second.slice(0, offset, offset + count)};
+                }
+                if (fused) {
+                    // Placeholders: only the shape is used, the shader decodes the
+                    // moments from the packed storage itself.
+                    return joint_adam::TensorMoments{Tensor::empty(TensorShape{count, attributes}, Device::GPU),
+                                                     Tensor::empty(TensorShape{count, attributes}, Device::GPU)};
+                }
+                return read_moment_rows(type, n, offset, count);
+            }();
             const auto shape = old.first.shape();
             const size_t cells = (slots ? ((count + 31) / 32) * 32 : count) * attributes;
-            Tensor gradient = rows_from_layout(state.grad.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells), count, slots);
+            // When the chunk fills whole 32-row blocks the packed layout needs no padding, so the
+            // gradient can be read straight from the swizzled storage with the kernel's own packed
+            // mapping and the rows_from_layout permute+materialise disappears. Padded chunks and
+            // non-SH parameters keep the old path. The delta write is not swizzled: that half
+            // diverged in testing (ledger section 105).
+            const bool swizzled_grad = slots != 0 && count % 32 == 0;
+            Tensor gradient = swizzled_grad
+                ? state.grad.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells).reshape(TensorShape{count, attributes})
+                : rows_from_layout(state.grad.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells), count, slots);
             Tensor lr_scale, enabled;
             const auto apply_mask = [&](const Tensor& mask, float scale) {
                 if (!mask.is_valid() || !mask.numel() || scale == 1.0f)
@@ -367,41 +464,79 @@ namespace lfs::training {
                 active.slice(1, 0, active_slots * 4).fill_(1.0f);
                 enabled = enabled.is_valid() ? enabled.logical_and(active) : active;
             }
+            joint_adam::TensorMoments packed_source;
+            core::internal::AdamMomentSource source;
+            if (fused) {
+                const size_t bpc = joint_adam::bytes_per_cell(state.joint_bits);
+                const size_t block_cells = 256 * attributes;
+                packed_source = {state.exp_avg.reshape({-1}).slice(0, offset * attributes * bpc,
+                                                                   offset * attributes * bpc + cells * bpc),
+                                 state.joint_bounds.slice(0, offset / 256, (offset + count + 255) / 256)};
+                source = {&packed_source.first, &packed_source.second, static_cast<uint32_t>(slots),
+                          static_cast<uint32_t>(block_cells), state.joint_bits, joint_adam::kEps};
+            }
+            if (swizzled_grad)
+                source.slots = static_cast<uint32_t>(slots);
             Tensor first = old.first, second = old.second, delta;
-            core::internal::vulkan_adam_update(first, second, delta, gradient, enabled, lr_scale,
-                                               {beta1, beta2, bc2, static_cast<float>(config_.eps), learning_rate});
+            {
+                LOG_TIMER("adam_kernel");
+                core::internal::vulkan_adam_update(first, second, delta, gradient, enabled, lr_scale,
+                                                   {beta1, beta2, bc2, static_cast<float>(config_.eps), learning_rate},
+                                                   source, swizzled_grad);
+            }
             if (slots) {
+                LOG_TIMER("adam_write_params");
                 const bool q16 = splat_data_.shN_value_quantized();
                 const size_t rest = splat_data_.max_sh_coeffs_rest();
-                Tensor values;
                 if (q16) {
                     const size_t code_start = offset * rest * 3;
                     const size_t code_count = core::sh_value_quant::sh_value_u16_count(count, rest);
                     const auto codes = param.reshape({-1}).slice(0, code_start, code_start + code_count);
                     const auto bounds = splat_data_.shN_value_bounds().reshape({-1, 2}).slice(0, offset / 256, (offset + count + 255) / 256);
-                    values = Tensor::zeros(shape, Device::GPU);
+                    Tensor values = Tensor::zeros(shape, Device::GPU);
                     values.slice(1, 0, rest * 3).copy_from(core::sh_value_quant::decode_shN_u16_to_canonical_tensor(codes, bounds, count, rest).reshape(TensorShape{count, rest * 3}));
+                    const auto swizzled = layout_from_rows(values - delta, slots);
+                    Tensor encoded, encoded_bounds;
+                    core::sh_value_quant::encode_shN_float4_to_u16_tensor(swizzled, count, slots, rest * 3, encoded, encoded_bounds);
+                    param.reshape({-1}).slice(0, offset * rest * 3, offset * rest * 3 + encoded.numel()).copy_from(encoded.reshape({-1}));
+                    splat_data_.shN_value_bounds().reshape({-1, 2}).slice(0, offset / 256, (offset + count + 255) / 256).copy_from(encoded_bounds);
                 } else {
-                    values = param.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells).to(DataType::Float32);
-                }
-                const Tensor updated = (q16 ? values : rows_from_layout(values, count, slots)) - delta;
-                const auto swizzled = layout_from_rows(updated, slots);
-                if (q16) {
-                    Tensor codes, bounds;
-                    core::sh_value_quant::encode_shN_float4_to_u16_tensor(swizzled, count, slots, rest * 3, codes, bounds);
-                    param.reshape({-1}).slice(0, offset * rest * 3, offset * rest * 3 + codes.numel()).copy_from(codes.reshape({-1}));
-                    splat_data_.shN_value_bounds().reshape({-1, 2}).slice(0, offset / 256, (offset + count + 255) / 256).copy_from(bounds);
-                } else {
-                    param.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells).copy_from(swizzled.to(param.dtype()));
+                    // The parameter storage is already in the swizzled order, and a
+                    // permutation commutes with elementwise subtraction, so the
+                    // un-swizzle/re-swizzle pair that used to bracket the update
+                    // collapses exactly:
+                    //     P(P^-1(values) - delta) == values - P(delta)
+                    // That removes one full read/write pass over the chunk plus the
+                    // materializing copy behind it, without changing any arithmetic.
+                    auto range = param.reshape({-1}).slice(0, offset * attributes, offset * attributes + cells);
+                    const Tensor flat_delta = layout_from_rows(delta, slots);
+                    if (range.dtype() == DataType::Float32) {
+                        range.sub_(flat_delta);
+                    } else {
+                        range.copy_from((range.to(DataType::Float32) - flat_delta).to(range.dtype()));
+                    }
                 }
             } else {
+                LOG_TIMER("adam_write_params");
                 auto range = param.slice(0, offset, offset + count);
-                range.copy_from((range.reshape(shape) - delta).reshape(range.shape()));
+                // Same collapse as the swizzled branch: update the parameter in place
+                // instead of materializing the difference and copying it back.
+                range.sub_(delta.reshape(range.shape()));
             }
-            write_moment_range(state, slots, {first, second}, offset);
+            if (fp32_moments) {
+                // first/second are this chunk's views into the state moments and the kernel now
+                // updates moments where they already are, so there is nothing to fold back. The
+                // packed form is stale until it is refreshed.
+                state.packed_current = false;
+            } else {
+                LOG_TIMER("adam_write_moments");
+                write_moment_range(state, slots, {first, second}, offset);
+            }
             // Release this chunk's queued temporaries before producing the next.
-            if (n > chunk_rows)
+            if (n > chunk_rows) {
+                LOG_TIMER("adam_drain");
                 core::with_idle_vulkan_device([](const auto&) {});
+            }
         }
         state.step_count = next_step;
     }

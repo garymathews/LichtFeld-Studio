@@ -127,6 +127,39 @@
 #endif
 
 namespace lfs::training {
+    namespace {
+        /// Reproducible-artifact mode, opt-in through SOURCE_DATE_EPOCH - the established convention
+        /// for reproducible builds (Debian, gcc, Python and others read it for the same reason).
+        ///
+        /// Enabled, identities are derived from the invocation instead of drawn at random and
+        /// timestamps come from the pinned epoch, so the same build and invocation produce
+        /// identical artifacts. Disabled - the default - every value is generated exactly as
+        /// before, which matters because crash recovery orders candidates by save time
+        /// (project_recovery.cpp:1585) and must see real times.
+        [[nodiscard]] std::optional<std::uint64_t> reproducible_epoch_ns() {
+            return lfs::core::reproducible_epoch_seconds().has_value()
+                       ? std::optional{lfs::core::reproducible_epoch_ns()}
+                       : std::nullopt;
+        }
+
+        [[nodiscard]] bool reproducible_artifacts() {
+            return lfs::core::reproducible_artifacts();
+        }
+
+        /// Identity derived from what an artifact *is*. The container requires the project and file
+        /// identities to be non-nil and self-consistent (project_container.cpp:446, :607); it never
+        /// requires them to be unique or random, and sidecars associate with their master by
+        /// project_uuid (project_recovery.cpp:179).
+        [[nodiscard]] lfs::core::Uuid derive_artifact_uuid(const std::string_view seed) {
+            return lfs::core::derive_uuid_from_seed(seed);
+        }
+
+        /// Identity that is derived in reproducible mode and generated otherwise.
+        [[nodiscard]] lfs::core::Uuid artifact_uuid(const std::string_view seed) {
+            return reproducible_artifacts() ? derive_artifact_uuid(seed)
+                                            : lfs::core::generate_uuid_v4();
+        }
+    } // namespace
 
     namespace {
         constexpr float CAMERA_LOSS_EMA_ALPHA = 0.2f;
@@ -4285,8 +4318,11 @@ namespace lfs::training {
 
         auto chapters =
             std::make_shared<ProjectSnapshotChapters>();
-        chapters->snapshot_uuid =
-            lfs::core::generate_uuid_v4();
+        chapters->snapshot_uuid = artifact_uuid(std::format(
+            "lfs.snapshot|{}|{}|{}",
+            lfs::core::path_to_utf8(requested_project_path_.value_or(std::filesystem::path{})),
+            requested_project_base_commit_uuid_.to_string(),
+            requested_project_autosave_sequence_));
         return chapters;
     }
 
@@ -4433,6 +4469,9 @@ namespace lfs::training {
         const lfs::core::Uuid
             base_explicit_commit_uuid,
         const std::uint64_t autosave_sequence) {
+        project_uuid_ = artifact_uuid(std::format(
+            "lfs.project|{}|{}", lfs::core::path_to_utf8(requested_path),
+            base_explicit_commit_uuid.to_string()));
         join_finished_project_writer();
 #if !LFS_TENSOR_CUDA
         if (auto health = lfs::core::vulkan_backend_status(); !health) {
@@ -5157,17 +5196,7 @@ namespace lfs::training {
                         const auto create_fresh_document =
                             [&]()
                             -> lfs::Result<void> {
-                            const auto created_ns =
-                                static_cast<std::uint64_t>(
-                                    std::chrono::
-                                        duration_cast<
-                                            std::chrono::
-                                                nanoseconds>(
-                                            std::chrono::
-                                                system_clock::
-                                                    now()
-                                                        .time_since_epoch())
-                                            .count());
+                            const auto created_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                             auto created =
                                 lfs::io::project::
                                     ProjectDocument::create(
@@ -5468,17 +5497,7 @@ namespace lfs::training {
                             }
                         }
 
-                        const auto wallclock_ns =
-                            static_cast<std::uint64_t>(
-                                std::chrono::
-                                    duration_cast<
-                                        std::chrono::
-                                            nanoseconds>(
-                                        std::chrono::
-                                            system_clock::
-                                                now()
-                                                    .time_since_epoch())
-                                        .count());
+                        const auto wallclock_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                         const lfs::io::project::
                             ProjectDocumentSaveOptions
                                 save_options{
@@ -5494,8 +5513,10 @@ namespace lfs::training {
                                                            : lfs::io::project::
                                                                  CommitKind::Explicit),
                                             .commit_uuid =
-                                                lfs::core::
-                                                    generate_uuid_v4(),
+                                                artifact_uuid(std::format(
+                                                    "lfs.commit|{}|{}",
+                                                    lfs::core::path_to_utf8(path),
+                                                    captured->snapshot_uuid.to_string())),
                                             .snapshot_uuid =
                                                 captured
                                                     ->snapshot_uuid,
@@ -5507,8 +5528,14 @@ namespace lfs::training {
                                                 {},
                                         },
                                     .file_uuid =
-                                        lfs::core::
-                                            generate_uuid_v4(),
+                                        artifact_uuid(std::format(
+                                            "lfs.file|{}|{}",
+                                            lfs::core::path_to_utf8(path),
+                                            project_uuid_.to_string())),
+                                    // 0 leaves the writer to stamp the wall clock, which is what
+                                    // default mode wants; the pinned epoch makes it reproducible.
+                                    .save_as_creation_time_unix_ns =
+                                        reproducible_epoch_ns().value_or(0),
                                     .save_as_project_uuid =
                                         document_context
                                             ? document_context
@@ -5561,8 +5588,10 @@ namespace lfs::training {
                                         lfs::io::project::
                                             ProjectDocumentAutosaveOptions{
                                                 .file_uuid =
-                                                    lfs::core::
-                                                        generate_uuid_v4(),
+                                                    artifact_uuid(std::format(
+                                                        "lfs.sidecar|{}|{}",
+                                                        lfs::core::path_to_utf8(lfs::io::project::autosave_sidecar_path(path)),
+                                                        project_uuid_.to_string())),
                                                 .base_explicit_commit_uuid =
                                                     base_explicit_commit_uuid,
                                                 .autosave_sequence =
@@ -5719,28 +5748,8 @@ namespace lfs::training {
                         write_kind !=
                             ProjectSnapshotWriteKind::
                                 Autosave) {
-                        const auto compact_creation_ns =
-                            static_cast<std::uint64_t>(
-                                std::chrono::
-                                    duration_cast<
-                                        std::chrono::
-                                            nanoseconds>(
-                                        std::chrono::
-                                            system_clock::
-                                                now()
-                                                    .time_since_epoch())
-                                        .count());
-                        const auto compact_wallclock_ns =
-                            static_cast<std::uint64_t>(
-                                std::chrono::
-                                    duration_cast<
-                                        std::chrono::
-                                            nanoseconds>(
-                                        std::chrono::
-                                            system_clock::
-                                                now()
-                                                    .time_since_epoch())
-                                        .count());
+                        const auto compact_creation_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
+                        const auto compact_wallclock_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                         auto compacted =
                             lfs::io::project::
                                 ProjectWriter::compact(
@@ -5750,11 +5759,15 @@ namespace lfs::training {
                                             .compatibility =
                                                 {},
                                             .new_file_uuid =
-                                                lfs::core::
-                                                    generate_uuid_v4(),
+                                                artifact_uuid(std::format(
+                                                    "lfs.file|{}|{}",
+                                                    lfs::core::path_to_utf8(path),
+                                                    project_uuid_.to_string())),
                                             .commit_uuid =
-                                                lfs::core::
-                                                    generate_uuid_v4(),
+                                                artifact_uuid(std::format(
+                                                    "lfs.compaction.commit|{}|{}",
+                                                    lfs::core::path_to_utf8(path),
+                                                    project_uuid_.to_string())),
                                             .snapshot_uuid =
                                                 {},
                                             .creation_time_unix_ns =

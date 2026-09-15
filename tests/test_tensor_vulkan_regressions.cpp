@@ -4,6 +4,10 @@
 #include "core/cuda/sh_layout.cuh"
 #include "core/nn.hpp"
 #include "core/tensor_backend.hpp"
+#include "core/tensor/internal/joint_moments.hpp"
+#include "core/tensor/internal/mcmc_noise.hpp"
+#include "core/vulkan_phase_timing.hpp"
+#include "training/kernels/mcmc_tensor.hpp"
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -15,8 +19,10 @@
 #include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <limits>
 #include <optional>
+#include <numbers>
 
 using namespace lfs::core;
 
@@ -32,6 +38,208 @@ namespace {
         std::optional<GpuBackendScope> backend_;
     };
 } // namespace
+
+TEST_F(VulkanTensorRegression, FusedMomentDecodeMatchesSeparateDecode) {
+    // The optimizer can let the Adam shader decode the joint-moment codec instead of
+    // running the decode kernel first. That is only worth having if it reproduces the
+    // separate decode bit for bit, including the swizzled packed layout.
+    constexpr size_t rows = 256, slots = 12, lanes = 32, attributes = slots * 4, blocks = rows / lanes;
+    constexpr size_t cells = rows * attributes;
+    constexpr int bits = 8;
+    constexpr size_t block_cells = 256 * attributes;
+    const auto to_rows = [&](const Tensor& flat) {
+        return flat.reshape(TensorShape{blocks, slots, lanes, 4}).permute({0, 2, 1, 3}).contiguous()
+            .reshape(TensorShape{rows, attributes});
+    };
+    const auto to_flat = [&](const Tensor& row_major) {
+        return row_major.reshape(TensorShape{blocks, lanes, slots, 4}).permute({0, 2, 1, 3}).contiguous()
+            .reshape(TensorShape{rows, attributes});
+    };
+    const auto index = Tensor::arange(0.f, static_cast<float>(cells));
+    const auto second_1d = ((index.mod(Tensor::full({1}, 11.f, Device::GPU, DataType::Float32)) + 1.f) * 0.25f).to(DataType::Float32);
+    const auto first_1d = (((index - static_cast<float>(cells) * 0.5f) * 0.01f) * (second_1d + 1.f)).to(DataType::Float32);
+    const auto gradient_1d = ((index - static_cast<float>(cells) * 0.25f) * 0.003f).to(DataType::Float32);
+    const auto second_flat = second_1d.reshape(TensorShape{rows, attributes});
+    const auto first_flat = first_1d.reshape(TensorShape{rows, attributes});
+    const auto gradient = gradient_1d.reshape(TensorShape{rows, attributes});
+    auto packed = Tensor::zeros({cells * 2}, Device::GPU, DataType::UInt8);
+    auto bounds = Tensor::zeros({rows / 256, 4}, Device::GPU);
+    ASSERT_TRUE(internal::try_encode_joint_moments(first_flat, second_flat, packed, bounds, bits, block_cells, 1e-15f, nullptr));
+    // The reference decodes through the codec first and permutes into the row-major
+    // order the Adam step uses; the fused run is handed only the packed storage and is
+    // expected to land on exactly the same values.
+    Tensor decoded_first, decoded_second;
+    ASSERT_TRUE(internal::try_decode_joint_moments(packed, bounds, bits, block_cells, 1e-15f,
+                                                   decoded_first, decoded_second));
+    const auto first_rows = to_rows(decoded_first);
+    const auto second_rows = to_rows(decoded_second);
+    const auto gradient_rows = to_rows(gradient);
+    const internal::AdamUpdateConfig config{0.9f, 0.999f, 1.0f, 1e-8f, 1e-3f};
+
+    auto ref_first = first_rows.clone(), ref_second = second_rows.clone(), ref_delta = Tensor{};
+    internal::vulkan_adam_update(ref_first, ref_second, ref_delta, gradient_rows, Tensor{}, Tensor{},
+                                 config);
+
+    auto fused_first = Tensor::empty(TensorShape{rows, attributes}, Device::GPU);
+    auto fused_second = Tensor::empty(TensorShape{rows, attributes}, Device::GPU);
+    auto fused_delta = Tensor{};
+    const internal::AdamMomentSource source{&packed, &bounds, static_cast<uint32_t>(slots),
+                                           static_cast<uint32_t>(block_cells), bits, 1e-15f};
+    internal::vulkan_adam_update(fused_first, fused_second, fused_delta, gradient_rows, Tensor{}, Tensor{},
+                                 config, source);
+
+    const auto compare = [&](const Tensor& fused, const Tensor& reference, const char* what) {
+        const auto a = fused.contiguous().cpu().to_vector();
+        const auto b = reference.contiguous().cpu().to_vector();
+        ASSERT_EQ(a.size(), b.size());
+        size_t mismatches = 0;
+        for (size_t i = 0; i < a.size(); ++i)
+            mismatches += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        EXPECT_EQ(mismatches, 0u) << what << " differs in " << mismatches << " of " << a.size()
+                                  << " values between fused and separate moment decode";
+    };
+    compare(fused_delta, ref_delta, "delta");
+    compare(fused_first, ref_first, "first moment");
+    compare(fused_second, ref_second, "second moment");
+}
+
+TEST_F(VulkanTensorRegression, SwizzlePermutationCommutesWithSliceUpdate) {
+    // The Vulkan Adam parameter write relies on two properties:
+    //   P(P^-1(values) - delta) == values - P(delta)
+    // so the un-swizzle/re-swizzle pair around the update can be dropped, and
+    // in-place subtraction through a view writes into the parent storage.
+    constexpr size_t rows = 256, slots = 12, lanes = 32, attributes = slots * 4, blocks = rows / lanes;
+    const size_t cells = rows * attributes;
+    const auto to_rows = [&](const Tensor& flat) {
+        return flat.reshape(TensorShape{blocks, slots, lanes, 4}).permute({0, 2, 1, 3}).contiguous()
+            .reshape(TensorShape{rows, attributes});
+    };
+    const auto to_flat = [&](const Tensor& row_major) {
+        return row_major.reshape(TensorShape{blocks, lanes, slots, 4}).permute({0, 2, 1, 3}).contiguous().reshape({-1});
+    };
+    const auto values = Tensor::arange(0.f, static_cast<float>(cells)).to(DataType::Float32);
+    const auto delta = to_rows(Tensor::arange(0.f, static_cast<float>(cells)).to(DataType::Float32)) * 0.25f;
+
+    const auto expected = values - to_flat(delta);
+    const auto composed = to_flat(to_rows(values) - delta);
+    ASSERT_EQ(composed.numel(), expected.numel());
+    const auto composed_host = composed.cpu().to_vector();
+    const auto expected_host = expected.cpu().to_vector();
+    EXPECT_EQ(std::memcmp(composed_host.data(), expected_host.data(), cells * sizeof(float)), 0)
+        << "swizzle round trip is not exact"
+        << " max |diff| = " << (composed - expected).abs().max().item<float>();
+
+    auto in_place = values.clone();
+    auto view = in_place.slice(0, 0, cells);
+    ASSERT_TRUE(view.is_contiguous());
+    view.sub_(to_flat(delta));
+    const auto in_place_host = in_place.cpu().to_vector();
+    EXPECT_EQ(std::memcmp(in_place_host.data(), expected_host.data(), cells * sizeof(float)), 0)
+        << "in-place view update did not match the materialized form";
+}
+
+TEST_F(VulkanTensorRegression, FusedMcmcNoiseMatchesSeededCovarianceReference) {
+    float max_reference_difference = 0.f;
+    for (const size_t count : {1, 31, 32, 33, 255, 256, 257}) {
+        for (const uint64_t seed : {0ULL, 1ULL, 0xfedcba9876543210ULL}) {
+            SCOPED_TRACE(::testing::Message() << count << "/" << seed);
+            std::vector<float> opacity(count, -5.f), scales(count * 3), quats(count * 4), initial(count * 3), frozen(count);
+            for (size_t i = 0; i < count; ++i) {
+                frozen[i] = i % 7 == 1;
+                for (size_t j = 0; j < 3; ++j) {
+                    scales[i * 3 + j] = -float(j + 1) * .5f;
+                    initial[i * 3 + j] = float(j) * .25f;
+                }
+                for (size_t j = 0; j < 4; ++j)
+                    quats[i * 4 + j] = i % 5 == 0 ? 0.f : float(int((i + j) % 9) - 4) * .3f;
+            }
+            auto draws = Tensor::empty({2, count * 3}, Device::GPU);
+            draws.uniform_(0.f, 1.f, seed);
+            const auto uniforms = draws.cpu().to_vector();
+            auto means = Tensor::from_vector(initial, {count, 3}, Device::GPU);
+            internal::vulkan_mcmc_noise(Tensor::from_vector(opacity, {count}, Device::GPU),
+                                        Tensor::from_vector(scales, {count, 3}, Device::GPU),
+                                        Tensor::from_vector(quats, {count, 4}, Device::GPU), means,
+                                        Tensor::from_vector(frozen, {count}, Device::GPU).to(DataType::Bool), .1f, seed);
+            const auto actual = means.cpu().to_vector();
+            auto reference = Tensor::from_vector(initial, {count, 3}, Device::GPU);
+            const auto noise = ((draws.slice(0, 0, 1).squeeze(0).clamp_min(1e-7f).log() * -2.f).sqrt() *
+                                (draws.slice(0, 1, 2).squeeze(0) * (2.f * std::numbers::pi_v<float>)).cos()).reshape(reference.shape());
+            lfs::training::mcmc::add_noise(Tensor::from_vector(opacity, {count}, Device::GPU),
+                                          Tensor::from_vector(scales, {count, 3}, Device::GPU),
+                                          Tensor::from_vector(quats, {count, 4}, Device::GPU), noise, reference,
+                                          Tensor::from_vector(frozen, {count}, Device::GPU).to(DataType::Bool), .1f);
+            const auto previous = reference.cpu().to_vector();
+            for (size_t i = 0; i < actual.size(); ++i)
+                max_reference_difference = std::max(max_reference_difference, std::abs(actual[i] - previous[i]));
+            for (size_t i = 0; i < count; ++i) {
+                double q[4], squared_norm = 0;
+                for (size_t j = 0; j < 4; ++j) squared_norm += double(quats[i * 4 + j]) * quats[i * 4 + j];
+                for (size_t j = 0; j < 4; ++j) q[j] = quats[i * 4 + j] * std::min(1.0 / std::sqrt(squared_norm), 1e12);
+                const double w = q[0], x = q[1], y = q[2], z = q[3];
+                const double rotation[3][3] = {{1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)},
+                                                {2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)},
+                                                {2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)}};
+                double noise[3];
+                for (size_t j = 0; j < 3; ++j)
+                    noise[j] = std::sqrt(-2.0 * std::log(std::max(double(uniforms[i * 3 + j]), 1e-7))) *
+                               std::cos(2.0 * std::numbers::pi * uniforms[count * 3 + i * 3 + j]);
+                const double factor = .1 / (1 + std::exp(100 / (1 + std::exp(-double(opacity[i]))) - .5));
+                // Form the covariance independently, in double precision.
+                for (size_t row = 0; row < 3; ++row) {
+                    double delta = 0;
+                    for (size_t col = 0; col < 3; ++col) {
+                        double covariance = 0;
+                        for (size_t axis = 0; axis < 3; ++axis)
+                            covariance += rotation[row][axis] * std::exp(2.0 * scales[i * 3 + axis]) * rotation[col][axis];
+                        delta += covariance * noise[col];
+                    }
+                    if (frozen[i]) EXPECT_EQ(actual[i * 3 + row], initial[i * 3 + row]);
+                    else EXPECT_NEAR(actual[i * 3 + row], initial[i * 3 + row] + factor * delta, 2e-6);
+                }
+            }
+        }
+    }
+    EXPECT_LE(max_reference_difference, 2e-6f);
+    std::cout << "Maximum fused/unfused noise update difference: " << max_reference_difference << '\n';
+}
+
+TEST_F(VulkanTensorRegression, PhaseTimestampsFollowSubmittedWork) {
+    // The GPU phase timing used to attribute the training loop must produce device
+    // timestamps that advance with submitted work, not host call time. Without this the
+    // per-phase numbers cannot be trusted at all, which is what made the backward look
+    // expensive while its body and cooperative loads turned out to be free.
+    lfs::core::vulkan_phase_timing_begin(64);
+    if (!lfs::core::vulkan_phase_timing_supported()) {
+        lfs::core::vulkan_phase_timing_end();
+        GTEST_SKIP() << "device cannot write timestamps";
+    }
+
+    std::vector<Tensor> results;
+    constexpr int kBoundaries = 3;
+    for (int step = 0; step < kBoundaries; ++step) {
+        lfs::core::vulkan_phase_timing_announce(static_cast<std::uint32_t>(step));
+        // Real work between boundaries so the stamps must advance.
+        auto value = Tensor::full({1u << 20}, 1.0f, Device::GPU);
+        for (int repeat = 0; repeat < 4; ++repeat)
+            value = value + 1.0f;
+        results.push_back(value);
+    }
+    // Drain before reading: the stamps are only valid once the submissions completed.
+    for (const auto& result : results)
+        (void)result.slice(0, 0, 1).cpu().to_vector();
+
+    const auto stamps = lfs::core::vulkan_phase_timestamps();
+    lfs::core::vulkan_phase_timing_end();
+    ASSERT_EQ(stamps.size(), size_t{kBoundaries});
+    for (size_t i = 0; i < stamps.size(); ++i)
+        EXPECT_EQ(stamps[i].tag, i);
+    for (size_t i = 1; i < stamps.size(); ++i)
+        EXPECT_GE(stamps[i].gpu_ms, stamps[i - 1].gpu_ms)
+            << "device timestamps went backwards between boundaries " << i - 1 << " and " << i;
+    EXPECT_GT(stamps.back().gpu_ms - stamps.front().gpu_ms, 0.0)
+        << "the device clock did not advance across submitted work";
+}
 
 TEST_F(VulkanTensorRegression, FloatingMaskedFillPreservesInfinity) {
     auto values = Tensor::zeros({4}, Device::GPU);

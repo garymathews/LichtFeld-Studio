@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "mcmc_tensor.hpp"
 #include "core/tensor_backend.hpp"
+#include "core/tensor/internal/mcmc_noise.hpp"
 #include <cmath>
 #include <numbers>
 #include <stdexcept>
@@ -90,6 +91,10 @@ namespace lfs::training::mcmc {
     void inject_noise(const Tensor& raw_opacities, const Tensor& raw_scales, const Tensor& raw_quats,
                       Tensor& means, const Tensor& frozen_mask, const float learning_rate, const uint64_t seed) {
         GpuBackendScope backend(gpu_backend_of(means).value_or(default_gpu_backend()));
+        if (gpu_backend_of(means) == GpuBackend::Vulkan) {
+            internal::vulkan_mcmc_noise(raw_opacities, raw_scales, raw_quats, means, frozen_mask, learning_rate, seed);
+            return;
+        }
         auto draws = Tensor::empty({2, means.numel()}, means.device());
         draws.uniform_(0.f, 1.f, seed);
         // Box-Muller from the existing explicitly seeded Philox uniform kernel.

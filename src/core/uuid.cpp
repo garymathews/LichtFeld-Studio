@@ -136,6 +136,14 @@ namespace lfs::core {
 
     Uuid generate_uuid_v4() {
         Uuid result;
+        // In reproducible mode every generated identity is derived from the pinned epoch and the
+        // order of generation, so an identical invocation produces an identical sequence. Default
+        // mode is untouched and still uses the OS CSPRNG.
+        if (const auto epoch = reproducible_epoch_seconds()) {
+            static std::uint64_t reproducible_sequence = 0;
+            return derive_uuid_from_seed(std::format(
+                "lfs.sequence|{}|{}", *epoch, ++reproducible_sequence));
+        }
         fillRandomBytes(result.bytes);
         result.bytes[6] = static_cast<std::uint8_t>((result.bytes[6] & 0x0f) | 0x40);
         result.bytes[8] = static_cast<std::uint8_t>((result.bytes[8] & 0x3f) | 0x80);

@@ -52,6 +52,12 @@ namespace lfs::training {
         std::array<Tensor, 6> parameters, raw_gradients;
         std::filesystem::path shader_directory;
         Tensor background, pixels, visibility, screen_share;
+        // The backward accumulates its per-splat adjoints and its densification statistics as
+        // scaled integers so neither can depend on atomic scheduling order. The adjoint storage is
+        // owned here - the renderer only validates and clears these fields - and holds two int32
+        // words per value, so its element count is twice the value count. The statistics scratch is
+        // int32 and is scaled back into the canonical Float32 tensor after the regions.
+        Tensor adjoint_xy_vs, adjoint_inv_cov_vs, adjoint_rgb, densification_statistics;
         std::unordered_set<VkBuffer> external_parents;
         bool pending_backward = false;
         VulkanGSRenderer::TileInstanceGate last_gate{};
@@ -255,10 +261,30 @@ namespace lfs::training {
             throw std::invalid_argument("Vulkan densification needs a Float32 HW error map and 2N model statistics");
         impl.pending_backward = false;
         // The last forward region is still resident in the renderer.
+        if (!impl.adjoint_xy_vs.is_valid() || impl.adjoint_xy_vs.numel() != 4 * n)
+            impl.adjoint_xy_vs = Tensor::empty(TensorShape{4 * n}, Device::GPU);
+        if (!impl.adjoint_inv_cov_vs.is_valid() || impl.adjoint_inv_cov_vs.numel() != 8 * n)
+            impl.adjoint_inv_cov_vs = Tensor::empty(TensorShape{8 * n}, Device::GPU);
+        if (!impl.adjoint_rgb.is_valid() || impl.adjoint_rgb.numel() != 6 * n)
+            impl.adjoint_rgb = Tensor::empty(TensorShape{6 * n}, Device::GPU);
+        impl.bind(impl.gradient_buffers.xy_vs, tensor_vulkan_write_buffer(impl.adjoint_xy_vs).value());
+        impl.bind(impl.gradient_buffers.inv_cov_vs_opacity,
+                  tensor_vulkan_write_buffer(impl.adjoint_inv_cov_vs).value());
+        impl.bind(impl.gradient_buffers.rgb, tensor_vulkan_write_buffer(impl.adjoint_rgb).value());
+        if (error_map.is_valid()) {
+            const auto stat_shape = TensorShape{2, n};
+            if (!impl.densification_statistics.is_valid() ||
+                impl.densification_statistics.shape() != stat_shape)
+                impl.densification_statistics = Tensor::empty(stat_shape, Device::GPU, DataType::Int32);
+            impl.densification_statistics.zero_();
+        }
+        const ParamType types[] = {ParamType::Means, ParamType::Sh0, ParamType::ShN, ParamType::Rotation, ParamType::Scaling, ParamType::Opacity};
+        const bool single_region = impl.regions.size() == 1;
         for (auto it = impl.regions.rbegin(); it != impl.regions.rend(); ++it) {
             const auto& region = *it;
+            const bool first_region = it == impl.regions.rbegin();
             auto gate = impl.last_gate;
-            if (it != impl.regions.rbegin()) {
+            if (!first_region) {
                 gate = impl.render(region);
                 if (gate.count_overflow || gate.raw_count > impl.max_tile_instances)
                     throw std::runtime_error("Training region changed between forward and backward");
@@ -275,17 +301,28 @@ namespace lfs::training {
             if (error_map.is_valid()) {
                 region_errors = error_map.slice(0, region.y, region.y + region.height).slice(1, region.x, region.x + region.width).contiguous();
                 error_view = tensor_vulkan_buffer(region_errors);
-                density_view = tensor_vulkan_write_buffer(impl.model->_densification_info);
+                density_view = tensor_vulkan_write_buffer(impl.densification_statistics);
             }
             auto& raw_gradients = impl.raw_gradients;
             std::array<TensorVulkanBuffer, 6> views;
             for (size_t i = 0; i < views.size(); ++i) {
-                // Projection writes live SH coefficients; padding and inactive
-                // lanes must contribute zero when regions are accumulated.
+                // Allocating zeroed covers the first use. Afterwards no host-side clear is
+                // needed: `projection_backward` is built without LFS_PROJECTION_SURVIVORS, so
+                // it dispatches every lane in [0, num_splats) and its epilogue writes all six
+                // outputs unconditionally (zero-initialising `grad` for a splat no tile
+                // reached). Every region therefore replaces the whole buffer before the host
+                // accumulates it, and clearing first only cost six dispatches and ~236 MB of
+                // stores per iteration at 1M splats.
+                // The first processed region needs no accumulation either, so it can also write
+                // straight into the optimizer gradient; later regions fold in via add_.
+                const bool direct = (single_region || first_region) &&
+                    !(types[i] == ParamType::ShN && model.max_sh_coeffs_rest() == 0);
+                if (direct) {
+                    views[i] = tensor_vulkan_write_buffer(optimizer.get_grad(types[i])).value();
+                    continue;
+                }
                 if (!raw_gradients[i].is_valid() || raw_gradients[i].shape() != impl.parameters[i].shape())
                     raw_gradients[i] = Tensor::zeros(impl.parameters[i].shape(), Device::GPU);
-                else
-                    raw_gradients[i].zero_();
                 views[i] = tensor_vulkan_write_buffer(raw_gradients[i]).value();
             }
             with_idle_vulkan_device([&](const VulkanExternalDevice& device) {
@@ -320,13 +357,22 @@ namespace lfs::training {
                     throw;
                 }
             });
-            const ParamType types[] = {ParamType::Means, ParamType::Sh0, ParamType::ShN, ParamType::Rotation, ParamType::Scaling, ParamType::Opacity};
-            for (size_t i = 0; i < raw_gradients.size(); ++i) {
-                if (types[i] == ParamType::ShN && impl.model->max_sh_coeffs_rest() == 0)
-                    continue;
-                auto& gradient = optimizer.get_grad(types[i]);
-                gradient.add_(raw_gradients[i].reshape(gradient.shape()));
+            if (!single_region && !first_region) {
+                for (size_t i = 0; i < raw_gradients.size(); ++i) {
+                    if (types[i] == ParamType::ShN && impl.model->max_sh_coeffs_rest() == 0)
+                        continue;
+                    auto& gradient = optimizer.get_grad(types[i]);
+                    gradient.add_(raw_gradients[i].reshape(gradient.shape()));
+                }
             }
+        }
+        {
+            constexpr float kDensificationStatScale = 65536.0f;  // matched pair with the shader
+            auto& canonical = impl.model->_densification_info;
+            if (impl.densification_statistics.is_valid() && canonical.is_valid() &&
+                impl.densification_statistics.shape() == canonical.shape())
+                canonical.copy_from(impl.densification_statistics.to(DataType::Float32) *
+                                    (1.0f / kDensificationStatScale));
         }
         // Forward-only evaluation must not influence subsequent scale clipping.
         if (impl.screen_share.is_valid())

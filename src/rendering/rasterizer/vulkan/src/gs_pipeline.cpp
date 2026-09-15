@@ -4,6 +4,7 @@
 #include "core/error.hpp"
 #include "core/logger.hpp"
 #include "core/tensor_backend.hpp"
+#include "core/vulkan_phase_timing.hpp"
 #include "diagnostics/vram_profiler.hpp"
 
 #include <cassert>
@@ -1102,6 +1103,9 @@ void VulkanGSPipeline::waitForPendingBatchSlot(CommandBatchSlot& slot) {
     if (slot.pending_signal == VK_NULL_HANDLE || slot.pending_signal_value == 0)
         return;
 
+    // Counted with the core timeline waits so the perf bench sees the whole stall: the training
+    // forward stops here to read the tile-instance count (plan §81 phase 0).
+    const lfs::core::VulkanHostWaitScope host_wait_scope;
     {
         [[maybe_unused]] auto cpu_timer = timeCpuStage("vksplat.command_batch.wait_pending");
         if (!timelineValueComplete(slot.pending_signal, slot.pending_signal_value)) {
@@ -1558,12 +1562,12 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence,
         wait_ctx.dispatch = &vulkan_dispatch_;
         wait_ctx.fingerprint = "vksplat.pipeline.wait_post_submit_fence";
         wait_ctx.owner_quarantine_flag = &gpu_wait_quarantined_;
-        auto wait_outcome = lfs::rendering::wait_fence_bounded(
-            device,
-            fence,
-            std::stop_token{},
-            lfs::rendering::VulkanWaitPolicy{},
-            wait_ctx);
+        auto wait_outcome = [&] {
+            // Counted with the core timeline waits so the perf bench sees the whole stall (plan §81).
+            const lfs::core::VulkanHostWaitScope host_wait_scope;
+            return lfs::rendering::wait_fence_bounded(
+                device, fence, std::stop_token{}, lfs::rendering::VulkanWaitPolicy{}, wait_ctx);
+        }();
         if (!wait_outcome.has_value() ||
             *wait_outcome != lfs::rendering::WaitOutcome::Ready) {
             PerfTimer::discardMarkers(this);
