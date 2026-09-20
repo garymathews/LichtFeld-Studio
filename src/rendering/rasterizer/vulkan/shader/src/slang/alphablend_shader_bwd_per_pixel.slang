@@ -26,6 +26,14 @@ layout(binding=7) StructuredBuffer<float4> v_current_pixel_state;
 layout(binding=8) RWByteAddressBuffer v_xy_vs;
 layout(binding=9) RWByteAddressBuffer v_inv_cov_vs_opacity;
 layout(binding=10) RWByteAddressBuffer v_rgb;
+#if DENSIFICATION_MCMC
+layout(binding=11) StructuredBuffer<float> pixel_error;
+layout(binding=12) RWByteAddressBuffer densification_info;
+#endif
+
+// Scale for the integer accumulation of densification statistics. Matched pair with
+// kDensificationStatScale in the Vulkan training rasterizer's backward(); keep them equal.
+static const int kDensificationStatScale = 65536;
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -84,12 +92,17 @@ void main(
         {
             uint32_t g_idx = collected_idx[j];
             DifferentialPair<Splat_2D_AlphaBlend> dp_g;
+#if DENSIFICATION_MCMC
+            float blend_weight = 0.0f;
+            float weighted_error = 0.0f;
+#endif
             #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
                 float2 d_xy_vs = float2(0.0);
                 float4 d_inv_cov_vs_opacity = float4(0.0);
                 float3 d_rgb = float3(0.0);
             #endif
 
+            bool contributes = false;
             if (is_inside) {
                 current_splat_offset--;
                 if (current_splat_offset < n_contrib_fwd) {
@@ -99,8 +112,13 @@ void main(
                 float4 gauss_rgba = evaluate_splat(g, center_pix_coord);
                 if (gauss_rgba.a >= ALPHA_THRESHOLD) {
 
+                contributes = true;
                 // Undo pixel state
                 current_pixel_state = undo_pixel_state(current_pixel_state, gauss_rgba);
+#if DENSIFICATION_MCMC
+                blend_weight = current_pixel_state.w * gauss_rgba.a;
+                weighted_error = blend_weight * pixel_error[pix_coord.y * W + pix_coord.x];
+#endif
 
                 // Back-prop automatically through blending and gaussian evaluation.
                 dp_g = diffPair(g);
@@ -117,16 +135,12 @@ void main(
                 }}
             }
 
+            // A subgroup with no contributing pixels has only zero gradients.
+            if (!WaveActiveAnyTrue(contributes))
+                continue;
+
             // add back
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
-
-          #if SUBGROUP_REDUCE_BEFORE_ATOMIC
-            #define subgroupSumF32(temp, val) \
-                temp = WaveActiveSum(val);
-          #else
-            #define subgroupSumF32(temp, val) \
-                temp = val;
-          #endif
 
           #if SKIP_ZERO_IN_ATOMIC
             #define ifNonZero(x) if (x != 0.0)
@@ -134,44 +148,59 @@ void main(
             #define ifNonZero(x)
           #endif
 
-            float temp_p0, temp_p1;
-            float temp_s0, temp_s1, temp_s2, temp_s3;
-            float temp_c0, temp_c1, temp_c2;
-            subgroupSumF32(temp_p0, d_xy_vs.x);
-            subgroupSumF32(temp_p1, d_xy_vs.y);
-            subgroupSumF32(temp_s0, d_inv_cov_vs_opacity.x);
-            subgroupSumF32(temp_s1, d_inv_cov_vs_opacity.y);
-            subgroupSumF32(temp_s2, d_inv_cov_vs_opacity.z);
-            subgroupSumF32(temp_s3, d_inv_cov_vs_opacity.w);
-            subgroupSumF32(temp_c0, float(d_rgb.x));
-            subgroupSumF32(temp_c1, float(d_rgb.y));
-            subgroupSumF32(temp_c2, float(d_rgb.z));
           #if SUBGROUP_REDUCE_BEFORE_ATOMIC
-            // if (WaveIsFirstLane()) {
-            if (thread_rank % SUBGROUP_SIZE == 0) {
-          #else
-            if (true) {
+            d_xy_vs = WaveActiveSum(d_xy_vs);
+            d_inv_cov_vs_opacity = WaveActiveSum(d_inv_cov_vs_opacity);
+            d_rgb = WaveActiveSum(d_rgb);
+#if DENSIFICATION_MCMC
+            blend_weight = WaveActiveSum(blend_weight);
+            weighted_error = WaveActiveSum(weighted_error);
+#endif
           #endif
-              #if USE_EMULATED_F32_ATOMIC
-                #define _ATOMIC_ADD(buffer, address, value) \
-                    ifNonZero(value) AtomicAddFloat(buffer, (address)*sizeof(float), value);
-              #else
-                #define _ATOMIC_ADD(buffer, address, value) \
-                    ifNonZero(value) buffer.InterlockedAddF32((address)*sizeof(float), value);
-              #endif
-                _ATOMIC_ADD(v_xy_vs, 2*g_idx+0, temp_p0);
-                _ATOMIC_ADD(v_xy_vs, 2*g_idx+1, temp_p1);
-                _ATOMIC_ADD(v_inv_cov_vs_opacity, 4*g_idx+0, temp_s0);
-                _ATOMIC_ADD(v_inv_cov_vs_opacity, 4*g_idx+1, temp_s1);
-                _ATOMIC_ADD(v_inv_cov_vs_opacity, 4*g_idx+2, temp_s2);
-                _ATOMIC_ADD(v_inv_cov_vs_opacity, 4*g_idx+3, temp_s3);
-                _ATOMIC_ADD(v_rgb, 3*g_idx+0, temp_c0);
-                _ATOMIC_ADD(v_rgb, 3*g_idx+1, temp_c1);
-                _ATOMIC_ADD(v_rgb, 3*g_idx+2, temp_c2);
+            // Each adjoint is accumulated as two scaled int32 words: a high part at 2^12 and a low
+            // part at 2^30 carrying the residual. Both sums are exact integer additions, so neither
+            // can depend on atomic scheduling order. A single int32 would need a scale coarse
+            // enough to flush the smallest gradients to zero; the pair keeps a ~1e-9 floor and uses
+            // the native integer atomic the count/index shaders already use, since no 64-bit
+            // integer atomic is dependable on this backend.
+            #define _ATOMIC_ADD_REFINED(buffer, address, value)                          \
+                if (value != 0.0) {                                                       \
+                    const int refined_hi = int(round(value * 4096.0));                    \
+                    const int refined_lo = int(round((value - float(refined_hi) *         \
+                                                       (1.0 / 4096.0)) * 1073741824.0));   \
+                    buffer.InterlockedAdd(8u * (address), refined_hi);                    \
+                    buffer.InterlockedAdd(8u * (address) + 4u, refined_lo);               \
+                }
+            // WaveActiveSum broadcasts each result; spread independent atomics across lanes.
+          #if SUBGROUP_REDUCE_BEFORE_ATOMIC
+            const uint lane = WaveGetLaneIndex(), lane_stride = WaveGetLaneCount();
+          #else
+            const uint lane = 0, lane_stride = 1;
+          #endif
+            for (uint c = lane; c < 2; c += lane_stride) {
+                _ATOMIC_ADD_REFINED(v_xy_vs, 2*g_idx+c, d_xy_vs[c]);
             }
+            for (uint c = lane; c < 4; c += lane_stride) {
+                _ATOMIC_ADD_REFINED(v_inv_cov_vs_opacity, 4*g_idx+c, d_inv_cov_vs_opacity[c]);
+            }
+            for (uint c = lane; c < 3; c += lane_stride) {
+                _ATOMIC_ADD_REFINED(v_rgb, 3*g_idx+c, d_rgb[c]);
+            }
+#if DENSIFICATION_MCMC
+            for (uint c = lane; c < 2; c += lane_stride) {
+                const float2 gradient = float2(blend_weight, weighted_error);
+                // Integer accumulation so the statistics cannot depend on atomic ordering; the host
+                // divides by kDensificationStatScale after the backward. Matched pair.
+                const int scaled = int(round(gradient[c] * float(kDensificationStatScale)));
+                densification_info.InterlockedAdd(4u * (c * uniforms.num_splats + g_idx), scaled);
+            }
+#endif
 
         #endif  // EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
         }
         splats_left_to_process -= block_size;
+        // All subgroups must finish reading before the next round overwrites
+        // the shared splat batch. Subgroup reduction is not a workgroup fence.
+        GroupMemoryBarrierWithGroupSync();
     }
 }

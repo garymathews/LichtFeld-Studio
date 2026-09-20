@@ -17,7 +17,7 @@
 #include "io/atomic_output.hpp"
 #include "io/error.hpp"
 
-#include <cuda_runtime.h>
+#include "core/tensor_backend.hpp"
 #include <libdeflate.h>
 #include <nlohmann/json.hpp>
 #include <tbb/blocked_range.h>
@@ -4771,10 +4771,13 @@ namespace lfs::io {
         // GPU chunk quantization (bit-identical planes; DEFLATE stays on the
         // CPU). Any CUDA failure falls back permanently for this writer.
         RadGpuQuantization gpu_quantization = RadGpuQuantization::Auto;
+#if LFS_TENSOR_CUDA
         std::unique_ptr<cuda::RadEncodeGpuQuantizer> gpu_quant;
+#endif
         bool gpu_quant_resolved = false;
         std::optional<core::ProvenanceStamp> provenance;
 
+#if LFS_TENSOR_CUDA
         bool gpuQuantEnabled() {
             if (!gpu_quant_resolved) {
                 gpu_quant_resolved = true;
@@ -4785,6 +4788,7 @@ namespace lfs::io {
             }
             return gpu_quant != nullptr;
         }
+#endif
 
         void dropMetaWriter(const std::string& reason) {
             LOG_WARN("RAD sidecar inline emission disabled: {}; loader rebuilds on demand", reason);
@@ -4939,6 +4943,7 @@ namespace lfs::io {
         // Batch-quantize the pure-arithmetic planes on the GPU while the TBB
         // workers keep the libm encoders (scales, orientation) and DEFLATE.
         std::vector<cuda::RadEncodeQuantChunkOut> gpu_planes;
+#if LFS_TENSOR_CUDA
         if (s.gpuQuantEnabled()) {
             std::vector<cuda::RadEncodeQuantChunkIn> gpu_in(chunks.size());
             for (std::size_t i = 0; i < chunks.size(); ++i) {
@@ -4953,6 +4958,7 @@ namespace lfs::io {
                 LOG_WARN("RAD GPU encode quantization failed; using CPU encoders");
             }
         }
+#endif
 
         std::vector<std::pair<RadChunkMeta, std::vector<uint8_t>>> encoded(chunks.size());
         tbb::parallel_for(std::size_t{0}, chunks.size(), [&](const std::size_t i) {
@@ -5829,9 +5835,12 @@ namespace lfs::io {
         if (logical_chunks <= 1) {
             return false;
         }
-        std::size_t free_bytes = 0;
-        std::size_t total_bytes = 0;
-        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {
+        const auto backend = lfs::core::gpu_backend_of(data.means_raw());
+        if (!backend)
+            return false;
+        const auto memory = lfs::core::gpu_backend_memory_info(*backend);
+        const std::size_t free_bytes = memory.free_bytes;
+        if (free_bytes == 0) {
             return false;
         }
         const auto tensor_bytes = [](const lfs::core::Tensor& t) -> std::size_t {

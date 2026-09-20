@@ -1,3 +1,4 @@
+#include "core/tensor_backend.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gs_renderer.h"
 #include <cassert>
@@ -292,7 +293,9 @@ void VulkanGSPipeline::destroyBufferImpl(_VulkanBuffer& buffer,
         }
         // Scripted-test forge has a null allocator; skip VMA free for minted handles.
         if (allocator != VK_NULL_HANDLE) {
-            vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
+            lfs::core::retire_vulkan_resources(device, [&] {
+                vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
+            });
         }
         if (current_vram < buffer.allocSize) {
             lfs::rendering::throw_renderer_contract(

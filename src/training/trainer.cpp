@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "trainer.hpp"
+#if LFS_TENSOR_CUDA
 #include "backward.h" // BWD-A T_eff hist arm/flush
+#endif
 #include "components/bilateral_grid.hpp"
 #include "components/ppisp.hpp"
 #include "components/ppisp_controller_pool.hpp"
@@ -12,24 +14,34 @@
 #include "control/command_api.hpp"
 #include "control/control_boundary.hpp"
 #include "core/assert.hpp"
+#include "core/tensor_backend.hpp"
+#include "core/nn/ops.hpp"
+#if !LFS_TENSOR_CUDA
+#include "rasterization/vulkan_rasterizer.hpp"
+#endif
 #include "core/checked_arithmetic.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/cuda/lanczos_resize/lanczos_resize.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda/memory_arena.hpp"
 #include "core/cuda_error.hpp"
 #include "core/cuda_error_typed.hpp"
+#endif
 #include "core/environment.hpp"
 #include "core/events.hpp"
 #include "core/exif.hpp"
+#include "core/guarded_task.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/provenance.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data_transform.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/memory_pool.hpp"
 #include "core/tensor/internal/size_bucketed_pool.hpp"
+#endif
 #include "depth_anchor_cache.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "io/cache_image_loader.hpp"
@@ -53,13 +65,17 @@
 #include "normal_auto_generate.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "python/runner.hpp"
+#if LFS_TENSOR_CUDA
 #include "rasterization/fast_rasterizer.hpp"
 #include "rasterization/gsplat/Ops.h"
 #include "rasterization/gsplat_rasterizer.hpp"
+#endif
 #include "strategies/mcmc.hpp"
 #include "strategies/strategy_factory.hpp"
 #include "strategies/strategy_utils.hpp"
+#if LFS_TENSOR_CUDA
 #include "training/kernels/camera_loss_heatmap.cuh"
+#endif
 #include "training/kernels/depth_loss.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mask_preprocess.hpp"
@@ -82,11 +98,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#if LFS_TENSOR_CUDA
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
+#endif
 #include <expected>
 #include <format>
 #include <future>
@@ -95,13 +112,14 @@
 #include <mutex>
 #include <numeric>
 #include <nvtx3/nvToolsExt.h>
+#if LFS_TENSOR_CUDA
 #include <nvtx3/nvToolsExtCudaRt.h>
+#endif
 #include <optional>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
 #if defined(__linux__)
@@ -109,6 +127,39 @@
 #endif
 
 namespace lfs::training {
+    namespace {
+        /// Reproducible-artifact mode, opt-in through SOURCE_DATE_EPOCH - the established convention
+        /// for reproducible builds (Debian, gcc, Python and others read it for the same reason).
+        ///
+        /// Enabled, identities are derived from the invocation instead of drawn at random and
+        /// timestamps come from the pinned epoch, so the same build and invocation produce
+        /// identical artifacts. Disabled - the default - every value is generated exactly as
+        /// before, which matters because crash recovery orders candidates by save time
+        /// (project_recovery.cpp:1585) and must see real times.
+        [[nodiscard]] std::optional<std::uint64_t> reproducible_epoch_ns() {
+            return lfs::core::reproducible_epoch_seconds().has_value()
+                       ? std::optional{lfs::core::reproducible_epoch_ns()}
+                       : std::nullopt;
+        }
+
+        [[nodiscard]] bool reproducible_artifacts() {
+            return lfs::core::reproducible_artifacts();
+        }
+
+        /// Identity derived from what an artifact *is*. The container requires the project and file
+        /// identities to be non-nil and self-consistent (project_container.cpp:446, :607); it never
+        /// requires them to be unique or random, and sidecars associate with their master by
+        /// project_uuid (project_recovery.cpp:179).
+        [[nodiscard]] lfs::core::Uuid derive_artifact_uuid(const std::string_view seed) {
+            return lfs::core::derive_uuid_from_seed(seed);
+        }
+
+        /// Identity that is derived in reproducible mode and generated otherwise.
+        [[nodiscard]] lfs::core::Uuid artifact_uuid(const std::string_view seed) {
+            return reproducible_artifacts() ? derive_artifact_uuid(seed)
+                                            : lfs::core::generate_uuid_v4();
+        }
+    } // namespace
 
     namespace {
         constexpr float CAMERA_LOSS_EMA_ALPHA = 0.2f;
@@ -578,12 +629,12 @@ namespace lfs::training {
 
                 const size_t H = mask.shape()[0];
                 const size_t W = mask.shape()[1];
-                float* const mask_ptr = mask.ptr<float>();
+
                 if (opt_params.invert_masks) {
-                    lfs::io::cuda::launch_mask_invert(mask_ptr, H, W, nullptr);
+                    mask = mask.neg() + 1.f;
                 }
                 if (opt_params.mask_threshold > 0.0f) {
-                    lfs::io::cuda::launch_mask_threshold(mask_ptr, H, W, opt_params.mask_threshold, nullptr);
+                    mask = mask.ge(opt_params.mask_threshold).to(lfs::core::DataType::Float32);
                 }
 
                 if (camera.is_undistort_prepared()) {
@@ -624,22 +675,12 @@ namespace lfs::training {
                 auto gpu_uint8 = cpu_tensor.to(lfs::core::Device::CUDA);
                 lfs::core::free_image(img_data);
 
-                auto rgb = lfs::core::Tensor::zeros(
-                    lfs::core::TensorShape({3, H, W}),
-                    lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
-                auto mask = lfs::core::Tensor::zeros(
-                    lfs::core::TensorShape({H, W}),
-                    lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-
-                lfs::io::cuda::launch_uint8_rgba_split_to_uint8_rgb_and_float32_alpha(
-                    gpu_uint8.ptr<uint8_t>(), rgb.ptr<uint8_t>(), mask.ptr<float>(), H, W, nullptr);
-
-                if (opt_params.invert_masks) {
-                    lfs::io::cuda::launch_mask_invert(mask.ptr<float>(), H, W, nullptr);
-                }
-                if (opt_params.mask_threshold > 0.0f) {
-                    lfs::io::cuda::launch_mask_threshold(mask.ptr<float>(), H, W, opt_params.mask_threshold, nullptr);
-                }
+                auto chw = gpu_uint8.permute({2, 0, 1}).contiguous();
+                auto rgb = chw.slice(0, 0, 3).contiguous();
+                auto mask = chw.slice(0, 3, 4).squeeze(0).to(lfs::core::DataType::Float32) / 255.f;
+                if (opt_params.invert_masks) mask = mask.neg() + 1.f;
+                if (opt_params.mask_threshold > 0.f)
+                    mask = mask.ge(opt_params.mask_threshold).to(lfs::core::DataType::Float32);
 
                 if (camera.is_undistort_prepared()) {
                     const auto scaled = lfs::core::scale_undistort_params(
@@ -648,16 +689,7 @@ namespace lfs::training {
                         static_cast<int>(H));
                     auto rgb_float = rgb.to(lfs::core::DataType::Float32) / 255.0f;
                     rgb_float = lfs::core::undistort_image(rgb_float, scaled, nullptr);
-                    auto rgb_uint8 = lfs::core::Tensor::empty(
-                        rgb_float.shape(), lfs::core::Device::CUDA, lfs::core::DataType::UInt8);
-                    lfs::io::cuda::launch_float32_chw_to_uint8_chw(
-                        rgb_float.ptr<float>(),
-                        rgb_uint8.ptr<uint8_t>(),
-                        rgb_float.shape()[1],
-                        rgb_float.shape()[2],
-                        rgb_float.shape()[0],
-                        nullptr);
-                    rgb = std::move(rgb_uint8);
+                    rgb = (rgb_float.clamp(0.f, 1.f) * 255.f + .5f).to(lfs::core::DataType::UInt8);
                     mask = lfs::core::undistort_mask(mask, scaled, nullptr);
                 }
 
@@ -766,6 +798,8 @@ namespace lfs::training {
         }
 
         void record_rasterizer_arena_disclosure(std::string_view scope) {
+#if LFS_TENSOR_CUDA
+
             auto* arena = lfs::core::GlobalArenaManager::instance().try_get_arena();
             if (!arena) {
                 return;
@@ -781,10 +815,13 @@ namespace lfs::training {
                               static_cast<double>(info.arena_capacity));
             profiler.setGauge("vram.audit.rasterizer_arena.current_usage_bytes",
                               static_cast<double>(info.current_usage));
+        #endif
         }
 
         void resize_rasterizer_arena_at_boundary(std::string_view boundary,
                                                  bool release_all) {
+#if LFS_TENSOR_CUDA
+
             auto* arena = lfs::core::GlobalArenaManager::instance().try_get_arena();
             if (!arena) {
                 return;
@@ -813,6 +850,7 @@ namespace lfs::training {
                     lfs::core::GlobalArenaManager::instance().clear_external_backing();
                 }
             }
+        #endif
         }
 
         void record_vram_entries(std::string_view scope,
@@ -869,6 +907,7 @@ namespace lfs::training {
             }
         }
 
+#if LFS_TENSOR_CUDA
         void record_fastgs_vram_breakdown(const FastRasterizeContext& ctx,
                                           const RenderOutput& output,
                                           const lfs::core::Tensor& gt_tile,
@@ -953,6 +992,8 @@ namespace lfs::training {
             record_vram_tensor("train.inputs", "background_tile", bg_tile);
             record_vram_tensor("train.losses", "densification_error_map.live", tile_error_map);
         }
+
+#endif
 
         void syncTrainingSceneTopology(lfs::core::Scene* const scene,
                                        const lfs::core::SplatData& model) {
@@ -1075,9 +1116,10 @@ namespace lfs::training {
                 return config;
             }
 
-            size_t free_bytes = 0;
-            size_t total_bytes = 0;
-            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0 || total_bytes == 0) {
+            const auto memory = lfs::core::gpu_backend_memory_info(lfs::core::default_gpu_backend());
+            const size_t free_bytes = memory.free_bytes;
+            const size_t total_bytes = memory.total_bytes;
+            if (free_bytes == 0 || total_bytes == 0) {
                 config.decoder_pool_size = std::min(config.decoder_pool_size, config.jpeg_batch_size);
                 return config;
             }
@@ -1163,6 +1205,9 @@ namespace lfs::training {
     } // namespace
 
     void Trainer::release_training_transient_state_at_boundary() {
+#if !LFS_TENSOR_CUDA
+        vulkan_rasterizer_.reset();
+#endif
         // These tensors are recreated lazily by train_step. Keep the model,
         // optimizer, evaluator, and source background image for resume.
         bg_mix_buffer_ = {};
@@ -1199,6 +1244,8 @@ namespace lfs::training {
     }
 
     Trainer::CameraLossHeatmapState::~CameraLossHeatmapState() {
+#if LFS_TENSOR_CUDA
+
         if (copy_stream) {
             LFS_CUDA_LOG_TEARDOWN(cudaStreamSynchronize(copy_stream), copy_stream,
                                   "heatmap state teardown: sync copy stream");
@@ -1216,6 +1263,7 @@ namespace lfs::training {
             LFS_CUDA_LOG_TEARDOWN(cudaStreamDestroy(copy_stream), copy_stream,
                                   "heatmap state teardown: destroy copy stream");
         }
+#endif
     }
 
     void Trainer::cleanup() {
@@ -1231,10 +1279,17 @@ namespace lfs::training {
         }
 
         // Sync callback stream to avoid race conditions
+#if LFS_TENSOR_CUDA
         if (callback_stream_) {
             LFS_CUDA_LOG_TEARDOWN(cudaStreamSynchronize(callback_stream_), callback_stream_,
                                   "cleanup: sync callback stream");
         }
+#else
+        if (auto health = lfs::core::vulkan_backend_status(); health)
+            lfs::core::with_idle_vulkan_device([](const auto&) {});
+        else if (health.error().code() != lfs::ErrorCode::DeviceLost)
+            throw lfs::Exception(health.error());
+#endif
         callback_busy_ = false;
 
         // Reset all components
@@ -1258,11 +1313,14 @@ namespace lfs::training {
         is_paused_ = false;
         {
             std::lock_guard<std::mutex> lock(params_mutex_);
+            stop_error_.reset();
             is_running_ = false;
         }
         training_complete_ = false;
         ready_to_start_ = false;
         current_iteration_ = 0;
+        completed_iteration_ = 0;
+        completed_mutation_epoch_ = mutation_epoch_;
         current_loss_ = 0.0f;
         train_dataset_size_ = 0;
         total_cameras_count_ = 0;
@@ -1648,6 +1706,7 @@ namespace lfs::training {
     }
 
     std::expected<void, std::string> Trainer::initialize_ppisp_controller() {
+#if LFS_TENSOR_CUDA
         if (!params_.optimization.ppisp_use_controller || !params_.optimization.ppisp_active()) {
             return {};
         }
@@ -1743,7 +1802,12 @@ namespace lfs::training {
         } catch (const std::exception& e) {
             return std::unexpected(std::format("Failed to init PPISP controller pool: {}", e.what()));
         }
-    }
+
+#else
+        if (!params_.optimization.ppisp_use_controller || !params_.optimization.ppisp_active()) return {};
+        return std::unexpected("PPISP controllers are unavailable on Vulkan");
+#endif
+}
 
     // Compute photometric loss AND gradient manually
     std::expected<Trainer::PhotometricLossResult, std::string> Trainer::compute_photometric_loss_with_gradient(
@@ -1757,6 +1821,8 @@ namespace lfs::training {
             opt_params.lambda_dssim > 0.0f;
 
         if (use_decoupled_appearance_loss) {
+#if LFS_TENSOR_CUDA
+
             auto& decoupled_ws = photometric_loss_.arena().decoupled();
             auto [loss_tensor, ctx] = lfs::training::kernels::decoupled_fused_l1_ssim_forward(
                 corrected, raw_rendered, gt_image, opt_params.lambda_dssim, decoupled_ws,
@@ -1772,6 +1838,16 @@ namespace lfs::training {
                 .loss = loss_tensor,
                 .grad_corrected = grads.grad_corrected,
                 .grad_raw = grads.grad_raw};
+        #else
+            auto l1 = photometric_loss_.forward(corrected, gt_image, {0.f});
+            if (!l1) return std::unexpected(l1.error());
+            auto ssim = photometric_loss_.forward(raw_rendered, gt_image, {1.f});
+            if (!ssim) return std::unexpected(ssim.error());
+            return PhotometricLossResult{
+                .loss = l1->first * (1.f - opt_params.lambda_dssim) + ssim->first * opt_params.lambda_dssim,
+                .grad_corrected = l1->second.grad_image * (1.f - opt_params.lambda_dssim),
+                .grad_raw = ssim->second.grad_image * opt_params.lambda_dssim};
+#endif
         }
 
         lfs::training::losses::PhotometricLoss::Params params{.lambda_dssim = opt_params.lambda_dssim};
@@ -1882,6 +1958,7 @@ namespace lfs::training {
             opt_params.lambda_dssim > 0.0f;
 
         if (photometric_weight.is_valid()) {
+#if LFS_TENSOR_CUDA
             if (use_decoupled_appearance_loss) {
                 auto& masked_decoupled_ws = photometric_loss_.arena().masked_decoupled();
                 auto [loss_tensor, ctx] = lfs::training::kernels::masked_decoupled_fused_l1_ssim_forward(
@@ -1912,6 +1989,23 @@ namespace lfs::training {
                     grad_corrected = grad_corrected.squeeze(0);
                 }
             }
+
+#else
+            if (use_decoupled_appearance_loss) {
+                auto l1 = photometric_loss_.forward(corrected, gt_image, {0.f}, photometric_weight);
+                if (!l1) return std::unexpected(l1.error());
+                auto ssim = photometric_loss_.forward(raw_rendered, gt_image, {1.f}, photometric_weight);
+                if (!ssim) return std::unexpected(ssim.error());
+                loss = l1->first * (1.f - opt_params.lambda_dssim) + ssim->first * opt_params.lambda_dssim;
+                grad_corrected = l1->second.grad_image * (1.f - opt_params.lambda_dssim);
+                grad_raw = ssim->second.grad_image * opt_params.lambda_dssim;
+            } else {
+                auto combined = photometric_loss_.forward(corrected, gt_image, {opt_params.lambda_dssim}, photometric_weight);
+                if (!combined) return std::unexpected(combined.error());
+                loss = combined->first;
+                grad_corrected = combined->second.grad_image;
+            }
+#endif
 
             if (has_user_mask &&
                 (mode == param::MaskMode::Segment || mode == param::MaskMode::SegmentAndIgnore) &&
@@ -2043,12 +2137,18 @@ namespace lfs::training {
             return;
         }
         auto& model = strategy_->get_model();
-        const auto result = morton::apply_morton_reorder(model, &strategy_->get_optimizer());
+        const auto result = morton::apply_morton_reorder(model, &strategy_->get_optimizer()
+#if !LFS_TENSOR_CUDA
+            , nullptr, [&](const auto& permutation) { strategy_->permute_gaussian_rows(permutation); }
+#endif
+        );
         if (!result.applied) {
             return;
         }
         cropbox_damping_cache_valid_ = false;
+#if LFS_TENSOR_CUDA
         strategy_->permute_gaussian_rows(result.permutation);
+#endif
         install_cropbox_step_damping(model, strategy_->get_optimizer());
     }
 
@@ -2122,9 +2222,13 @@ namespace lfs::training {
         project_snapshot_service_ =
             std::make_unique<TrainingSnapshotService>();
 
+#if LFS_TENSOR_CUDA
         int device_count = 0;
         LFS_CUDA_TRY(cudaGetDeviceCount(&device_count), nullptr, "CUDA device discovery");
         LFS_ASSERT_MSG(device_count > 0, "CUDA is not available - aborting");
+#else
+        LFS_ASSERT_MSG(lfs::core::gpu_backend_available(lfs::core::GpuBackend::Vulkan), "Vulkan is unavailable");
+#endif
         createCudaResources();
 
         // One-lock: bind Scene live-model readers to this trainer's step-boundary
@@ -2137,6 +2241,8 @@ namespace lfs::training {
     }
 
     void Trainer::createCudaResources() {
+#if LFS_TENSOR_CUDA
+
         try {
             LFS_CUDA_TRY(
                 cudaStreamCreateWithFlags(&callback_stream_, cudaStreamNonBlocking),
@@ -2178,9 +2284,15 @@ namespace lfs::training {
             }
             throw;
         }
+#else
+        lfs::core::with_idle_vulkan_device([](const auto&) {});
+        createSyncPrimitives();
+#endif
     }
 
     void Trainer::createSyncPrimitives() {
+#if LFS_TENSOR_CUDA
+
         LFS_CUDA_TRY(
             cudaEventCreateWithFlags(&params_ready_event_, cudaEventDisableTiming),
             nullptr, "Trainer parameter-ready event creation");
@@ -2203,9 +2315,14 @@ namespace lfs::training {
                 loss_slots_[i].pinned != nullptr,
                 std::format("Trainer loss slot {} pinned allocation failed", i));
         }
+#else
+        for (auto& slot : loss_slots_) slot.pinned = &slot.host_value;
+#endif
     }
 
     void Trainer::destroySyncPrimitives() {
+#if LFS_TENSOR_CUDA
+
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
         params_ready_recorded_ = false;
         reader_done_pending_ = 0;
@@ -2239,9 +2356,15 @@ namespace lfs::training {
                                   "destroy orphaned sidecar event");
         }
         orphaned_sidecar_events_.clear();
+#else
+        for (auto& slot : loss_slots_) { slot.in_flight = false; slot.pinned = nullptr; }
+#endif
     }
 
-    void Trainer::submitLossReadback(const lfs::core::Tensor& total_loss, int iter) {
+    void Trainer::submitLossReadback(const lfs::core::Tensor& total_loss, int iter,
+                                     std::optional<float> host_loss) {
+#if LFS_TENSOR_CUDA
+
         LossReadbackSlot& slot = loss_slots_[loss_slot_head_];
         if (!slot.pinned || !slot.done) {
             return;
@@ -2255,8 +2378,10 @@ namespace lfs::training {
                                   "loss readback: drain ring slot");
             slot.in_flight = false;
         }
-        if (cudaMemcpyAsync(slot.pinned, total_loss.ptr<float>(), sizeof(float),
-                            cudaMemcpyDeviceToHost, training_stream_) != cudaSuccess) {
+        if (host_loss) {
+            *slot.pinned = *host_loss;
+        } else if (cudaMemcpyAsync(slot.pinned, total_loss.ptr<float>(), sizeof(float),
+                                   cudaMemcpyDeviceToHost, training_stream_) != cudaSuccess) {
             return;
         }
         if (cudaEventRecord(slot.done, training_stream_) == cudaSuccess) {
@@ -2264,6 +2389,16 @@ namespace lfs::training {
             slot.in_flight = true;
             loss_slot_head_ = (loss_slot_head_ + 1) % LOSS_RING;
         }
+#else
+        auto& slot = loss_slots_[loss_slot_head_];
+        if (slot.in_flight)
+            throw std::logic_error("Loss readback must be harvested before reusing its slot");
+        slot.host_value = host_loss ? *host_loss : total_loss.cpu().item<float>();
+        slot.pinned = &slot.host_value;
+        slot.iter = iter;
+        slot.in_flight = true;
+        loss_slot_head_ = (loss_slot_head_ + 1) % LOSS_RING;
+#endif
     }
 
     std::expected<void, std::string> Trainer::harvestLossReadbacks(bool drain, bool in_controller_phase) {
@@ -2272,6 +2407,7 @@ namespace lfs::training {
             if (!slot.in_flight) {
                 continue;
             }
+#if LFS_TENSOR_CUDA
             if (drain) {
                 if (cudaEventSynchronize(slot.done) != cudaSuccess) {
                     slot.in_flight = false;
@@ -2280,6 +2416,7 @@ namespace lfs::training {
             } else if (cudaEventQuery(slot.done) != cudaSuccess) {
                 break;
             }
+#endif
             slot.in_flight = false;
 
             const float loss_value = *slot.pinned;
@@ -2306,15 +2443,22 @@ namespace lfs::training {
     }
 
     void Trainer::beginModelRead(cudaStream_t reader_stream) {
+#if LFS_TENSOR_CUDA
+
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
         if (params_ready_event_ && params_ready_recorded_) {
             LFS_CUDA_TRY(cudaStreamWaitEvent(reader_stream, params_ready_event_, 0),
                          reader_stream,
                          "begin model read: wait params-ready event");
         }
+#else
+        lfs::core::with_idle_vulkan_device([](const auto&) {});
+#endif
     }
 
     void Trainer::endModelRead(cudaStream_t reader_stream) {
+#if LFS_TENSOR_CUDA
+
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
         cudaEvent_t& slot = reader_done_events_[reader_done_head_];
         if (!slot) {
@@ -2332,8 +2476,12 @@ namespace lfs::training {
                      "end model read: record reader-done event");
         reader_done_pending_ |= bit;
         reader_done_head_ = (reader_done_head_ + 1) % READER_DONE_RING;
+#else
+        lfs::core::with_idle_vulkan_device([](const auto&) {});
+#endif
     }
 
+#if LFS_TENSOR_CUDA
     void Trainer::setViewerReleaseFence(cudaExternalSemaphore_t semaphore) {
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
         if (viewer_release_semaphore_ == semaphore) {
@@ -2346,6 +2494,8 @@ namespace lfs::training {
         // semaphore never reaches.
         viewer_borrow_value_.store(0, std::memory_order_release);
     }
+#endif
+
 
     Trainer::ExportableDensifyBarrierBegin Trainer::beginExportableDensifyBarrier() {
         if (exportable_densify_barrier_depth_ > 0) {
@@ -2389,6 +2539,8 @@ namespace lfs::training {
     }
 
     void Trainer::recordParamsReady() {
+#if LFS_TENSOR_CUDA
+
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
         if (!params_ready_event_) {
             return;
@@ -2398,9 +2550,14 @@ namespace lfs::training {
         if (cudaEventRecord(params_ready_event_, training_stream_) == cudaSuccess) {
             params_ready_recorded_ = true;
         }
+#else
+        lfs::core::with_idle_vulkan_device([](const auto&) {});
+#endif
     }
 
     void Trainer::waitForModelReaders() {
+#if LFS_TENSOR_CUDA
+
         std::lock_guard<std::mutex> lock(stream_sync_mutex_);
         if (reader_done_pending_ != 0) {
             for (size_t i = 0; i < READER_DONE_RING; ++i) {
@@ -2426,6 +2583,9 @@ namespace lfs::training {
                     "viewer-release semaphore wait, borrow value {}", borrow));
             viewer_borrow_waited_ = borrow;
         }
+#else
+        lfs::core::with_idle_vulkan_device([](const auto&) {});
+#endif
     }
 
     // Fits each camera's depth-prior alignment against the initial point
@@ -2671,6 +2831,7 @@ namespace lfs::training {
         heatmap->published_colors.resize(heatmap->camera_uids.size());
         heatmap->published_valid.assign(heatmap->camera_uids.size(), 0u);
 
+#if LFS_TENSOR_CUDA
         if (const cudaError_t err = cudaStreamCreateWithFlags(&heatmap->copy_stream, cudaStreamNonBlocking);
             err != cudaSuccess) {
             return std::unexpected(std::format("Failed to create camera-loss copy stream: {}",
@@ -2689,6 +2850,7 @@ namespace lfs::training {
                                                cudaGetErrorString(err)));
         }
 
+#endif
         setCameraLossHeatmap(std::move(heatmap));
         return {};
     }
@@ -2707,6 +2869,7 @@ namespace lfs::training {
         }
 
         const cudaStream_t stream = image_loss.stream();
+#if LFS_TENSOR_CUDA
         kernels::launch_update_camera_loss_heatmap(
             image_loss.ptr<float>(),
             static_cast<int>(it->second),
@@ -2715,6 +2878,15 @@ namespace lfs::training {
             heatmap->ema_loss_gpu.ptr<float>(),
             heatmap->camera_uids.size(),
             stream);
+#else
+        const auto index = static_cast<int>(it->second);
+        auto latest = heatmap->latest_loss_gpu.slice(0, index, index + 1);
+        auto ema = heatmap->ema_loss_gpu.slice(0, index, index + 1);
+        const auto scalar = image_loss.reshape({1});
+        latest.copy_from(scalar);
+        ema.copy_from(lfs::core::Tensor::where(ema >= 0.f,
+            ema + (scalar - ema) * CAMERA_LOSS_EMA_ALPHA, scalar));
+#endif
 
         heatmap->producer_stream = stream;
         heatmap->dirty = true;
@@ -2774,6 +2946,7 @@ namespace lfs::training {
             return;
         }
 
+#if LFS_TENSOR_CUDA
         if (heatmap->copy_in_flight) {
             cudaError_t status = force
                                      ? cudaEventSynchronize(heatmap->done_event)
@@ -2838,12 +3011,86 @@ namespace lfs::training {
                 heatmap->dirty = true;
             }
         }
+#else
+        if (heatmap->dirty && (force || iter % CAMERA_LOSS_PUBLISH_INTERVAL == 0)) {
+            heatmap->ema_loss_stage_cpu = heatmap->ema_loss_gpu.cpu();
+            publish_camera_loss_heatmap_snapshot();
+            heatmap->dirty = false;
+        }
+#endif
+    }
+
+    void Trainer::capture_scheduled_project_snapshot(int iter) {
+                const auto project_hook =
+                    getParams()
+                        .save_project_at_iteration;
+                if (project_hook &&
+                    *project_hook <=
+                        static_cast<std::size_t>(
+                            std::numeric_limits<int>::
+                                max())) {
+                    TrainerProjectSavePolicy policy;
+                    std::optional<std::filesystem::path> bound;
+                    {
+                        std::lock_guard lock(project_snapshot_mutex_);
+                        policy = trainer_project_save_policy_;
+                        if (live_project_path_ && !live_project_path_->empty())
+                            bound = *live_project_path_;
+                    }
+                    const int target =
+                        static_cast<int>(
+                            *project_hook);
+                    std::filesystem::path
+                        project_hook_destination =
+                            getParams()
+                                .save_project_path;
+                    if (project_hook_destination
+                            .empty() &&
+                        bound) {
+                        project_hook_destination =
+                            *bound;
+                    }
+                    const bool may_save_at_project_hook =
+                        policy
+                            .at_step_boundaries &&
+                        !project_hook_destination
+                             .empty();
+                    if (!may_save_at_project_hook) {
+                        if (iter + 1 == target ||
+                            iter == target) {
+                            LOG_DEBUG(
+                                "Skipping save-project-at-iter project save at iteration {}: trainer-initiated saves are not authorized",
+                                iter);
+                        }
+                    } else {
+                        if (iter + 1 == target &&
+                            !prepared_project_snapshot_) {
+                            prepare_project_snapshot_at_safe_point(
+                                target,
+                                project_hook_destination);
+                        }
+                        if (iter == target) {
+                            if (!prepared_project_snapshot_) {
+                                prepare_project_snapshot_at_safe_point(
+                                    iter,
+                                    project_hook_destination);
+                            }
+                            capture_project_snapshot_at_safe_point(
+                                iter);
+                        }
+                    }
+                }
+
     }
 
     std::expected<void, std::string> Trainer::initialize(const lfs::core::param::TrainingParameters& params) {
         if (const auto validation_error = params.validate(); !validation_error.empty()) {
             return std::unexpected("Invalid training parameters: " + validation_error);
         }
+#if !LFS_TENSOR_CUDA
+        if (auto error = params.optimization.validate_training_backend(core::GpuBackend::Vulkan); !error.empty())
+            return std::unexpected(std::move(error));
+#endif
 
         // Thread-safe initialization using mutex
         std::lock_guard<std::mutex> lock(init_mutex_);
@@ -3409,6 +3656,7 @@ namespace lfs::training {
             // arena acquisition so a refining iteration holding the arena can't
             // deadlock this reader (which holds render_mutex_ shared) — on
             // timeout the rasterizer throws and the metric is skipped this call.
+#if LFS_TENSOR_CUDA
             const cudaStream_t reader_stream = metrics_stream_ ? metrics_stream_
                                                                : lfs::core::getCurrentCUDAStream();
             std::optional<lfs::core::CUDAStreamGuard> metrics_guard;
@@ -3416,6 +3664,9 @@ namespace lfs::training {
                 metrics_guard.emplace(metrics_stream_);
             }
             const lfs::core::RasterizerMemoryArena::ScopedBeginFrameTimeout arena_timeout(100);
+#else
+            const cudaStream_t reader_stream = nullptr;
+#endif
             try {
                 beginModelRead(reader_stream);
             } catch (const std::exception& e) {
@@ -3427,6 +3678,7 @@ namespace lfs::training {
 
             try {
                 RenderOutput output;
+#if LFS_TENSOR_CUDA
                 if (params.optimization.gut) {
                     output = gsplat_rasterize(
                         camera, model, background,
@@ -3435,6 +3687,17 @@ namespace lfs::training {
                     output = fast_rasterize(
                         camera, model, background, params.optimization.mip_filter);
                 }
+#else
+                const auto bg = background.cpu().to_vector();
+                const std::lock_guard metric_lock(metrics_rasterizer_mutex_);
+                if (!metrics_rasterizer_) metrics_rasterizer_ = std::make_unique<VulkanTrainingRasterizer>();
+                output = metrics_rasterizer_->forward(camera, model, {bg.at(0), bg.at(1), bg.at(2)}, params.optimization.mip_filter);
+                if (params.optimization.bg_mode == core::param::BackgroundMode::Image && bg_image_base_.is_valid()) {
+                    const auto pixels = core::nn::resize2d(bg_image_base_.unsqueeze(0), output.image.shape()[1], output.image.shape()[2],
+                        core::nn::ResizeMode::Bilinear, core::nn::CoordTransform::HalfPixel).squeeze(0);
+                    output.composite_background(pixels, background);
+                }
+#endif
 
                 rendered = output.image;
                 if (appearance.enabled) {
@@ -3528,6 +3791,7 @@ namespace lfs::training {
 
         lfs::core::image_io::wait_for_pending_saves();
 
+#if LFS_TENSOR_CUDA
         if (callback_stream_) {
             LFS_CUDA_LOG_TEARDOWN(cudaStreamSynchronize(callback_stream_), callback_stream_,
                                   "shutdown: sync callback stream");
@@ -3545,10 +3809,19 @@ namespace lfs::training {
 
         LFS_CUDA_LOG_TEARDOWN(cudaDeviceSynchronize(), nullptr, "shutdown: device sync");
 
+#else
+        try {
+            lfs::core::with_idle_vulkan_device([](const auto&) {});
+        } catch (const std::exception& e) {
+            LOG_ERROR("Trainer Vulkan shutdown synchronization failed: {}", e.what());
+        }
+        vulkan_rasterizer_.reset();
+#endif
         finish_project_writer();
         project_snapshot_service_.reset();
 
         const bool exiting_headless = params_.optimization.headless;
+#if LFS_TENSOR_CUDA
         if (callback_stream_) {
             lfs::core::CudaMemoryPool::instance().release_stream(callback_stream_);
         }
@@ -3561,6 +3834,7 @@ namespace lfs::training {
             lfs::core::CudaMemoryPool::instance().release_stream(training_stream_);
         }
 
+#endif
         if (strategy_) {
             strategy_->set_image_loader(nullptr);
         }
@@ -3603,6 +3877,7 @@ namespace lfs::training {
         setCameraLossHeatmap(nullptr);
         setActiveImageLoader(nullptr);
 
+#if LFS_TENSOR_CUDA
         if (callback_stream_) {
             LFS_CUDA_LOG_TEARDOWN(cudaStreamDestroy(callback_stream_), callback_stream_,
                                   "shutdown: destroy callback stream");
@@ -3623,6 +3898,10 @@ namespace lfs::training {
             training_stream_ = nullptr;
         }
 
+#else
+        destroySyncPrimitives();
+        callback_busy_ = false;
+#endif
         if (!exiting_headless) {
             // Never let a
             // poisoned CUDA context turn arena full_reset into std::terminate.
@@ -3634,6 +3913,7 @@ namespace lfs::training {
             } catch (...) {
                 LOG_ERROR("Trainer::shutdown trim_memory_pool failed (unknown; continuing)");
             }
+#if LFS_TENSOR_CUDA
             try {
                 lfs::core::GlobalArenaManager::instance().get_arena().full_reset();
             } catch (const std::exception& e) {
@@ -3644,6 +3924,7 @@ namespace lfs::training {
             }
             LFS_CUDA_LOG_TEARDOWN(cudaDeviceSynchronize(), nullptr,
                                   "shutdown: post-trim device sync");
+#endif
         }
         LOG_DEBUG("GPU memory released");
 
@@ -3660,6 +3941,11 @@ namespace lfs::training {
     void Trainer::setParams(const lfs::core::param::TrainingParameters& params) {
         if (const auto validation_error = params.validate(); !validation_error.empty()) {
             LOG_ERROR("Rejected invalid training parameter update: {}", validation_error);
+            return;
+        }
+
+        if (const auto error = params.optimization.validate_training_backend(core::default_gpu_backend()); !error.empty()) {
+            LOG_ERROR("Rejected training parameter update: {}", error);
             return;
         }
 
@@ -3685,6 +3971,16 @@ namespace lfs::training {
             evaluator_->set_lpips_weights_path(lpips_weights_path_);
     }
 
+    void Trainer::request_stop(lfs::Error error) {
+#if !LFS_TENSOR_CUDA
+        lfs::core::invalidate_vulkan_backend(error);
+#endif
+        std::lock_guard lock(params_mutex_);
+        if (!stop_error_)
+            stop_error_ = std::move(error);
+        stop_requested_ = true;
+    }
+
     void Trainer::apply_pending_params_at_safe_point() {
         std::optional<lfs::core::param::TrainingParameters> update;
         bool bg_image_path_changed = false;
@@ -3708,6 +4004,15 @@ namespace lfs::training {
         // Metrics render under render_mutex_ shared and read background_ directly.
         // Publish the parameter-dependent tensors as one exclusive update.
         const std::unique_lock<std::shared_mutex> render_lock(render_mutex_);
+#if !LFS_TENSOR_CUDA
+        const std::unique_lock model_lock(model_access_mutex_);
+        if (initialized_ && strategy_) {
+            waitForModelReaders();
+            sync_strategy_optimization_params();
+            strategy_->get_optimizer().set_frozen_lr_scale(params.freeze_lr_scale);
+        }
+        if (evaluator_) evaluator_->set_evaluation_params(params.optimization);
+#endif
         const bool bg_mode_is_image =
             params.optimization.bg_mode == lfs::core::param::BackgroundMode::Image;
 
@@ -4013,8 +4318,11 @@ namespace lfs::training {
 
         auto chapters =
             std::make_shared<ProjectSnapshotChapters>();
-        chapters->snapshot_uuid =
-            lfs::core::generate_uuid_v4();
+        chapters->snapshot_uuid = artifact_uuid(std::format(
+            "lfs.snapshot|{}|{}|{}",
+            lfs::core::path_to_utf8(requested_project_path_.value_or(std::filesystem::path{})),
+            requested_project_base_commit_uuid_.to_string(),
+            requested_project_autosave_sequence_));
         return chapters;
     }
 
@@ -4027,6 +4335,8 @@ namespace lfs::training {
         }
         std::lock_guard lock(project_snapshot_mutex_);
         result.last_path = last_project_snapshot_path_;
+        result.last_checkpoint_iteration = last_checkpoint_iteration_;
+        result.last_checkpoint_uuid = last_checkpoint_uuid_;
         result.last_writer_error =
             last_project_writer_error_;
         const auto step_metrics =
@@ -4159,7 +4469,18 @@ namespace lfs::training {
         const lfs::core::Uuid
             base_explicit_commit_uuid,
         const std::uint64_t autosave_sequence) {
+        project_uuid_ = artifact_uuid(std::format(
+            "lfs.project|{}|{}", lfs::core::path_to_utf8(requested_path),
+            base_explicit_commit_uuid.to_string()));
         join_finished_project_writer();
+#if !LFS_TENSOR_CUDA
+        if (auto health = lfs::core::vulkan_backend_status(); !health) {
+            std::lock_guard lock(project_snapshot_mutex_);
+            last_project_writer_typed_error_ = health.error();
+            fail_project_request_locked(request_id, lfs::format_for_developer(health.error()));
+            return;
+        }
+#endif
         if (write_kind ==
             ProjectSnapshotWriteKind::Autosave) {
             std::lock_guard lock(
@@ -4466,6 +4787,27 @@ namespace lfs::training {
             !project_snapshot_service_) {
             return;
         }
+        const auto capture_request_id = prepared_project_request_id_;
+        const auto fail_capture = [&](lfs::Error error) {
+            const auto message = lfs::format_for_developer(error);
+            std::lock_guard lock(project_snapshot_mutex_);
+            fail_project_request_locked(capture_request_id, message);
+            last_project_writer_typed_error_ = std::move(error);
+            if (prestaged_project_request_id_ == capture_request_id) {
+                prestaged_project_chapters_.reset();
+                prestaged_project_request_id_ = 0;
+            }
+            clear_prepared_project_request();
+            project_snapshot_retry_id_.reset();
+        };
+        try {
+        if (completed_mutation_epoch_ != mutation_epoch_) {
+            std::lock_guard lock(project_snapshot_mutex_);
+            fail_project_request_locked(prepared_project_request_id_,
+                "Cannot save resumable training state after an incomplete persistent update; retain the last completed checkpoint");
+            prepared_project_snapshot_.reset();
+            return;
+        }
         if (prepared_project_iteration_ != iteration) {
             LOG_WARN(
                 "Prepared .licht snapshot iteration {} reached "
@@ -4585,13 +4927,20 @@ namespace lfs::training {
         std::unique_lock render_lock(render_mutex_);
         std::unique_lock model_lock(
             model_access_mutex_);
-        waitForModelReaders();
-        auto prepared =
-            std::move(*prepared_project_snapshot_);
+        auto prepared = std::move(*prepared_project_snapshot_);
         prepared_project_snapshot_.reset();
-        auto pending =
-            project_snapshot_service_->capture(
-                std::move(prepared), request);
+        auto pending = [&]() -> lfs::Result<PendingTrainingSnapshot> {
+            try {
+                waitForModelReaders();
+                return project_snapshot_service_->capture(std::move(prepared), request);
+            } catch (const lfs::Exception& error) {
+                return error.error();
+            } catch (const std::bad_alloc& error) {
+                return project_snapshot_error(lfs::ErrorCode::ResourceExhausted, error.what(), LFS_SOURCE_SITE_CURRENT());
+            } catch (const std::exception& error) {
+                return project_snapshot_error(lfs::ErrorCode::Internal, error.what(), LFS_SOURCE_SITE_CURRENT());
+            }
+        }();
         render_lock.unlock();
         model_lock.unlock();
 
@@ -4623,15 +4972,11 @@ namespace lfs::training {
                 lfs::format_for_developer(
                     pending.error());
             const bool requires_replan =
-                pending.error().code() ==
-                    lfs::ErrorCode::
-                        FailedPrecondition &&
-                pending.error().detail().find(
-                    "layout changed") !=
-                    std::string_view::npos;
+                pending.error().code() == lfs::ErrorCode::FailedPrecondition &&
+                pending.error().retryability() == lfs::Retryability::Retryable;
             if (requires_replan) {
                 LOG_WARN(
-                    "Replanning .licht snapshot at iteration {}: "
+                    "Snapshot layout changed at iteration {}: "
                     "reason={}",
                     iteration, message);
             } else {
@@ -4648,7 +4993,8 @@ namespace lfs::training {
                     pending.error();
                 // A topology-changing step may invalidate a preplanned
                 // layout. Coalesce and replan at the next post-step point.
-                if (!requested_project_path_) {
+                if (requires_replan && project_snapshot_retry_id_ != request_id && !requested_project_path_) {
+                    project_snapshot_retry_id_ = request_id;
                     requested_project_path_ = path;
                     requested_project_preview_png_ =
                         std::move(preview_png);
@@ -4665,13 +5011,15 @@ namespace lfs::training {
                     prestaged_project_request_id_ =
                         request_id;
                 } else {
+                    project_snapshot_retry_id_.reset();
                     fail_project_request_locked(
                         request_id,
-                        "A newer project snapshot request replaced the failed capture");
+                        message);
                 }
             }
             return;
         }
+        project_snapshot_retry_id_.reset();
         if (cpu_state->snapshot_uuid !=
                 snapshot_uuid ||
             cpu_state->iteration != iteration) {
@@ -4689,7 +5037,11 @@ namespace lfs::training {
             return;
         }
 
+
+#if LFS_TENSOR_CUDA
         photometric_loss_.arena().shrink_to_required();
+#endif
+
 
         std::optional<std::filesystem::path> headless_source_path;
         bool first_publish_to_destination =
@@ -4844,17 +5196,7 @@ namespace lfs::training {
                         const auto create_fresh_document =
                             [&]()
                             -> lfs::Result<void> {
-                            const auto created_ns =
-                                static_cast<std::uint64_t>(
-                                    std::chrono::
-                                        duration_cast<
-                                            std::chrono::
-                                                nanoseconds>(
-                                            std::chrono::
-                                                system_clock::
-                                                    now()
-                                                        .time_since_epoch())
-                                            .count());
+                            const auto created_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                             auto created =
                                 lfs::io::project::
                                     ProjectDocument::create(
@@ -5155,17 +5497,7 @@ namespace lfs::training {
                             }
                         }
 
-                        const auto wallclock_ns =
-                            static_cast<std::uint64_t>(
-                                std::chrono::
-                                    duration_cast<
-                                        std::chrono::
-                                            nanoseconds>(
-                                        std::chrono::
-                                            system_clock::
-                                                now()
-                                                    .time_since_epoch())
-                                        .count());
+                        const auto wallclock_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                         const lfs::io::project::
                             ProjectDocumentSaveOptions
                                 save_options{
@@ -5181,8 +5513,10 @@ namespace lfs::training {
                                                            : lfs::io::project::
                                                                  CommitKind::Explicit),
                                             .commit_uuid =
-                                                lfs::core::
-                                                    generate_uuid_v4(),
+                                                artifact_uuid(std::format(
+                                                    "lfs.commit|{}|{}",
+                                                    lfs::core::path_to_utf8(path),
+                                                    captured->snapshot_uuid.to_string())),
                                             .snapshot_uuid =
                                                 captured
                                                     ->snapshot_uuid,
@@ -5194,8 +5528,14 @@ namespace lfs::training {
                                                 {},
                                         },
                                     .file_uuid =
-                                        lfs::core::
-                                            generate_uuid_v4(),
+                                        artifact_uuid(std::format(
+                                            "lfs.file|{}|{}",
+                                            lfs::core::path_to_utf8(path),
+                                            project_uuid_.to_string())),
+                                    // 0 leaves the writer to stamp the wall clock, which is what
+                                    // default mode wants; the pinned epoch makes it reproducible.
+                                    .save_as_creation_time_unix_ns =
+                                        reproducible_epoch_ns().value_or(0),
                                     .save_as_project_uuid =
                                         document_context
                                             ? document_context
@@ -5248,8 +5588,10 @@ namespace lfs::training {
                                         lfs::io::project::
                                             ProjectDocumentAutosaveOptions{
                                                 .file_uuid =
-                                                    lfs::core::
-                                                        generate_uuid_v4(),
+                                                    artifact_uuid(std::format(
+                                                        "lfs.sidecar|{}|{}",
+                                                        lfs::core::path_to_utf8(lfs::io::project::autosave_sidecar_path(path)),
+                                                        project_uuid_.to_string())),
                                                 .base_explicit_commit_uuid =
                                                     base_explicit_commit_uuid,
                                                 .autosave_sequence =
@@ -5406,28 +5748,8 @@ namespace lfs::training {
                         write_kind !=
                             ProjectSnapshotWriteKind::
                                 Autosave) {
-                        const auto compact_creation_ns =
-                            static_cast<std::uint64_t>(
-                                std::chrono::
-                                    duration_cast<
-                                        std::chrono::
-                                            nanoseconds>(
-                                        std::chrono::
-                                            system_clock::
-                                                now()
-                                                    .time_since_epoch())
-                                        .count());
-                        const auto compact_wallclock_ns =
-                            static_cast<std::uint64_t>(
-                                std::chrono::
-                                    duration_cast<
-                                        std::chrono::
-                                            nanoseconds>(
-                                        std::chrono::
-                                            system_clock::
-                                                now()
-                                                    .time_since_epoch())
-                                        .count());
+                        const auto compact_creation_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
+                        const auto compact_wallclock_ns = reproducible_epoch_ns().value_or(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
                         auto compacted =
                             lfs::io::project::
                                 ProjectWriter::compact(
@@ -5437,11 +5759,15 @@ namespace lfs::training {
                                             .compatibility =
                                                 {},
                                             .new_file_uuid =
-                                                lfs::core::
-                                                    generate_uuid_v4(),
+                                                artifact_uuid(std::format(
+                                                    "lfs.file|{}|{}",
+                                                    lfs::core::path_to_utf8(path),
+                                                    project_uuid_.to_string())),
                                             .commit_uuid =
-                                                lfs::core::
-                                                    generate_uuid_v4(),
+                                                artifact_uuid(std::format(
+                                                    "lfs.compaction.commit|{}|{}",
+                                                    lfs::core::path_to_utf8(path),
+                                                    project_uuid_.to_string())),
                                             .snapshot_uuid =
                                                 {},
                                             .creation_time_unix_ns =
@@ -5467,9 +5793,10 @@ namespace lfs::training {
                     {
                         std::lock_guard lock(
                             project_snapshot_mutex_);
-                        last_project_snapshot_path_ =
-                            path;
                         if (writer_result) {
+                            last_project_snapshot_path_ = path;
+                            last_checkpoint_iteration_ = chapters->iteration;
+                            last_checkpoint_uuid_ = chapters->snapshot_uuid;
                             last_project_writer_error_
                                 .clear();
                             last_completed_project_request_id_ =
@@ -5525,6 +5852,14 @@ namespace lfs::training {
                 "Failed to start .licht project writer: {}",
                 error.what());
         }
+        } catch (const lfs::Exception& error) {
+            fail_capture(error.error());
+        } catch (const std::bad_alloc& error) {
+            fail_capture(project_snapshot_error(lfs::ErrorCode::ResourceExhausted, error.what(), LFS_SOURCE_SITE_CURRENT()));
+        } catch (const std::exception& error) {
+            fail_capture(project_snapshot_error(lfs::ErrorCode::Internal, error.what(), LFS_SOURCE_SITE_CURRENT()));
+        }
+
     }
 
     void Trainer::observe_training_step_duration(
@@ -5576,6 +5911,9 @@ namespace lfs::training {
     }
 
     void Trainer::handle_control_requests(int iter, std::stop_token stop_token) {
+        // Poll UI settings at every safe point, including while paused.
+        if (on_iteration_start_)
+            on_iteration_start_();
         apply_pending_params_at_safe_point();
 
         // Check stop token first
@@ -5591,7 +5929,11 @@ namespace lfs::training {
                 progress_->pause();
             }
             // B3: the previous step is complete; release the production loss arena.
-            photometric_loss_.arena().reset();
+
+#if LFS_TENSOR_CUDA
+        photometric_loss_.arena().reset();
+#endif
+
             resize_rasterizer_arena_at_boundary("B3 pause", true);
             LOG_INFO("Training paused at iteration {}", iter);
             LOG_DEBUG("Click 'Resume Training' to continue.");
@@ -5599,7 +5941,7 @@ namespace lfs::training {
             is_paused_ = false;
             if (progress_) {
                 progress_->resume(
-                    iter,
+                    completed_iteration_.load(),
                     current_loss_.load(),
                     static_cast<int>(strategy_->get_model().size()),
                     get_progress_phase(iter));
@@ -5610,7 +5952,11 @@ namespace lfs::training {
         // Handle stop request - this permanently stops training
         if (stop_requested_.load()) {
             // B3: no new forward work will consume these views.
-            photometric_loss_.arena().reset();
+
+#if LFS_TENSOR_CUDA
+        photometric_loss_.arena().reset();
+#endif
+
             LOG_INFO("Stopping training permanently at iteration {}...", iter);
         }
     }
@@ -5648,14 +5994,14 @@ namespace lfs::training {
         constexpr int BG_PERIOD_B = 43;
     } // anonymous namespace
 
-    lfs::core::Tensor& Trainer::background_for_step(int iter) {
+    std::array<float, 3> Trainer::background_color_for_step(int iter) {
         if (!params_.optimization.bg_modulation) {
-            return background_;
+            return params_.optimization.bg_color;
         }
 
         const float w = inv_weight_piecewise(iter, get_total_iterations());
         if (w <= 0.0f) {
-            return background_;
+            return params_.optimization.bg_color;
         }
 
         // Sine-based RGB with prime periods for color diversity
@@ -5663,21 +6009,26 @@ namespace lfs::training {
         const float pg = TWO_PI * static_cast<float>(iter % BG_PERIOD_G) / BG_PERIOD_G;
         const float pb = TWO_PI * static_cast<float>(iter % BG_PERIOD_B) / BG_PERIOD_B;
 
-        const float result[3] = {
+        return {
             std::clamp(0.5f * (1.0f + std::sin(pr)) * w, CLAMP_EPS, 1.0f - CLAMP_EPS),
             std::clamp(0.5f * (1.0f + std::sin(pg + PHASE_OFFSET_G)) * w, CLAMP_EPS, 1.0f - CLAMP_EPS),
             std::clamp(0.5f * (1.0f + std::sin(pb + PHASE_OFFSET_B)) * w, CLAMP_EPS, 1.0f - CLAMP_EPS)};
+    }
 
-        if (bg_mix_buffer_.is_empty()) {
+#if LFS_TENSOR_CUDA
+    lfs::core::Tensor& Trainer::background_for_step(int iter) {
+        if (!params_.optimization.bg_modulation || inv_weight_piecewise(iter, get_total_iterations()) <= 0.0f)
+            return background_;
+        const auto result = background_color_for_step(iter);
+        if (bg_mix_buffer_.is_empty())
             bg_mix_buffer_ = lfs::core::Tensor::empty({3}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-        }
-
         LFS_CUDA_TRY(
-            cudaMemcpyAsync(bg_mix_buffer_.ptr<float>(), result, sizeof(result),
+            cudaMemcpyAsync(bg_mix_buffer_.ptr<float>(), result.data(), sizeof(result),
                             cudaMemcpyHostToDevice, bg_mix_buffer_.stream()),
             bg_mix_buffer_.stream(), "background modulation: upload mix color");
         return bg_mix_buffer_;
     }
+#endif
 
     void Trainer::clearBackgroundImageCache() {
         bg_image_cache_.clear();
@@ -5734,6 +6085,7 @@ namespace lfs::training {
                 map_shape, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
         }
         edge_map_buffer_.set_stream(stream);
+#if LFS_TENSOR_CUDA
         if (gt_image.dtype() == lfs::core::DataType::UInt8) {
             kernels::launch_fused_canny_edge_filter_chw(
                 gt_image.ptr<uint8_t>(), edge_map_buffer_.ptr<float>(),
@@ -5746,6 +6098,9 @@ namespace lfs::training {
         kernels::launch_normalize_by_positive_median(
             edge_map_buffer_.ptr<float>(), height * width, stream,
             &edge_weight_median_scratch_);
+#else
+        edge_map_buffer_ = kernels::normalized_canny_edge_weights(gt_image);
+#endif
 
         lfs::core::Tensor map;
         const bool cacheable = map_bytes <= EDGE_WEIGHT_CACHE_BUDGET_BYTES;
@@ -5811,24 +6166,12 @@ namespace lfs::training {
             return bg_image_base_;
         }
 
-        // Create resized tensor
-        auto resized = lfs::core::Tensor::empty(
-            {static_cast<size_t>(channels), static_cast<size_t>(height), static_cast<size_t>(width)},
-            lfs::core::Device::CUDA,
-            lfs::core::DataType::Float32);
-
-        // Use bilinear resize kernel
-        kernels::launch_bilinear_resize_chw(
-            bg_image_base_.ptr<float>(),
-            resized.ptr<float>(),
-            channels,
-            src_h, src_w,
-            height, width,
-            resized.stream());
+        auto resized = lfs::core::nn::resize2d(bg_image_base_.unsqueeze(0), height, width,
+            lfs::core::nn::ResizeMode::Bilinear, lfs::core::nn::CoordTransform::HalfPixel).squeeze(0);
 
         // Cache only if this physical bucket can fit under the hard byte ceiling.
         // Returned Tensor copies retain storage safely if an older entry is evicted.
-        const size_t allocation_bytes = lfs::core::SizeBucketedPool::get_bucket_size(resized.bytes());
+        const size_t allocation_bytes = tensor_reserved_bytes(resized);
         if (allocation_bytes <= BG_IMAGE_CACHE_BUDGET_BYTES) {
             while (!bg_image_cache_.empty() &&
                    bg_image_cache_bytes_ > BG_IMAGE_CACHE_BUDGET_BYTES - allocation_bytes) {
@@ -5859,18 +6202,39 @@ namespace lfs::training {
     lfs::core::Tensor Trainer::get_random_background_for_camera(int width, int height, int iteration) {
         const size_t required_size = 3 * static_cast<size_t>(height) * static_cast<size_t>(width);
 
-        if (!random_bg_buffer_.is_valid() || random_bg_buffer_.numel() != required_size) {
+        if (!random_bg_buffer_.is_valid() ||
+            random_bg_buffer_.shape() != lfs::core::TensorShape{3, static_cast<size_t>(height), static_cast<size_t>(width)} ||
+            random_bg_buffer_.dtype() != lfs::core::DataType::Float32 ||
+            lfs::core::gpu_backend_of(random_bg_buffer_) != lfs::core::default_gpu_backend()) {
             random_bg_buffer_ = lfs::core::Tensor::empty(
                 {3, static_cast<size_t>(height), static_cast<size_t>(width)},
-                lfs::core::Device::CUDA,
+                lfs::core::Device::GPU,
                 lfs::core::DataType::Float32);
         }
 
+#if LFS_TENSOR_CUDA
         kernels::launch_random_background(
             random_bg_buffer_.ptr<float>(),
             height, width,
             static_cast<uint64_t>(iteration),
             random_bg_buffer_.stream());
+#else
+        // Deterministic PCG sequence shared with the CUDA image-background kernel.
+        const auto pcg = [](uint32_t value) {
+            const uint32_t state = value * 747796405u + 2891336453u;
+            const uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+            return static_cast<float>((word >> 22u) ^ word) * (1.f / 4294967296.f);
+        };
+        const size_t pixels = required_size / 3;
+        std::vector<float> values(required_size);
+        for (size_t i = 0; i < pixels; ++i) {
+            const uint32_t base = static_cast<uint32_t>(iteration) ^ static_cast<uint32_t>(i);
+            values[i] = pcg(base);
+            values[pixels + i] = pcg(base + 0x9E3779B9u);
+            values[2 * pixels + i] = pcg(base + 0x6C8E9CF9u);
+        }
+        random_bg_buffer_.copy_(lfs::core::Tensor::from_vector(values, random_bg_buffer_.shape(), lfs::core::Device::GPU));
+#endif
 
         return random_bg_buffer_;
     }
@@ -5889,6 +6253,8 @@ namespace lfs::training {
     }
 
     lfs::Status Trainer::recover_forward_oom(const lfs::Error& cause) {
+#if LFS_TENSOR_CUDA
+
         if (auto* arena = lfs::core::GlobalArenaManager::instance().try_get_arena()) {
             const auto info = arena->get_memory_info();
             lfs::core::log_arena_failure_vram_snapshot(
@@ -5950,6 +6316,22 @@ namespace lfs::training {
         }
         static_cast<void>(cudaGetLastError());
         return {};
+#else
+        try {
+            lfs::core::with_idle_vulkan_device([](const auto&) {});
+            vulkan_rasterizer_.reset();
+            if (auto loader = getActiveImageLoader()) loader->reclaim_idle_decoded_frames();
+            lfs::core::Tensor::trim_memory_pool();
+            return {};
+        } catch (const lfs::Exception& e) {
+            return lfs::Status::failure(lfs::Error(e.error()).with_suppressed(cause));
+        } catch (const std::exception& e) {
+            return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::Internal, .domain = lfs::ErrorDomain::Vulkan,
+                .user_message = "Vulkan recovery failed", .detail = e.what(),
+                .detection = LFS_SOURCE_SITE_CURRENT()}).with_suppressed(cause));
+        }
+#endif
     }
 
     namespace {
@@ -5965,6 +6347,7 @@ namespace lfs::training {
         };
     } // namespace
 
+#if LFS_TENSOR_CUDA
     lfs::Result<Trainer::StepDisposition> Trainer::train_step(
         int iter,
         lfs::core::Camera* cam,
@@ -6034,12 +6417,6 @@ namespace lfs::training {
 
                 // Check control requests at the beginning
                 handle_control_requests(iter, stop_token);
-
-                if (on_iteration_start_)
-                    on_iteration_start_();
-                // Manager/Python callbacks publish parameter updates via setParams().
-                // Install them before forward or optimizer work observes params_.
-                apply_pending_params_at_safe_point();
 
                 // Gate this step's in-place parameter writes behind in-flight model
                 // reads (viewer packs, metric renders) — GPU-side waits, ~free once
@@ -8014,6 +8391,8 @@ namespace lfs::training {
                             } else {
                                 model_write_lock.unlock();
                             }
+                            completed_iteration_ = iter;
+                            completed_mutation_epoch_ = mutation_epoch_;
                             consume_requested_project_snapshot(iter);
                             if (need_exclusive) {
                                 lock.lock();
@@ -8087,6 +8466,8 @@ namespace lfs::training {
                     }
 
                     // Clean evaluation - let the evaluator handle everything
+                    completed_iteration_ = iter;
+                    completed_mutation_epoch_ = mutation_epoch_;
                     if (evaluator_->is_enabled() && evaluator_->should_evaluate(iter)) {
                         evaluator_->print_evaluation_header(iter);
                         eval_ppisp_applied_.store(0);
@@ -8123,7 +8504,11 @@ namespace lfs::training {
                             bilateral_grid_->log_eval_diagnostics();
                         }
                         // B2: retain only the current active shape after evaluation.
-                        photometric_loss_.arena().shrink_to_required();
+
+#if LFS_TENSOR_CUDA
+        photometric_loss_.arena().shrink_to_required();
+#endif
+
                     }
 
                     current_phase = StepPhase::TerminalCleanup;
@@ -8194,6 +8579,8 @@ namespace lfs::training {
                     }
                 }
 
+                completed_iteration_ = iter;
+                completed_mutation_epoch_ = mutation_epoch_;
                 // Python hook: post-step (after optimizer and side-effects)
                 {
                     lfs::training::HookContext ctx{
@@ -8211,65 +8598,7 @@ namespace lfs::training {
 
                 consume_requested_project_snapshot(iter);
 
-                const auto project_hook =
-                    getParams()
-                        .save_project_at_iteration;
-                if (project_hook &&
-                    *project_hook <=
-                        static_cast<std::size_t>(
-                            std::numeric_limits<int>::
-                                max())) {
-                    TrainerProjectSavePolicy policy;
-                    std::optional<std::filesystem::path> bound;
-                    {
-                        std::lock_guard lock(project_snapshot_mutex_);
-                        policy = trainer_project_save_policy_;
-                        if (live_project_path_ && !live_project_path_->empty())
-                            bound = *live_project_path_;
-                    }
-                    const int target =
-                        static_cast<int>(
-                            *project_hook);
-                    std::filesystem::path
-                        project_hook_destination =
-                            getParams()
-                                .save_project_path;
-                    if (project_hook_destination
-                            .empty() &&
-                        bound) {
-                        project_hook_destination =
-                            *bound;
-                    }
-                    const bool may_save_at_project_hook =
-                        policy
-                            .at_step_boundaries &&
-                        !project_hook_destination
-                             .empty();
-                    if (!may_save_at_project_hook) {
-                        if (iter + 1 == target ||
-                            iter == target) {
-                            LOG_DEBUG(
-                                "Skipping save-project-at-iter project save at iteration {}: trainer-initiated saves are not authorized",
-                                iter);
-                        }
-                    } else {
-                        if (iter + 1 == target &&
-                            !prepared_project_snapshot_) {
-                            prepare_project_snapshot_at_safe_point(
-                                target,
-                                project_hook_destination);
-                        }
-                        if (iter == target) {
-                            if (!prepared_project_snapshot_) {
-                                prepare_project_snapshot_at_safe_point(
-                                    iter,
-                                    project_hook_destination);
-                            }
-                            capture_project_snapshot_at_safe_point(
-                                iter);
-                        }
-                    }
-                }
+                capture_scheduled_project_snapshot(iter);
 
                 if (live_vram_profiler_enabled() && strategy_) {
                     record_splat_vram_breakdown(strategy_->get_model());
@@ -8336,6 +8665,8 @@ namespace lfs::training {
         return result;
     }
 
+#endif
+
     lfs::Status Trainer::train(std::stop_token stop_token) {
         const std::uint64_t train_start_epoch = mutation_epoch_;
         StepPhase train_phase = StepPhase::AcquireData;
@@ -8364,11 +8695,11 @@ namespace lfs::training {
         };
 
         // Check if initialized
-        if (!initialized_.load()) {
+        if (!initialized_.load() || completed_mutation_epoch_ != mutation_epoch_) {
             return lfs::Status::failure(attach_train_stamp(lfs::make_error(lfs::ErrorInit{
                 .code = lfs::ErrorCode::FailedPrecondition,
                 .domain = lfs::ErrorDomain::Training,
-                .user_message = "Trainer not initialized. Call initialize() before train().",
+                .user_message = "Trainer is uninitialized or has an incomplete persistent update. Restore a checkpoint or reinitialize before training.",
                 .detection = LFS_SOURCE_SITE_CURRENT(),
             })));
         }
@@ -8385,7 +8716,14 @@ namespace lfs::training {
             std::lock_guard<std::mutex> lock(params_mutex_);
             is_running_ = true; // Active setParams() calls queue from this point onward.
         }
-        apply_pending_params_at_safe_point();
+        const auto finalize_state = makeScopeGuard([this] {
+            pause_requested_ = false;
+            is_paused_ = false;
+            saving_model_ = false;
+            training_complete_ = true;
+            std::lock_guard lock(params_mutex_);
+            is_running_ = false;
+        });
         LOG_INFO("Starting training loop");
         if (params_.optimization.gut && params_.optimization.use_normal_loss) {
             LOG_WARN("normal loss requested but the 3DGUT backend has no normal channel; normal terms are inactive");
@@ -8404,6 +8742,7 @@ namespace lfs::training {
         };
 
         try {
+            apply_pending_params_at_safe_point();
             cache_loader.reset_cache();
             cache_loader.update_cache_params(params_.dataset.loading_params.use_cpu_memory,
                                              train_dataset_size_,
@@ -8427,6 +8766,7 @@ namespace lfs::training {
                 lfs::training::ControlBoundary::instance().notify(lfs::training::ControlHook::TrainingStart, ctx);
             }
 
+#if LFS_TENSOR_CUDA
             std::optional<lfs::core::CUDAStreamGuard> stream_guard;
             if (training_stream_) {
                 stream_guard.emplace(training_stream_);
@@ -8437,11 +8777,14 @@ namespace lfs::training {
                     "order initialize() work before first training-stream kernel");
             }
 
+#else
+            lfs::core::with_idle_vulkan_device([](const auto&) {});
+#endif
             // Start from current_iteration_ (allows resume from checkpoint)
-            int iter = current_iteration_.load() > 0 ? current_iteration_.load() + 1 : 1;
+            int iter = completed_iteration_.load() + 1;
             if (progress_) {
                 progress_->update(
-                    iter,
+                    completed_iteration_.load(),
                     current_loss_.load(),
                     static_cast<int>(strategy_->get_model().size()),
                     get_progress_phase(iter));
@@ -8678,6 +9021,7 @@ namespace lfs::training {
 
                 if (stop_token.stop_requested() || stop_requested_.load())
                     break;
+#if LFS_TENSOR_CUDA
                 if (callback_busy_.load(std::memory_order_acquire)) {
                     const cudaError_t callback_status = cudaStreamQuery(callback_stream_);
                     if (callback_status == cudaSuccess) {
@@ -8687,6 +9031,7 @@ namespace lfs::training {
                         callback_busy_.store(false, std::memory_order_release);
                     }
                 }
+#endif
 
                 lfs::core::Camera* cam = nullptr;
                 lfs::core::Tensor gt_image;
@@ -8723,19 +9068,14 @@ namespace lfs::training {
                 // normalization used by the original float decode path.
                 if (gt_image.dtype() == lfs::core::DataType::UInt8) {
                     gt_image.sync_to_stream(training_stream_);
-                    auto gt_image_fp32 = lfs::core::Tensor::empty(
-                        gt_image.shape(), lfs::core::Device::CUDA,
-                        lfs::core::DataType::Float32);
-                    lfs::io::cuda::launch_uint8_chw_to_float32_chw(
-                        gt_image.ptr<uint8_t>(), gt_image_fp32.ptr<float>(),
-                        gt_image.numel(), training_stream_);
-                    gt_image = std::move(gt_image_fp32);
+                    gt_image = gt_image.to(lfs::core::DataType::Float32) / 255.f;
                 }
 
                 for (CUevent_st** event : {&example.depth_ready_event, &example.normal_ready_event}) {
                     if (!*event) {
                         continue;
                     }
+#if LFS_TENSOR_CUDA
                     const auto wait_site = LFS_SOURCE_SITE_CURRENT();
                     lfs::core::record_cuda_breadcrumb(
                         "cudaStreamWaitEvent(training_stream_, *event, 0)", __FILE__, __LINE__,
@@ -8759,6 +9099,9 @@ namespace lfs::training {
                     LFS_CUDA_LOG_TEARDOWN(cudaEventDestroy(*event), nullptr,
                                           "destroy sidecar loader-ready event");
                     *event = nullptr;
+#else
+                    throw std::runtime_error("A CUDA sidecar event was returned to the Vulkan trainer");
+#endif
                 }
                 // Store pipelined mask for use in train_step
                 pipelined_mask_ = example.mask.has_value() ? std::move(*example.mask) : lfs::core::Tensor();
@@ -8790,22 +9133,28 @@ namespace lfs::training {
                 }
 
                 train_phase = StepPhase::Forward;
+                const auto layout_before_step = strategy_->get_model().param_layout_generation();
+#if LFS_TENSOR_CUDA
                 const auto training_step_begin =
                     std::chrono::steady_clock::now();
+#endif
                 auto step_result = train_step(iter, cam, gt_image, stop_token);
                 const double training_step_ms =
+#if !LFS_TENSOR_CUDA
+                    active_step_ms_;
+#else
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
                         training_step_begin)
                         .count();
+#endif
                 if (!step_result) {
                     terminal_error = std::move(step_result).error();
                     break;
                 }
                 observe_training_step_duration(
                     iter, training_step_ms,
-                    strategy_ &&
-                        strategy_->is_refining(iter));
+                    layout_before_step != strategy_->get_model().param_layout_generation());
                 train_dataloader->observe_training_iteration(
                     training_step_ms, dl_wait_ms, iter);
 
@@ -8820,6 +9169,7 @@ namespace lfs::training {
                 // Launch callback for async progress update (except first iteration)
                 if (iter > 1 && callback_ && !callback_busy_.load(std::memory_order_acquire)) {
                     callback_busy_.store(true, std::memory_order_release);
+#if LFS_TENSOR_CUDA
                     auto err = cudaLaunchHostFunc(
                         callback_stream_,
                         [](void* self) {
@@ -8834,6 +9184,15 @@ namespace lfs::training {
                         LOG_WARN("Failed to launch callback: {}", cudaGetErrorString(err));
                         callback_busy_.store(false, std::memory_order_release);
                     }
+#else
+                    try {
+                        callback_();
+                    } catch (...) {
+                        callback_busy_.store(false, std::memory_order_release);
+                        throw;
+                    }
+                    callback_busy_.store(false, std::memory_order_release);
+#endif
                 }
 
                 ++iter;
@@ -8853,7 +9212,11 @@ namespace lfs::training {
                                                     val_dataset_,
                                                     background_);
                 LOG_INFO("{}", metrics.to_string());
-                photometric_loss_.arena().shrink_to_required();
+
+#if LFS_TENSOR_CUDA
+        photometric_loss_.arena().shrink_to_required();
+#endif
+
             }
 
             clearActiveImageLoader();
@@ -8886,6 +9249,7 @@ namespace lfs::training {
 
         train_phase = StepPhase::TerminalCleanup;
 
+#if LFS_TENSOR_CUDA
         if (callback_busy_.load()) {
             const auto callback_status = cudaStreamSynchronize(callback_stream_);
             if (callback_status != cudaSuccess) {
@@ -8900,29 +9264,47 @@ namespace lfs::training {
             }
         }
 
-        const int terminal_iteration = current_iteration_.load();
-        const bool user_stopped = stop_requested_.load() || stop_token.stop_requested();
-        apply_pending_params_at_safe_point();
-        pending_snapshot_finish_reason_ =
-            terminal_error
-                ? lfs::io::project::TrainingFinishReason::Error
-            : user_stopped
-                ? lfs::io::project::TrainingFinishReason::UserStopped
-                : lfs::io::project::TrainingFinishReason::Completed;
-        // A save-project-at-iter capture that needed replan is re-queued for
-        // the next post-step. When the target is the final iteration there is
-        // no next post-step; drain here (layout is stable) before the terminal save.
+#endif
         {
-            bool drain_requested_project_snapshot = false;
-            {
-                std::lock_guard lock(project_snapshot_mutex_);
-                drain_requested_project_snapshot = requested_project_path_.has_value();
-            }
-            if (drain_requested_project_snapshot) {
-                consume_requested_project_snapshot(terminal_iteration);
-                finish_project_writer();
+            std::lock_guard lock(params_mutex_);
+            if (stop_error_) {
+                auto first = *stop_error_;
+                if (terminal_error)
+                    first = std::move(first).with_suppressed(std::move(*terminal_error));
+                terminal_error = std::move(first);
             }
         }
+        const int terminal_iteration = completed_iteration_.load();
+        current_iteration_ = terminal_iteration;
+        bool can_capture = completed_mutation_epoch_ == mutation_epoch_;
+        bool user_stopped = !terminal_error && (stop_requested_.load() || stop_token.stop_requested());
+        lfs::core::run_guarded<void>(
+            {.name = "training-terminal-capture", .domain = lfs::ErrorDomain::Training, .operation_id = lfs::OperationId::generate(), .site = LFS_SOURCE_SITE_CURRENT()},
+            [&]() -> lfs::Status {
+#if !LFS_TENSOR_CUDA
+                if (auto health = lfs::core::vulkan_backend_status(); !health)
+                    return health;
+#endif
+                if (!terminal_error)
+                    apply_pending_params_at_safe_point();
+                pending_snapshot_finish_reason_ = terminal_error
+                                                      ? lfs::io::project::TrainingFinishReason::Error
+                                                  : user_stopped ? lfs::io::project::TrainingFinishReason::UserStopped
+                                                                 : lfs::io::project::TrainingFinishReason::Completed;
+                // Drain a final-step request that required a layout replan.
+                if (can_capture)
+                    consume_requested_project_snapshot(terminal_iteration);
+                return {};
+            },
+            [&](lfs::Status&& result) {
+                if (!result) {
+                    append_terminal_error(result.error());
+                    user_stopped = false;
+                    can_capture = false;
+                }
+            });
+        if (!can_capture)
+            abandon_pending_project_requests("Training state is unavailable; retain the last completed checkpoint");
         TrainerProjectSavePolicy terminal_save_policy;
         std::optional<std::filesystem::path> terminal_project_path;
         {
@@ -8937,7 +9319,7 @@ namespace lfs::training {
             (user_stopped || terminal_error)
                 ? terminal_save_policy.on_stop_or_error
                 : terminal_save_policy.on_completion;
-        if (authorize_terminal_save &&
+        if (can_capture && authorize_terminal_save &&
             terminal_project_path) {
             const auto terminal_save_started = std::chrono::steady_clock::now();
             saving_model_.store(true, std::memory_order_release);
@@ -9024,6 +9406,9 @@ namespace lfs::training {
                 skip_reason);
         }
 
+        // Complete an already captured host snapshot even after GPU failure.
+        finish_project_writer();
+
         // A dead train loop must not report an active pause: stale is_paused_
         // makes finished-trainer saves skip the synchronous flush and wait
         // forever on a safe point.
@@ -9040,12 +9425,12 @@ namespace lfs::training {
 
         try {
             if (progress_) {
-                progress_->complete(user_stopped, terminal_iteration);
+                progress_->complete(user_stopped, terminal_iteration, terminal_error.has_value());
             }
             if (evaluator_) {
                 evaluator_->save_report();
             }
-            if (progress_ && strategy_) {
+            if (progress_ && strategy_ && !terminal_error) {
                 progress_->print_final_summary(static_cast<int>(strategy_->get_model().size()),
                                                terminal_iteration, user_stopped);
             }
@@ -9068,12 +9453,14 @@ namespace lfs::training {
         release_training_transient_state_at_boundary();
         resize_rasterizer_arena_at_boundary("B3 training end", true);
         lfs::core::Tensor::trim_memory_pool();
+#if LFS_TENSOR_CUDA
         if (auto* arena = lfs::core::GlobalArenaManager::instance().try_get_arena()) {
             // Emit arena growth and cross-module churn totals while the
             // training-end counters still include the terminal trim.
             arena->dump_statistics();
         }
 
+#endif
         auto& command_center = lfs::training::CommandCenter::instance();
         auto snapshot_guard = makeScopeGuard([&command_center, this]() {
             command_center.clear_snapshot(this);
@@ -9166,11 +9553,7 @@ namespace lfs::training {
     }
 
     int Trainer::project_snapshot_iteration() const {
-        const int current = current_iteration_.load();
-        if (is_paused_.load() && current > 0) {
-            return current - 1;
-        }
-        return current;
+        return completed_iteration_.load();
     }
 
     std::expected<std::filesystem::path, std::string>
@@ -9182,6 +9565,13 @@ namespace lfs::training {
         if (!strategy_ || !scene_) {
             return std::unexpected(
                 "Cannot save project: no initialized training scene");
+        }
+#if !LFS_TENSOR_CUDA
+        if (auto health = lfs::core::vulkan_backend_status(); !health)
+            return std::unexpected(lfs::format_for_developer(health.error()));
+#endif
+        if (completed_mutation_epoch_ != mutation_epoch_) {
+            return std::unexpected("Cannot save resumable training state after an incomplete persistent update; retain the last completed checkpoint");
         }
         if (iteration < 0) {
             return std::unexpected(
@@ -9273,8 +9663,12 @@ namespace lfs::training {
             const int controller_idx =
                 (camera_idx >= 0 && camera_idx < pool->num_cameras()) ? camera_idx : 0;
             std::lock_guard<std::mutex> controller_lock(pool->predict_mutex());
+#if LFS_TENSOR_CUDA
             const auto controller_params = pool->predict(controller_idx, rgb_chw.unsqueeze(0), 1.0f);
             return ppisp_->apply_with_controller_params(rgb_chw, controller_params, controller_idx);
+#else
+            throw std::runtime_error("PPISP controller inference is unavailable on Vulkan");
+#endif
         }
 
         int camera_id = cam.camera_id();
@@ -9320,11 +9714,15 @@ namespace lfs::training {
             const int controller_idx =
                 (camera_idx >= 0 && camera_idx < ppisp_controller_pool_->num_cameras()) ? camera_idx : 0;
             std::lock_guard<std::mutex> controller_lock(ppisp_controller_pool_->predict_mutex());
+#if LFS_TENSOR_CUDA
             const auto controller_params = ppisp_controller_pool_->predict(controller_idx, rgb_chw.unsqueeze(0), 1.0f);
             result = overrides.isIdentity()
                          ? ppisp_->apply_with_controller_params(rgb_chw, controller_params, controller_idx)
                          : ppisp_->apply_with_controller_params_and_overrides(rgb_chw, controller_params, controller_idx,
                                                                               toRenderOverrides(overrides));
+#else
+            throw std::runtime_error("PPISP controller inference is unavailable on Vulkan");
+#endif
         } else if (is_training_camera) {
             const int camera_id = ppisp_->camera_for_frame(camera_uid);
             result = overrides.isIdentity() ? ppisp_->apply(rgb_chw, camera_id, camera_uid)
@@ -9505,6 +9903,8 @@ namespace lfs::training {
         sync_strategy_optimization_params();
 
         current_iteration_ = *result;
+        completed_iteration_ = *result;
+        completed_mutation_epoch_ = mutation_epoch_;
 
         LOG_INFO("Restored training state from checkpoint at iteration {}", *result);
         return result;

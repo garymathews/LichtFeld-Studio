@@ -238,7 +238,7 @@ namespace lfs::vis {
         }
 
         std::lock_guard lock(params_mutex_);
-        active_strategy_ = std::string(lfs::core::param::kStrategyMRNF);
+        active_strategy_ = std::string(lfs::core::param::kDefaultTrainingStrategy);
         mcmc_session_ = lfs::core::param::OptimizationParameters::mcmc_defaults();
         mcmc_current_ = mcmc_session_;
         mrnf_session_ = lfs::core::param::OptimizationParameters::mrnf_defaults();

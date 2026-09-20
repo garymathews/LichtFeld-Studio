@@ -4,7 +4,11 @@
 
 #include "gui/gpu_memory_query.hpp"
 
+#include "core/tensor_backend.hpp"
+#include "core/tensor_storage.hpp"
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #ifdef _WIN32
 #include <dxgi1_4.h>
@@ -17,6 +21,7 @@
 namespace lfs::vis::gui {
 
     namespace {
+#if LFS_TENSOR_CUDA
 
         std::string shortenGpuDeviceName(std::string name) {
             if (name.rfind("NVIDIA ", 0) == 0)
@@ -259,11 +264,13 @@ namespace lfs::vis::gui {
             return s;
         }
 
+ #endif
     } // namespace
 
     GpuMemoryInfo queryGpuMemory() {
         GpuMemoryInfo info;
 
+#if LFS_TENSOR_CUDA
         int cuda_device = 0;
         if (cudaGetDevice(&cuda_device) == cudaSuccess) {
             cudaDeviceProp prop{};
@@ -287,11 +294,24 @@ namespace lfs::vis::gui {
         if (info.process_used > info.total)
             info.process_used = 0;
 
+#else
+        const auto backend = lfs::core::default_gpu_backend();
+        const auto memory = lfs::core::gpu_backend_memory_info(backend);
+        info.device_name = lfs::core::gpu_backend_name(backend);
+        info.total = memory.total_bytes;
+        info.total_used = memory.total_bytes >= memory.free_bytes ? memory.total_bytes - memory.free_bytes : 0;
+        // Heap budget usage is not an OS per-process residency counter.
+        // Leave process memory and utilization unavailable on this backend.
+#endif
         return info;
     }
 
     float queryGpuUtilization() {
+#if LFS_TENSOR_CUDA
         return nvmlState().getUtilization();
+#else
+        return -1.f;
+#endif
     }
 
 } // namespace lfs::vis::gui

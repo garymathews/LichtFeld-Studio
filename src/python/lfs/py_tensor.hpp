@@ -43,6 +43,7 @@ namespace lfs::python {
         PyTensor clone() const;
         PyTensor cpu() const;
         PyTensor cuda() const;
+        PyTensor gpu() const;
         PyTensor contiguous() const;
         void sync() const;
 

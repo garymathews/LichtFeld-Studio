@@ -6,8 +6,8 @@
 include(${CMAKE_SOURCE_DIR}/cmake/FetchLibvterm.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/CompileShaders.cmake)
 
-# SHARED on Windows to avoid singleton duplication across .exe/.pyd boundary
-if(WIN32)
+# Share GUI registries across the executable and Python module on Windows and macOS.
+if(WIN32 OR APPLE)
     set(LFS_VIS_LIB_TYPE SHARED)
 else()
     set(LFS_VIS_LIB_TYPE STATIC)
@@ -226,6 +226,13 @@ if(MSVC)
 endif()
 
 # Set include directories
+if(APPLE)
+    enable_language(OBJCXX)
+    target_sources(lfs_visualizer PRIVATE window/native_error_dialog.mm)
+    set_property(TARGET lfs_visualizer PROPERTY OBJCXX_STANDARD 23)
+    target_link_libraries(lfs_visualizer PRIVATE "-framework Cocoa")
+endif()
+
 target_include_directories(lfs_visualizer
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -257,7 +264,7 @@ target_link_libraries(lfs_visualizer
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
-        CUDA::cudart
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::cudart>
         Freetype::Freetype
         nfd::nfd
         vterm
@@ -279,9 +286,9 @@ endif()
 target_sources(lfs_visualizer
         PRIVATE
         gui/rmlui/rmlui_vk_backend.cpp
-        rendering/lod_page_dequant_cuda.cu
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:rendering/lod_page_dequant_cuda.cu>
         rendering/vksplat_input_packer.cpp
-        rendering/vksplat_input_packer_cuda.cu
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:rendering/vksplat_input_packer_cuda.cu>
         rendering/vksplat_viewport_renderer.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
@@ -358,10 +365,7 @@ if(NOT WIN32)
 
     find_package(lunasvg CONFIG REQUIRED)
     target_link_libraries(lfs_rmlui PRIVATE
-        -Wl,--whole-archive
-        $<TARGET_FILE:RmlUi::Core>
-        $<TARGET_FILE:RmlUi::Debugger>
-        -Wl,--no-whole-archive
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,RmlUi::Core,RmlUi::Debugger>"
         Freetype::Freetype
         lunasvg::lunasvg
     )

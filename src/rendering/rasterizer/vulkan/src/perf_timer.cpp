@@ -1,4 +1,5 @@
 #include "perf_timer.h"
+#include "gs_pipeline.h"
 
 #include "diagnostics/vram_profiler.hpp"
 
@@ -34,62 +35,64 @@ namespace PerfTimer {
         return nullptr;
     }
 
-    std::vector<Marker> marks;
-    std::vector<TrainStage> pushedMarks;
+    void hostTic(VulkanGSPipeline* module) {
+        auto& state = module->perf_timer_state;
 
-    bool hostHold = false;
-    std::chrono::time_point<std::chrono::high_resolution_clock> hostStartTime;
-    double hostTimeDelta = -1.0;
-
-    void hostTic() {
-        if (hostHold) {
+        if (state.hostHold) {
             lfs::rendering::throw_renderer_contract(
                 std::format(
                     "PerfTimer::hostTic cannot start an already-running host interval (host_hold={}, accumulated_seconds={}, marker_count={}, pushed_marker_count={})",
-                    hostHold,
-                    hostTimeDelta,
-                    marks.size(),
-                    pushedMarks.size()),
+                    state.hostHold,
+                    state.hostTimeDelta,
+                    state.marks.size(),
+                    state.pushedMarks.size()),
                 LFS_SOURCE_SITE_CURRENT());
         }
-        hostHold = true;
-        hostStartTime = std::chrono::high_resolution_clock::now();
+        state.hostHold = true;
+        state.hostStartTime = std::chrono::high_resolution_clock::now();
     }
 
-    void hostToc() {
-        if (hostTimeDelta < 0.0) {
-            hostTimeDelta = 0.0;
+    void hostToc(VulkanGSPipeline* module) {
+        auto& state = module->perf_timer_state;
+
+        if (state.hostTimeDelta < 0.0) {
+            state.hostTimeDelta = 0.0;
             return;
         }
-        if (!hostHold) {
+        if (!state.hostHold) {
             lfs::rendering::throw_renderer_contract(
                 std::format(
                     "PerfTimer::hostToc requires a running host interval (host_hold={}, accumulated_seconds={}, marker_count={}, pushed_marker_count={})",
-                    hostHold,
-                    hostTimeDelta,
-                    marks.size(),
-                    pushedMarks.size()),
+                    state.hostHold,
+                    state.hostTimeDelta,
+                    state.marks.size(),
+                    state.pushedMarks.size()),
                 LFS_SOURCE_SITE_CURRENT());
         }
-        hostHold = false;
+        state.hostHold = false;
         auto hostEndTime = std::chrono::high_resolution_clock::now();
-        hostTimeDelta += std::chrono::duration<double>(hostEndTime - hostStartTime).count();
+        state.hostTimeDelta += std::chrono::duration<double>(hostEndTime - state.hostStartTime).count();
     }
 
     template <TrainStage stage>
     Timer<stage>::Timer(VulkanGSPipeline* module) : module(module) {
-        then = std::chrono::high_resolution_clock::now();
+        auto& marks = module->perf_timer_state.marks;
+
         module->writeTimestamp(1);
         marks.emplace_back(stage, 1);
     }
 
     template <TrainStage stage>
     Timer<stage>::~Timer() {
+        auto& marks = module->perf_timer_state.marks;
+
         if (module->writeTimestampNoExcept(-1))
             marks.emplace_back(stage, -1);
     }
 
     void pushMarker(VulkanGSPipeline* module) {
+        auto& marks = module->perf_timer_state.marks;
+        auto& pushedMarks = module->perf_timer_state.pushedMarks;
 
         module->writeTimestamp(-1);
 
@@ -114,6 +117,10 @@ namespace PerfTimer {
     }
 
     void popMarkers(VulkanGSPipeline* module) {
+        auto& marks = module->perf_timer_state.marks;
+        auto& pushedMarks = module->perf_timer_state.pushedMarks;
+        auto& hostTimeDelta = module->perf_timer_state.hostTimeDelta;
+
         while (!pushedMarks.empty()) {
             auto stage = pushedMarks.back();
             pushedMarks.pop_back();
@@ -123,13 +130,18 @@ namespace PerfTimer {
         hostTimeDelta = 0.0;
     }
 
-    std::vector<Marker> takeMarkers() {
+    std::vector<Marker> takeMarkers(VulkanGSPipeline* module) {
+        auto& marks = module->perf_timer_state.marks;
+
         std::vector<Marker> result;
         result.swap(marks);
         return result;
     }
 
-    void discardMarkers() noexcept {
+    void discardMarkers(VulkanGSPipeline* module) noexcept {
+        auto& marks = module->perf_timer_state.marks;
+        auto& pushedMarks = module->perf_timer_state.pushedMarks;
+
         marks.clear();
         pushedMarks.clear();
     }

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "hdr_libplacebo.hpp"
+#if LFS_WITH_LIBPLACEBO
 #include "core/include/core/logger.hpp"
 
 extern "C" {
@@ -308,3 +309,26 @@ namespace lfs::io {
     void HdrLibplaceboRenderer::reset() { impl_->reset(); }
 
 } // namespace lfs::io
+
+#else
+namespace lfs::io {
+    class HdrLibplaceboRenderer::Impl {};
+    HdrLibplaceboRenderer::HdrLibplaceboRenderer() = default;
+    HdrLibplaceboRenderer::~HdrLibplaceboRenderer() = default;
+    bool HdrLibplaceboRenderer::isAvailable(std::string& error) {
+        error = "HDR tone mapping is unavailable: this build does not include libplacebo";
+        return false;
+    }
+    bool HdrLibplaceboRenderer::tonemapToSdr(const AVFrame*, const AVStream*, HdrFormat,
+                                             int, int, std::vector<unsigned char>&,
+                                             std::string& error, HdrTonemapTiming*) {
+        return isAvailable(error);
+    }
+    bool HdrLibplaceboRenderer::tonemapToSdrRgba(const AVFrame*, const AVStream*, HdrFormat,
+                                                 int, int, int, std::vector<unsigned char>&,
+                                                 std::string& error) {
+        return isAvailable(error);
+    }
+    void HdrLibplaceboRenderer::reset() {}
+} // namespace lfs::io
+#endif

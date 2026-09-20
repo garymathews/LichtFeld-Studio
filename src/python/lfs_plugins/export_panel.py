@@ -30,6 +30,8 @@ class ExportFormat(IntEnum):
     SSOG = 8
 
 
+CUDA_EXPORT_FORMATS = (ExportFormat.SOG, ExportFormat.SSOG, ExportFormat.HTML_VIEWER)
+
 FORMAT_INFO = (
     (ExportFormat.PLY, "export.format.ply_standard"),
     (ExportFormat.SOG, "export.format.sog_supersplat"),
@@ -490,7 +492,11 @@ class ExportPanel(Panel):
         return False
 
     def _get_export_error_text(self):
+        if self._can_export():
+            return ""
         tr = lf.ui.tr
+        if lf.get_gpu_backend() != "cuda" and self._format in CUDA_EXPORT_FORMATS:
+            return "This export format requires CUDA. Choose another format."
         if self._format == ExportFormat.SSOG and not self._ssog_bundle and not self._valid_ssog_folder_name():
             return tr("export_dialog.invalid_folder_name")
         if self._format != ExportFormat.COLMAP:
@@ -567,7 +573,7 @@ class ExportPanel(Panel):
             [
                 {
                     "index": str(int(fmt)),
-                    "label": tr(key),
+                    "label": tr(key) + (" (requires CUDA)" if lf.get_gpu_backend() != "cuda" and fmt in CUDA_EXPORT_FORMATS else ""),
                     "selected": fmt == self._format,
                 }
                 for fmt, key in FORMAT_INFO
@@ -704,6 +710,8 @@ class ExportPanel(Panel):
             return False
 
     def _can_export(self):
+        if lf.get_gpu_backend() != "cuda" and self._format in CUDA_EXPORT_FORMATS:
+            return False
         if self._format == ExportFormat.COLMAP:
             return self._can_export_colmap()
         return bool(self._selected_nodes) and (

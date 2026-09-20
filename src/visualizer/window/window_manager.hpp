@@ -10,6 +10,7 @@
 #include "visualizer/visualizer.hpp"
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <glm/glm.hpp>
 #include <memory>
 #include <optional>
@@ -70,6 +71,10 @@ namespace lfs::vis {
         void requestClose() { should_close_ = true; }
         void cancelClose();
         void wakeEventLoop();
+        // The callback must contain exceptions; SDL invokes it inside native event polling.
+        void setLiveResizeCallback(std::function<void()> callback);
+        [[nodiscard]] bool isLiveResizeRendering() const { return live_resize_rendering_; }
+        void showErrorDialog(const char* title, const char* message);
         void refreshResizeCursor();
         [[nodiscard]] unsigned manualResizeEdgeMask() const;
 
@@ -110,6 +115,7 @@ namespace lfs::vis {
 
         SDL_Window* window_ = nullptr;
         std::unique_ptr<VulkanContext> vulkan_context_;
+        bool tensor_backend_adopted_ = false;
         GraphicsBackend graphics_backend_ = GraphicsBackend::Vulkan;
         std::string title_;
         glm::ivec2 window_size_;
@@ -145,6 +151,9 @@ namespace lfs::vis {
         InputController* input_controller_ = nullptr;
         input::InputRouter input_router_;
         FrameInputBuffer frame_input_;
+        std::function<void()> live_resize_callback_;
+        bool live_resize_rendering_ = false;
+        static bool liveResizeEventWatch(void* userdata, SDL_Event* event);
         std::vector<std::string> pending_drop_files_;
 
         void beginTitlebarNativeMove();
@@ -171,6 +180,8 @@ namespace lfs::vis {
         [[nodiscard]] bool titlebarDragMovedEnough() const;
         [[nodiscard]] bool isTitlebarDragAtDisplayTop() const;
         void flushPendingTitlebarDoubleClick();
+        void adoptTensorBackendDevice();
+        void releaseTensorBackendDevice();
     };
 
 } // namespace lfs::vis

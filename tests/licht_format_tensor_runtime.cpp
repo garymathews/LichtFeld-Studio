@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include "core/float16.hpp"
 #include "core/mesh_data.hpp"
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
@@ -42,7 +43,7 @@ namespace lfs::core {
             case DataType::Float32:
                 return tensor.ptr<float>()[index];
             case DataType::Float16:
-                return __half2float(tensor.ptr<__half>()[index]);
+                return static_cast<float>(tensor.ptr<Float16>()[index]);
             case DataType::Int32:
                 return tensor.ptr<std::int32_t>()[index];
             case DataType::Int64:
@@ -61,8 +62,8 @@ namespace lfs::core {
                 tensor.ptr<float>()[index] = static_cast<float>(value);
                 return;
             case DataType::Float16:
-                tensor.ptr<__half>()[index] =
-                    __float2half(static_cast<float>(value));
+                tensor.ptr<Float16>()[index] =
+                    static_cast<Float16>(static_cast<float>(value));
                 return;
             case DataType::Int32:
                 tensor.ptr<std::int32_t>()[index] =

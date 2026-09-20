@@ -8,7 +8,10 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/provenance.hpp"
+#include "core/tensor_backend.hpp"
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <format>
 
 extern "C" {
@@ -16,8 +19,8 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_cuda.h>
 #include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 }
 
 namespace lfs::io::video {
@@ -64,9 +67,14 @@ namespace lfs::io::video {
             y_plane_bytes_ = width * height;
             uv_plane_bytes_ = y_plane_bytes_ / 4;
 
-            if (!tryInitNvenc(path, opts)) {
+#if LFS_TENSOR_CUDA
+            if (core::default_gpu_backend() != core::GpuBackend::CUDA || !tryInitNvenc(path, opts))
+#endif
+            {
                 cleanup();
+#if LFS_TENSOR_CUDA
                 LOG_INFO("NVENC unavailable, falling back to x264");
+#endif
                 if (const auto result = initX264(path, opts); !result) {
                     cleanup();
                     return result;
@@ -94,6 +102,7 @@ namespace lfs::io::video {
                 return std::unexpected("Frame size mismatch");
             }
 
+#if LFS_TENSOR_CUDA
             // Boundary for CUDA launches that now throw lfs::Exception
             // (rgbToNv12Cuda / rgbToYuv420pCuda via LFS_CUDA_LAUNCH_CHECK).
             // Keep the expected-based API non-throwing so the GUI export
@@ -113,6 +122,37 @@ namespace lfs::io::video {
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));
             }
+#else
+            return std::unexpected("Raw GPU frame encoding requires CUDA; use the CPU RGB frame API");
+#endif
+        }
+
+        std::expected<void, std::string> writeFrame(
+            const std::span<const uint8_t> rgb, const int width, const int height) {
+            if (!is_open_)
+                return std::unexpected("Encoder not open");
+            if (width != width_ || height != height_)
+                return std::unexpected("Frame size mismatch");
+            if (rgb.size() != y_plane_bytes_ * 3)
+                return std::unexpected("RGB frame byte count mismatch");
+            if (use_nvenc_)
+                return std::unexpected("CPU frames require the software video encoder");
+            if (av_frame_make_writable(frame_) < 0)
+                return std::unexpected("Frame not writable");
+            sws_ctx_ = sws_getCachedContext(sws_ctx_, width_, height_, AV_PIX_FMT_RGB24,
+                                            width_, height_, AV_PIX_FMT_YUV420P,
+                                            SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!sws_ctx_)
+                return std::unexpected("RGB-to-YUV conversion context creation failed");
+            const uint8_t* source[] = {rgb.data(), nullptr, nullptr, nullptr};
+            const int strides[] = {width_ * 3, 0, 0, 0};
+            if (sws_scale(sws_ctx_, source, strides, 0, height_, frame_->data, frame_->linesize) != height_)
+                return std::unexpected("RGB-to-YUV conversion failed");
+            frame_->pts = frame_count_;
+            if (auto result = encodeFrame(frame_); !result)
+                return result;
+            ++frame_count_;
+            return {};
         }
 
         std::expected<void, std::string> close() {
@@ -144,6 +184,7 @@ namespace lfs::io::video {
         [[nodiscard]] bool isOpen() const { return is_open_; }
 
     private:
+#if LFS_TENSOR_CUDA
         bool tryInitNvenc(const std::filesystem::path& path, const VideoExportOptions& opts) {
             const AVCodec* const codec = avcodec_find_encoder_by_name("h264_nvenc");
             if (!codec) {
@@ -265,6 +306,7 @@ namespace lfs::io::video {
             return true;
         }
 
+#endif
         std::expected<void, std::string> initX264(
             const std::filesystem::path& path,
             const VideoExportOptions& opts) {
@@ -276,7 +318,7 @@ namespace lfs::io::video {
                 return std::unexpected("MP4 context creation failed");
             }
 
-            const AVCodec* const codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+            const AVCodec* const codec = avcodec_find_encoder_by_name("libx264");
             if (!codec) {
                 return std::unexpected("H.264 encoder not found");
             }
@@ -357,12 +399,17 @@ namespace lfs::io::video {
                 return std::unexpected("Packet allocation failed");
             }
 
-            if (const auto allocation = allocateGpuBuffers(); !allocation)
-                return allocation;
+#if LFS_TENSOR_CUDA
+            if (core::default_gpu_backend() == core::GpuBackend::CUDA) {
+                if (const auto allocation = allocateGpuBuffers(); !allocation)
+                    return allocation;
+            }
+#endif
             LOG_INFO("x264: {}x{} @ {} fps, CRF {}", width_, height_, framerate_, opts.crf);
             return {};
         }
 
+#if LFS_TENSOR_CUDA
         [[nodiscard]] std::expected<void, std::string> allocateGpuBuffers() {
             if (auto result = checkCuda(cudaMalloc(&y_gpu_, y_plane_bytes_), "Video Y-plane GPU allocation"); !result)
                 return result;
@@ -414,6 +461,8 @@ namespace lfs::io::video {
             const void* const rgb_gpu_ptr,
             const cudaStream_t stream) {
 
+            if (!y_gpu_ || !u_gpu_ || !v_gpu_ || !y_pinned_ || !u_pinned_ || !v_pinned_)
+                return std::unexpected("CUDA video buffers are unavailable for this encoder");
             rgbToYuv420pCuda(
                 static_cast<const float*>(rgb_gpu_ptr),
                 y_gpu_, u_gpu_, v_gpu_,
@@ -467,7 +516,10 @@ namespace lfs::io::video {
             return {};
         }
 
+#endif
         std::expected<void, std::string> encodeFrame(AVFrame* const frame) {
+            if (frame)
+                frame->duration = 1; // One tick of the encoder's 1/framerate time base.
             int ret = avcodec_send_frame(codec_ctx_, frame);
             if (ret < 0) {
                 char err[AV_ERROR_MAX_STRING_SIZE];
@@ -485,6 +537,10 @@ namespace lfs::io::video {
                     return std::unexpected(std::string("Receive packet error: ") + err);
                 }
 
+                // libx264 can leave packet duration unset even for constant-rate
+                // input. Preserve the final frame's interval in the MP4 timeline.
+                if (packet_->duration <= 0)
+                    packet_->duration = 1;
                 av_packet_rescale_ts(packet_, codec_ctx_->time_base, stream_->time_base);
                 packet_->stream_index = stream_->index;
 
@@ -527,6 +583,9 @@ namespace lfs::io::video {
         }
 
         void cleanup() {
+            sws_freeContext(sws_ctx_);
+            sws_ctx_ = nullptr;
+#if LFS_TENSOR_CUDA
             if (y_gpu_) {
                 cudaFree(y_gpu_);
                 y_gpu_ = nullptr;
@@ -553,6 +612,7 @@ namespace lfs::io::video {
                 v_pinned_ = nullptr;
             }
 
+#endif
             if (packet_) {
                 av_packet_free(&packet_);
                 packet_ = nullptr;
@@ -567,6 +627,7 @@ namespace lfs::io::video {
             use_nvenc_ = false;
         }
 
+        SwsContext* sws_ctx_ = nullptr;
         AVFormatContext* fmt_ctx_ = nullptr;
         AVCodecContext* codec_ctx_ = nullptr;
         AVStream* stream_ = nullptr;
@@ -604,8 +665,8 @@ namespace lfs::io::video {
     }
 
     std::expected<void, std::string> VideoEncoder::writeFrame(
-        std::span<const uint8_t> /*rgba_data*/, const int /*width*/, const int /*height*/) {
-        return std::unexpected("CPU path not implemented - use writeFrameGpu");
+        std::span<const uint8_t> rgb_data, const int width, const int height) {
+        return impl_->writeFrame(rgb_data, width, height);
     }
 
     std::expected<void, std::string> VideoEncoder::writeFrameGpu(

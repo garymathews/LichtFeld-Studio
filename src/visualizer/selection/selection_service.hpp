@@ -10,7 +10,7 @@
 #include "rendering/rendering_types.hpp"
 #include <array>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 #include <glm/mat4x4.hpp>
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
@@ -166,7 +166,11 @@ namespace lfs::vis {
             std::shared_ptr<core::Tensor> mask;
             std::unique_ptr<op::SceneSnapshot> undo_entry;
             core::Tensor scratch;
+#if LFS_TENSOR_CUDA
             int* host_counts = nullptr;
+#else
+            int host_counts[std::tuple_size_v<core::Scene::SelectionGroupCounts> + 1]{};
+#endif
             cudaEvent_t ready_event = nullptr;
             bool pending = false;
             bool apply_to_scene = true;

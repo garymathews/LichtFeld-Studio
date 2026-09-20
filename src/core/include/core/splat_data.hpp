@@ -228,12 +228,15 @@ namespace lfs::core {
         // Deep-copies scalars and tensors, including q16 bounds. Skips allocator,
         // capacity hook, LOD tree, frozen ranges, and layout generation.
         [[nodiscard]] SplatData clone() const;
+        // Publish detached training storage while retaining scene-owned hooks
+        // and monotonically advancing renderer invalidation generations.
+        void adopt_training_update(SplatData&& prepared) noexcept;
 
         // Deep-copy tensor state onto an already-created CUDA stream. Device
         // copies remain ordered on `stream`; callers synchronize before using
         // the returned snapshot from another thread. CPU tensors are copied
         // synchronously because they do not participate in CUDA transfers.
-        [[nodiscard]] SplatData clone_async(cudaStream_t stream) const;
+        [[nodiscard]] SplatData clone_async(cudaStream_t stream, bool preserve_capacity = false) const;
 
         // ========== Computed getters ==========
         Tensor get_means() const;

@@ -5,7 +5,9 @@
 #include "gui/gui_manager.hpp"
 #include "control/command_api.hpp"
 #include "core/camera.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/environment.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
 #include "core/event_bridge/localization_manager.hpp"
@@ -4462,8 +4464,9 @@ namespace lfs::vis::gui {
 #ifdef LFS_DEV_LOCALE_SOURCE_DIR
         {
             const auto source_locale_dir = lfs::core::utf8_to_path(LFS_DEV_LOCALE_SOURCE_DIR);
-            if (std::filesystem::exists(source_locale_dir) &&
-                std::filesystem::is_directory(source_locale_dir)) {
+            std::error_code ec;
+            if (lfs::core::usingDevelopmentResources() &&
+                std::filesystem::is_directory(source_locale_dir, ec)) {
                 locale_dir = source_locale_dir;
                 LOG_INFO("Localization dev source enabled: {}",
                          lfs::core::path_to_utf8(locale_dir));
@@ -4756,20 +4759,22 @@ namespace lfs::vis::gui {
         dev_resource_watch_ = {};
 
 #if !defined(LFS_BUILD_PORTABLE) && (defined(LFS_DEV_RMLUI_SOURCE_DIR) || defined(LFS_DEV_LOCALE_SOURCE_DIR))
-        if (!lfs::core::environment::flag("LFS_DEV_HOT_RELOAD", true))
+        if (!lfs::core::usingDevelopmentResources() || !lfs::core::environment::flag("LFS_DEV_HOT_RELOAD", true))
             return;
 
 #ifdef LFS_DEV_RMLUI_SOURCE_DIR
         {
             const auto dir = lfs::core::utf8_to_path(LFS_DEV_RMLUI_SOURCE_DIR);
-            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir))
+            std::error_code ec;
+            if (std::filesystem::is_directory(dir, ec))
                 dev_resource_watch_.rml_dir = dir;
         }
 #endif
 #ifdef LFS_DEV_LOCALE_SOURCE_DIR
         {
             const auto dir = lfs::core::utf8_to_path(LFS_DEV_LOCALE_SOURCE_DIR);
-            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir))
+            std::error_code ec;
+            if (std::filesystem::is_directory(dir, ec))
                 dev_resource_watch_.locale_dir = dir;
         }
 #endif
@@ -5875,12 +5880,16 @@ namespace lfs::vis::gui {
                                                LFS_SOURCE_SITE_CURRENT());
         }
 
+
+#if LFS_TENSOR_CUDA
         if (!cuda_unavailable_notified_ && lfs::core::cuda_is_unavailable()) {
             cuda_unavailable_notified_ = true;
             lfs::core::events::state::CudaUnavailable{
                 .message = LOC("runtime.cuda_unavailable_message")}
                 .emit();
         }
+#endif
+
 
         promptFileAssociation();
 

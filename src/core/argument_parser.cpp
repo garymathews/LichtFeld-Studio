@@ -107,7 +107,7 @@ namespace lfs::core::args {
             const prop::PropertyMeta& meta) {
             if (!meta.getter)
                 throw std::runtime_error("Optimization property has no getter: " + meta.id);
-            auto defaults = param::OptimizationParameters::mrnf_defaults();
+            auto defaults = param::OptimizationParameters::defaults_for_strategy(param::kDefaultTrainingStrategy);
             const auto ref = prop::PropertyObjectRef::cpp(&defaults);
             const auto value = meta.getter(ref);
 
@@ -1733,7 +1733,7 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[]) {
         else if (strategy == "mcmc")
             params->optimization = lfs::core::param::OptimizationParameters::mcmc_defaults();
         else
-            params->optimization = lfs::core::param::OptimizationParameters::mrnf_defaults();
+            params->optimization = lfs::core::param::OptimizationParameters::defaults_for_strategy(lfs::core::param::kDefaultTrainingStrategy);
     }
 
     params->dataset.loading_params = lfs::core::param::LoadingParams{};

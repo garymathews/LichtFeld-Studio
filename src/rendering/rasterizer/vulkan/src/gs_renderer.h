@@ -262,6 +262,35 @@ public:
                                   const _VulkanBuffer& lod_weights = _VulkanBuffer(),
                                   const _VulkanBuffer& lod_counts = _VulkanBuffer(),
                                   bool write_overlay_flags = true);
+    // Record the complete training forward chain for one image region. Retains
+    // the tile lists/pixel state used by backward, and snapshots visibility before
+    // the viewer's scratch aliases are reused. Returns the exact instance count;
+    // counts above HIGS_DEPTH_WAVE_INSTANCES (or overflow) return before rasterization
+    // so the caller can subdivide and replay the image region.
+    TileInstanceGate executeTrainingForward(VulkanGSRendererUniforms uniforms,
+                                  VulkanGSPipelineBuffers& buffers,
+                                  const _VulkanBuffer& projection_visibility);
+
+    // Gradients use the same split parameter layout as forward. The visibility
+    // snapshot must precede the tiles_touched/index_buffer_offset alias reuse.
+    // Input adjoints are gradients.xy_vs, inv_cov_vs_opacity, and rgb; this
+    // overwrites gradients' six raw-parameter buffers (no accumulation).
+    void executeProjectionBackward(const VulkanGSRendererUniforms& uniforms,
+                                   const VulkanGSPipelineBuffers& parameters,
+                                   const _VulkanBuffer& projection_visibility,
+                                   VulkanGSPipelineBuffers& gradients);
+
+    // Reverse a complete, single-wave plain fp32 rasterization. Forward tile
+    // ranges, sorted IDs, pixel state and contributor counts must be retained.
+    // pixel_state in gradients contains dLoss/d(RGB, transmittance); projected
+    // adjoints are overwritten, ready for executeProjectionBackward.
+    void executeRasterizationBackward(const VulkanGSRendererUniforms& uniforms,
+                                      const VulkanGSPipelineBuffers& forward,
+                                      size_t instance_count,
+                                      VulkanGSPipelineBuffers& gradients,
+                                      const _VulkanBuffer& error_map = {},
+                                      const _VulkanBuffer& densification_info = {});
+
     // HiGS viewer chain. The cull prepass + survivor projection replace the
     // N-wide projection / visible-flag / compact passes: per-splat outputs are
     // written at wave-appended compact slots and the depth-sort input is
@@ -310,6 +339,7 @@ public:
                                 bool overlays_active,
                                 bool predicate_waves = true);
     [[nodiscard]] bool supportsFloat16Storage() const { return supports_float16_storage_; }
+    [[nodiscard]] bool supportsMacroRaster() const { return supports_macro_raster_; }
     [[nodiscard]] bool supportsConditionalRendering() const {
         return supports_conditional_rendering_;
     }
@@ -424,6 +454,9 @@ protected:
 
     // Binding 8 is unused (legacy write-only radii buffer deleted). Shader
     // binding numbers stay stable so tagged lists keep placeholder slot 8.
+    _ComputePipeline pipeline_projection_backward = _ComputePipeline(16);
+    _ComputePipeline pipeline_rasterize_backward = _ComputePipeline(11);
+    _ComputePipeline pipeline_rasterize_backward_mcmc = _ComputePipeline(13);
     _ComputePipeline pipeline_projection_forward = _ComputePipeline(vksplatSkipBinding(24, 8));
     _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(vksplatSkipBinding(24, 8));
     // Canonical quantized LOD pool variants: same binding sets plus the
@@ -488,6 +521,7 @@ protected:
     _ComputePipelinePair pipeline_macro_compose = _ComputePipelinePair(12);
     _ComputePipelinePair pipeline_macro_compose_overlays = _ComputePipelinePair(18);
     bool supports_float16_storage_ = false;
+    bool supports_macro_raster_ = false;
     bool supports_conditional_rendering_ = false;
     PFN_vkCmdBeginConditionalRenderingEXT vk_cmd_begin_conditional_rendering_ = nullptr;
     PFN_vkCmdEndConditionalRenderingEXT vk_cmd_end_conditional_rendering_ = nullptr;

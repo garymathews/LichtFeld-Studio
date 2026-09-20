@@ -410,6 +410,9 @@ namespace lfs::io {
         void prefetch_thread_func();
         void gpu_batch_decode_thread_func();
         void cold_process_thread_func(size_t worker_index);
+#if !LFS_TENSOR_CUDA
+        void process_portable_item(const PrefetchedImage& item);
+#endif
 
         std::string make_cache_key(const std::filesystem::path& path, const LoadParams& params) const;
         bool is_jpeg_data(const std::vector<uint8_t>& data) const;

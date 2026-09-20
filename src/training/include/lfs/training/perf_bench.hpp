@@ -20,7 +20,10 @@
 
 #include "diagnostics/vram_profiler.hpp"
 
-#include <cuda_runtime_api.h>
+#include "core/cuda_stream_fwd.hpp"
+#if !LFS_TENSOR_CUDA
+#include "core/vulkan_phase_timing.hpp"
+#endif
 
 #include <cstdint>
 #include <filesystem>
@@ -76,10 +79,33 @@ namespace lfs::training {
                 return;
             }
             instance().record_phase_mark(b);
+#if !LFS_TENSOR_CUDA
+            // Also timestamp the boundary on the device. Host marks cannot attribute
+            // pipelined GPU work: they record when the host reached the boundary, so the
+            // work of an earlier phase is charged to whichever phase drains it.
+            lfs::core::vulkan_phase_timing_announce(
+                (static_cast<std::uint32_t>(iter) << kTagIterShift) |
+                (static_cast<std::uint32_t>(b) << kTagBoundaryShift) |
+                (instance().phase_refining_ ? 1u : 0u));
+#endif
+        }
+
+        /// Device-timestamp a sub-phase boundary inside the optimizer phase. `subtag` picks the
+        /// free boundary slot (0 or 1); the trainer uses 0 to split refinement from the Adam step.
+        /// Only subtag 0 is currently emitted; slot 7 (subtag 1) is reserved.
+        static void phase_mark_sub(int iter, unsigned subtag) {
+            if (iter != phase_active_iter_)
+                return;
+#if !LFS_TENSOR_CUDA
+            lfs::core::vulkan_phase_timing_announce(
+                (static_cast<std::uint32_t>(iter) << kTagIterShift) |
+                ((kSubPhaseBoundary + subtag) << kTagBoundaryShift) |
+                (instance().phase_refining_ ? 1u : 0u));
+#endif
         }
 
         void on_training_start(int total_iters);
-        void on_step_begin(int iter);
+        void on_step_begin(int iter, bool refining = false);
         void on_step_end(int iter, float loss, std::size_t live_splats);
         void set_ledger(const diagnostics::TrainingStateLedger& ledger);
         void set_psnr(double psnr);
@@ -120,11 +146,31 @@ namespace lfs::training {
         static constexpr int kPhaseSampleCap = 400;
         static constexpr int kPhaseBoundaryCount = static_cast<int>(PhaseBoundary::Count);
 
+        // Vulkan device-tag layout (encode in phase_mark / phase_mark_sub, decode in finalize):
+        //   bits [0]      = refining flag
+        //   bits [1..3]   = boundary slot (0..7, 3 bits)
+        //   bits [4+]     = iteration
+        // Boundaries 0..5 are the primary phases; slot 6 is the optimizer sub-mark and slot 7
+        // is reserved.
+        static constexpr unsigned kTagIterShift = 4;
+        static constexpr unsigned kTagBoundaryShift = 1;
+        static constexpr unsigned kTagBoundarySlots = 8;
+        static constexpr unsigned kTagBoundaryMask = kTagBoundarySlots - 1u;
+        static constexpr unsigned kSubPhaseBoundary = 6;
+        // pre_fwd..optimizer_and_refinement (kPhaseBoundaryCount - 1).
+        static constexpr int kGpuPhaseCount = 5;
+
         struct PhaseSample {
             int iter = 0;
+            bool refining = false;
             std::uint32_t seen_mask = 0;
             std::int64_t host_ns[kPhaseBoundaryCount]{};
+            /// Monotonic device-wait total at each boundary; consecutive marks give the per-phase split.
+            std::uint64_t host_wait_total_ns[kPhaseBoundaryCount]{};
         };
+
+        // Detail rows are split by refinement state; so is the window total.
+        static constexpr int kPhaseBuckets = 2;
 
         PerfBenchCollector() = default;
         ~PerfBenchCollector();
@@ -146,8 +192,16 @@ namespace lfs::training {
         int phase_sample_count_ = 0;
         int phase_current_index_ = -1;
         int phase_last_primary_iter_ = 0;
+        bool phase_refining_ = false;
         std::vector<PhaseSample> phase_samples_;
         std::vector<cudaEvent_t> phase_events_;
+        // Whole-window phase totals per steady iteration (Vulkan host intervals),
+        // bucketed by whether the iteration performed refinement.
+        PhaseSample phase_scratch_;
+        double phase_sum_ms_[kPhaseBuckets][kPhaseBoundaryCount]{};
+        // Host time inside each phase spent blocked on the device, averaged like phase_sum_ms_.
+        double phase_wait_ms_[kPhaseBuckets][kPhaseBoundaryCount]{};
+        std::uint64_t phase_sum_steps_[kPhaseBuckets]{};
 
         bool started_ = false;
         int total_iters_ = 0;
@@ -164,6 +218,7 @@ namespace lfs::training {
         std::uint64_t steady_steps_ = 0;
         double warmup_ms_sum_ = 0.0;
         double steady_ms_sum_ = 0.0;
+        std::vector<double> step_ms_;
         // Dataloader wait is outside train_step timing (steady_ms is blind to it).
         double dataloader_wait_ms_sum_ = 0.0;
         double steady_dataloader_wait_ms_sum_ = 0.0;

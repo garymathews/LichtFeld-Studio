@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 
 namespace lfs::training::kernels {
 

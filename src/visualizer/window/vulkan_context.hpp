@@ -248,6 +248,17 @@ namespace lfs::vis {
         [[nodiscard]] uint32_t transferQueueFamily() const { return transfer_queue_family_; }
         [[nodiscard]] bool hasDedicatedTransferQueue() const { return has_dedicated_transfer_queue_; }
         [[nodiscard]] const std::array<std::uint8_t, VK_UUID_SIZE>& deviceUUID() const { return device_uuid_; }
+        // A second queue and the feature set the tensor library's Vulkan backend
+        // needs to run on this device. `complete` is false when the device lacks a
+        // required feature or has no spare queue; the backend then keeps its own device.
+        struct TensorBackendDevice {
+            VkQueue queue = VK_NULL_HANDLE;
+            uint32_t queue_family = 0;
+            bool shader_atomic_float = false;
+            bool shader_float16 = false;
+            bool complete = false;
+        };
+        [[nodiscard]] const TensorBackendDevice& tensorBackendDevice() const { return tensor_backend_device_; }
         [[nodiscard]] bool externalMemoryDedicatedAllocationEnabled() const {
             return external_memory_dedicated_allocation_enabled_;
         }
@@ -282,6 +293,7 @@ namespace lfs::vis {
         [[nodiscard]] LFS_VIS_API bool endFrame();
         [[nodiscard]] bool hasActiveFrame() const noexcept { return frame_active_; }
         [[nodiscard]] LFS_VIS_API std::expected<WindowCapture, std::string> captureAndEndActiveFrameRgba();
+        void withQueuesIdle(const std::function<void()>& work);
         [[nodiscard]] bool waitForNextFrameSlot();
         [[nodiscard]] bool waitForCurrentFrameSlot();
         [[nodiscard]] LFS_VIS_API bool waitForSubmittedFrames();
@@ -492,6 +504,7 @@ namespace lfs::vis {
         VkQueue transfer_queue_ = VK_NULL_HANDLE;
         uint32_t transfer_queue_family_ = 0;
         bool has_dedicated_transfer_queue_ = false;
+        TensorBackendDevice tensor_backend_device_{};
 
         VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
         VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
@@ -547,6 +560,7 @@ namespace lfs::vis {
         // binary semaphore while an earlier vkQueuePresentKHR wait is still pending whenever the
         // swapchain has more images than frames in flight.
         std::vector<VkSemaphore> render_finished_;
+        std::vector<VkFence> present_fences_;
         std::array<VkFence, kFramesInFlight> in_flight_{};
         std::array<std::uint64_t, kFramesInFlight> frame_submit_serials_{};
         std::uint64_t frame_submit_serial_ = 0;
@@ -587,6 +601,7 @@ namespace lfs::vis {
         bool sparse_binding_enabled_ = false;
         bool buffer_device_address_enabled_ = false;
         std::mutex graphics_queue_mutex_;
+        VkFence retirement_fence_ = VK_NULL_HANDLE; // Retained only on unknown completion.
         bool swapchain_maintenance1_enabled_ = false;
         bool swapchain_present_scaling_enabled_ = false;
         bool has_push_descriptor_ = false;

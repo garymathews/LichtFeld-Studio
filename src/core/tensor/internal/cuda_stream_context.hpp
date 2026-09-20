@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include "core/cuda_stream_fwd.hpp"
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <initializer_list>
 #include <optional>
 
@@ -33,8 +36,10 @@ namespace lfs::core {
     // Downloads make the legacy stream wait for `stream` first; uploads make
     // `stream` wait for the legacy stream afterwards. The host never waits on
     // `stream` itself, so a gated or capturing home stream cannot deadlock.
+#if LFS_TENSOR_CUDA
     LFS_CORE_API cudaError_t memcpy_ordered(void* dst, const void* src, size_t bytes,
                                             cudaMemcpyKind kind, cudaStream_t stream);
+#endif
 
     /**
      * RAII guard for temporarily setting the current CUDA stream

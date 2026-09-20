@@ -2049,13 +2049,11 @@ class HistogramPanel(Panel):
 
     @staticmethod
     def _device_string(tensor: lf.Tensor) -> str:
-        return "cuda" if bool(getattr(tensor, "is_cuda", False)) else "cpu"
+        return "cpu" if tensor.device == "cpu" else "gpu"
 
     @staticmethod
     def _to_device(tensor: lf.Tensor, device: str) -> lf.Tensor:
-        if device == "cuda":
-            return tensor if tensor.is_cuda else tensor.cuda()
-        return tensor.cpu() if tensor.is_cuda else tensor
+        return tensor.cpu() if device == "cpu" else tensor.gpu()
 
     @staticmethod
     def _any_true(mask: lf.Tensor) -> bool:

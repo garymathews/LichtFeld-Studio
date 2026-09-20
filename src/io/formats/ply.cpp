@@ -7,14 +7,19 @@
 #include "core/cuda/sh_layout.cuh"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/pinned_memory_allocator.hpp"
+#endif
 #include "core/provenance.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/sh_value_quant_kernels.hpp"
 #include "core/splat_exportable_storage.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/tensor/internal/memory_pool.hpp"
+#endif
+#include "core/tensor_backend.hpp"
 #include "io/error.hpp"
 #include "io/ply_export_internal.hpp"
 #include "tinyply.hpp"
@@ -41,6 +46,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
@@ -52,7 +58,9 @@
 #include <tbb/task_arena.h>
 
 // CUDA runtime for stream-aware batched H2D copies
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 // Platform-specific includes
 #ifdef _WIN32
@@ -126,9 +134,11 @@ namespace lfs::io {
 
         Tensor pageable_host_copy(const Tensor& input) {
             LFS_ASSERT_MSG(input.is_valid(), "PLY pageable host copy requires a valid tensor");
-            if (input.device() == Device::CPU && input.is_contiguous() &&
-                !lfs::core::PinnedMemoryAllocator::instance().is_cuda_host_allocation(
-                    input.data_ptr())) {
+            if (input.device() == Device::CPU && input.is_contiguous()
+#if LFS_TENSOR_CUDA
+                && !lfs::core::PinnedMemoryAllocator::instance().is_cuda_host_allocation(input.data_ptr())
+#endif
+            ) {
                 return input;
             }
 
@@ -176,16 +186,7 @@ namespace lfs::io {
                 return result;
             }
 
-            const cudaStream_t transfer_stream = lfs::core::prepare_inputs_for_stream({&source});
-            LFS_CUDA_CHECK_MSG_STREAM(
-                cudaMemcpyAsync(result.data_ptr(), source.data_ptr(), source.bytes(),
-                                cudaMemcpyDeviceToHost, transfer_stream),
-                transfer_stream,
-                "while copying PLY tensor to pageable host memory");
-            LFS_CUDA_CHECK_MSG_STREAM(
-                cudaStreamSynchronize(transfer_stream),
-                transfer_stream,
-                "while completing PLY tensor copy to pageable host memory");
+            result.copy_from(source);
             return result;
         }
 
@@ -566,7 +567,7 @@ namespace lfs::io {
                 return false;
             }
 
-            struct stat st {};
+            struct stat st{};
             if (fstat(fd, &st) < 0) {
                 return false;
             }
@@ -581,7 +582,9 @@ namespace lfs::io {
             if (size > ply_constants::FILE_SIZE_THRESHOLD_MB * 1024 * 1024) {
                 madvise(data, size, MADV_SEQUENTIAL);
                 madvise(data, size, MADV_WILLNEED);
+#ifdef POSIX_FADV_WILLNEED
                 posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+#endif
             }
 
             return true;
@@ -1403,14 +1406,15 @@ namespace lfs::io {
         return tensor;
     }
 
-    class CudaUploadBatch {
+    class GpuUploadBatch {
     public:
-        explicit CudaUploadBatch(const cudaStream_t stream) : stream_(stream) {}
+        explicit GpuUploadBatch(const cudaStream_t stream) : stream_(stream) {}
 
-        CudaUploadBatch(const CudaUploadBatch&) = delete;
-        CudaUploadBatch& operator=(const CudaUploadBatch&) = delete;
+        GpuUploadBatch(const GpuUploadBatch&) = delete;
+        GpuUploadBatch& operator=(const GpuUploadBatch&) = delete;
 
-        ~CudaUploadBatch() {
+        ~GpuUploadBatch() {
+#if LFS_TENSOR_CUDA
             if (!has_pending_cuda_work_) {
                 return;
             }
@@ -1419,6 +1423,7 @@ namespace lfs::io {
                 LOG_ERROR("PLY upload cleanup failed: {} ({})",
                           cudaGetErrorName(status), cudaGetErrorString(status));
             }
+#endif
         }
 
         void enqueue(Tensor& tensor,
@@ -1432,6 +1437,18 @@ namespace lfs::io {
                 return;
             }
 
+            if (lfs::core::gpu_backend_of(tensor) == lfs::core::GpuBackend::Vulkan) {
+                Tensor host = Tensor::empty(tensor.shape(), Device::CPU, tensor.dtype());
+                LFS_ASSERT_MSG(host.bytes() == data.size_bytes(),
+                               std::format("PLY Vulkan upload size must match the destination "
+                                           "(name='{}', dest_bytes={}, staging_bytes={})",
+                                           name, host.bytes(), data.size_bytes()));
+                std::memcpy(host.data_ptr(), data.data(), data.size_bytes());
+                tensor.copy_from(host);
+                return;
+            }
+
+#if LFS_TENSOR_CUDA
             if (tensor.device() == Device::CUDA) {
                 const cudaError_t status = cudaMemcpyAsync(
                     tensor.data_ptr(),
@@ -1452,12 +1469,15 @@ namespace lfs::io {
                 }
                 has_pending_cuda_work_ = true;
                 tensor.record_stream(stream_);
-            } else {
+            } else
+#endif
+            {
                 std::memcpy(tensor.data_ptr(), data.data(), data.size_bytes());
             }
         }
 
         void wait() {
+#if LFS_TENSOR_CUDA
             if (!has_pending_cuda_work_) {
                 return;
             }
@@ -1474,6 +1494,7 @@ namespace lfs::io {
                         .code = static_cast<std::int64_t>(status),
                         .name = cudaGetErrorName(status)});
             }
+#endif
         }
 
     private:
@@ -1795,6 +1816,7 @@ namespace lfs::io {
             return g_ply_q16_band_prims.load(std::memory_order_relaxed);
         }
 
+#if LFS_TENSOR_CUDA
         [[noreturn]] void throw_cuda_ply(const cudaError_t status, const std::string_view what) {
             throw_ply_error(
                 lfs::ErrorCode::ResourceExhausted,
@@ -1889,6 +1911,7 @@ namespace lfs::io {
                 throw_cuda_ply(sync_status, "cudaStreamSynchronize q16 encode");
             }
         }
+#endif
     } // namespace
 
     void set_ply_q16_band_prims_for_tests(const std::size_t band_prims) {
@@ -1915,6 +1938,13 @@ namespace lfs::io {
             }
             throw_if_load_cancel_requested(options, "PLY load cancelled");
 
+            // Empty files cannot be mmap'd on POSIX; classify the missing header
+            // as invalid input rather than reporting an internal mapping failure.
+            std::error_code size_error;
+            const auto input_bytes = std::filesystem::file_size(filepath, size_error);
+            if (!size_error && input_bytes == 0) {
+                throw_ply_error(lfs::ErrorCode::InvalidArgument, "PLY file is empty");
+            }
             // Memory map
             MMappedFile mapped_file;
             if (!mapped_file.map(filepath)) {
@@ -2189,16 +2219,19 @@ namespace lfs::io {
                 return {buffer.ptr, buffer.count};
             };
 
-            LOG_DEBUG("Creating Tensor objects and uploading to CUDA");
+            LOG_DEBUG("Creating Tensor objects and uploading to GPU");
 
+            Tensor means = allocate_float_tensor(
+                host_span(host.means), {N, 3}, options, "SplatData.means");
+            const bool dest_is_vulkan =
+                means.is_valid() &&
+                lfs::core::gpu_backend_of(means) == lfs::core::GpuBackend::Vulkan;
             const bool encode_shN_q16 =
                 options.shN_q16 &&
                 static_cast<bool>(options.splat_tensor_allocator) &&
                 layout_rest > 0 &&
                 host.shN_swizzled.count > 0;
 
-            Tensor means = allocate_float_tensor(
-                host_span(host.means), {N, 3}, options, "SplatData.means");
             Tensor sh0 = allocate_float_tensor(
                 host_span(host.sh0),
                 {N, static_cast<size_t>(sh0_dim1), static_cast<size_t>(sh0_dim2)},
@@ -2206,7 +2239,8 @@ namespace lfs::io {
                 "SplatData.sh0");
             Tensor shN;
             Tensor shN_bounds;
-            if (encode_shN_q16) {
+            const bool cuda_q16 = encode_shN_q16 && lfs::core::gpu_backend_of(means) == lfs::core::GpuBackend::CUDA;
+            if (cuda_q16) {
                 const size_t cap = means.is_valid() ? std::max(means.capacity(), N) : N;
                 const size_t cells =
                     lfs::core::sh_value_quant::sh_value_u16_count(cap, layout_rest);
@@ -2236,19 +2270,38 @@ namespace lfs::io {
             Tensor opacity = allocate_float_tensor(
                 host_span(host.opacity), {N, 1}, options, "SplatData.opacity");
 
-            CudaUploadBatch uploads(lfs::core::getCurrentCUDAStream());
+            GpuUploadBatch uploads(lfs::core::getCurrentCUDAStream());
             uploads.enqueue(means, host_span(host.means), "SplatData.means");
             uploads.enqueue(sh0, host_span(host.sh0), "SplatData.sh0");
-            if (!encode_shN_q16) {
+            if (!cuda_q16) {
                 uploads.enqueue(shN, host_span(host.shN_swizzled), "SplatData.shN");
             }
             uploads.enqueue(scaling, host_span(host.scaling), "SplatData.scaling");
             uploads.enqueue(rotation, host_span(host.rotation), "SplatData.rotation");
             uploads.enqueue(opacity, host_span(host.opacity), "SplatData.opacity");
             uploads.wait();
-            if (encode_shN_q16) {
+            if (encode_shN_q16 && dest_is_vulkan) {
+                Tensor encoded_codes;
+                Tensor encoded_bounds;
+                lfs::core::sh_value_quant::encode_shN_float4_to_u16_tensor(
+                    shN,
+                    N,
+                    lfs::core::sh_float4_slots_for_rest(layout_rest),
+                    lfs::core::sh_value_quant::n_value_cells_per_prim(layout_rest),
+                    encoded_codes,
+                    encoded_bounds);
+                shN = encoded_codes.contiguous().reshape(
+                    TensorShape({encoded_codes.numel()}));
+                shN.set_name("SplatData.shN");
+                shN_bounds = encoded_bounds.contiguous().reshape(
+                    TensorShape({encoded_bounds.numel()}));
+                shN_bounds.set_name("SplatData.shN_value_bounds");
+
+#if LFS_TENSOR_CUDA
+            } else if (cuda_q16) {
                 encode_host_shN_to_q16(
                     host.shN_swizzled, shN, shN_bounds, N, layout_rest);
+#endif
             }
             const auto upload_complete_at = std::chrono::steady_clock::now();
 

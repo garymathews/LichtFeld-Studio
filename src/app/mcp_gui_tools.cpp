@@ -4996,12 +4996,16 @@ namespace lfs::app {
                                 selected_sh = core::Tensor::empty(
                                     {resolved_indices.size(), static_cast<size_t>(rest_coefficients), size_t{3}},
                                     node->model->shN_raw().device());
+#if LFS_TENSOR_CUDA
                                 core::shN_swizzled_gather_to_linear(
                                     node->model->shN_raw().ptr<float>(),
                                     index_tensor.ptr<int>(),
                                     selected_sh.ptr<float>(),
                                     resolved_indices.size(),
                                     rest_coefficients);
+#else
+                                selected_sh = node->model->shN_canonical().index_select(0, index_tensor).contiguous();
+#endif
                             }
                             field_payloads[field_name] = tensor_payload_json(selected_sh);
                             continue;

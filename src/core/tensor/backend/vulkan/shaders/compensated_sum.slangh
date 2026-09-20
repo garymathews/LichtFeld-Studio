@@ -1,0 +1,14 @@
+// A run-time zero preserves rounded intermediates in the driver compiler.
+static uint gOpaqueZero = 0;
+
+float opaque(float value)
+{
+    return asfloat(asuint(value) + gOpaqueZero);
+}
+
+void twoSum(float a, float b, out float total, out float error)
+{
+    total = opaque(a + b);
+    const float bb = opaque(total - a);
+    error = opaque(a - opaque(total - bb)) + opaque(b - bb);
+}

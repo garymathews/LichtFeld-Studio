@@ -18,6 +18,7 @@
 #include "core/splat_exportable_storage.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor_backend.hpp"
 #include "cuda/kmeans.hpp"
 #include "cuda/morton_encoding.hpp"
 #include "io/atomic_output.hpp"
@@ -1588,6 +1589,11 @@ namespace lfs::io {
     } // anonymous namespace
 
     Result<void> encode_sog(const SplatData& splat_data, const SogEncodeOptions& options_in, SogSink& archive) {
+#if !LFS_TENSOR_CUDA
+        return make_error(ErrorCode::ENCODING_FAILED, "SOG export requires CUDA k-means; use PLY or SPZ on this build", options_in.output_path);
+#else
+        if (lfs::core::gpu_backend_of(splat_data.means_raw()) != lfs::core::GpuBackend::CUDA)
+            return make_error(ErrorCode::ENCODING_FAILED, "SOG export requires CUDA tensors; use PLY or SPZ for Vulkan", options_in.output_path);
         SogEncodeOptions options = options_in;
         if (!options.provenance) {
             options.provenance = core::make_minimal_provenance_stamp();
@@ -2409,6 +2415,7 @@ namespace lfs::io {
                               std::format("Failed to save SOG: {}", e.what()),
                               options.output_path);
         }
+#endif
     }
 
     std::unique_ptr<SogSink> make_sog_archive(const std::filesystem::path& path) {

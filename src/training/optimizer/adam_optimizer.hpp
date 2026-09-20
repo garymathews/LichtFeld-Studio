@@ -4,11 +4,12 @@
 
 #pragma once
 
+#include "core/cuda_stream_fwd.hpp"
 #include "core/splat_data.hpp"
+#include "joint_adam_tensor.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cuda_runtime_api.h>
 #include <string>
 #include <unordered_map>
 
@@ -49,6 +50,14 @@ namespace lfs::training {
         //   joint_bounds holds float4 per 256-splat block.
         lfs::core::Tensor exp_avg;
         lfs::core::Tensor joint_bounds; // [n_bounds, 4] fp32; joint codec only
+        // Vulkan keeps the Adam moments in fp32 as well as in the packed codec form.
+        // The fp32 form is authoritative while training, so the packed form is refreshed
+        // only when something outside the update path needs it (checkpoint, reorder,
+        // compaction, relocation). That removes the per-step moment decode and encode
+        // from the optimizer step entirely.
+        lfs::core::Tensor moments_first;  // {n, attributes} fp32, rows-major
+        lfs::core::Tensor moments_second;
+        bool packed_current = true; // false once the fp32 moments have moved ahead
         int joint_bits = 0;             // 0=legacy, 8=SH, 16=non-SH
         int64_t step_count = 0;
         size_t capacity = 0; // Allocated capacity (moment rows / float cells)
@@ -189,6 +198,7 @@ namespace lfs::training {
         /// `n_new` rows BEFORE any free_mask / param mutation. Returns false when
         /// capacity-ensure fails so callers can abort with zero torn state.
         [[nodiscard]] bool preflight_grow_capacity(size_t n_new);
+        void relocate_params_at_indices(ParamType type, const lfs::core::Tensor& indices);
         void relocate_params_at_indices_gpu(ParamType type, const int64_t* indices_device, size_t n_indices);
 
         // Low-level state manipulation
@@ -203,11 +213,21 @@ namespace lfs::training {
         const AdamConfig& get_config() const { return config_; }
 
         // Serialization
-        void serialize(std::ostream& os) const;
+        // Write any fp32-resident moment state back into the packed representation before
+        // a caller outside the update path touches it. No-op on CUDA.
+        void sync_moments_for_external_access();
+        // Drop the fp32 moments so the next update re-derives them from the packed form.
+        void invalidate_fp32_moments();
+        void serialize(std::ostream& os);
         void deserialize(std::istream& is);
         void adopt_checkpoint_state(AdamOptimizer& loaded) noexcept;
         void reserve_capacity(size_t capacity);
 
+#if !LFS_TENSOR_CUDA
+        void permute_rows(const lfs::core::Tensor& permutation);
+        std::unique_ptr<AdamOptimizer> clone_for_model(lfs::core::SplatData& model) const;
+        void adopt_training_update(AdamOptimizer& prepared) noexcept;
+#endif
         // Control notifications for external mutations
         void reset_state(ParamType type);
 
@@ -217,6 +237,17 @@ namespace lfs::training {
         static void reset_slow_path_grow_count() noexcept;
 
     private:
+#if !LFS_TENSOR_CUDA
+        joint_adam::TensorMoments read_moment_rows(ParamType type, size_t primitives,
+                                                  size_t offset = 0, size_t count = 0);
+        static void write_moment_range(AdamParamState& state, size_t slots, const joint_adam::TensorMoments& rows, size_t offset);
+        void remap_moment_rows(ParamType type, size_t previous_primitives, size_t primitives,
+                                const lfs::core::Tensor& mapping, bool append);
+        // fp32 moments: (re)derive them from the packed form, and write the packed form
+        // back out before anything outside the update path reads it.
+        void ensure_fp32_moments(ParamType type);
+        void flush_moments_to_packed();
+#endif
         static void note_slow_path_grow(const char* site, const std::string& name);
         AdamConfig config_;
         lfs::core::SplatData& splat_data_;

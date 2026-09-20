@@ -1142,12 +1142,18 @@ namespace lfs::vis::cap {
         const auto index_tensor = core::Tensor::from_vector(indices, {indices.size()}, field->device());
         const auto src_tensor = core::Tensor::from_vector(values, core::TensorShape(shape_dims), field->device());
         if (is_shN) {
+#if LFS_TENSOR_CUDA
             core::shN_swizzled_scatter_linear(
                 field->ptr<float>(),
                 index_tensor.ptr<int>(),
                 src_tensor.ptr<float>(),
                 indices.size(),
                 static_cast<uint32_t>(node->model->max_sh_coeffs_rest()));
+#else
+            auto canonical = node->model->shN_canonical();
+            canonical.index_copy_(0, index_tensor, src_tensor.reshape(core::TensorShape({indices.size(), node->model->max_sh_coeffs_rest(), 3})));
+            node->model->shN_set_from_canonical(canonical, node->model->means_raw().capacity());
+#endif
         } else {
             field->index_copy_(0, index_tensor, src_tensor);
         }

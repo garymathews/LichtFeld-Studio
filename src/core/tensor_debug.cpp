@@ -4,6 +4,7 @@
 
 #include "core/tensor_debug.hpp"
 #include "core/tensor_trace.hpp"
+#include "core/tensor/backend/gpu_backend_ops.hpp"
 #include <algorithm>
 #include <cmath>
 #include <format>
@@ -78,13 +79,20 @@ namespace lfs::core::debug {
 
     // GPU validation is implemented in tensor_debug.cu
     // Forward declaration - implemented in CUDA file
+#if LFS_TENSOR_CUDA
     extern TensorValidation validate_tensor_gpu_impl(const float* data, size_t n);
+#endif
 
     TensorValidation validate_tensor_gpu(const Tensor& tensor) {
         if (tensor.is_empty() || tensor.dtype() != DataType::Float32 || tensor.device() != Device::CUDA) {
             return validate_tensor_cpu(tensor);
         }
-        return validate_tensor_gpu_impl(tensor.ptr<float>(), tensor.numel());
+#if LFS_TENSOR_CUDA
+        if (internal::gpu_backend_tag(tensor) == GpuBackend::CUDA) {
+            return validate_tensor_gpu_impl(tensor.ptr<float>(), tensor.numel());
+        }
+#endif
+        return validate_tensor_cpu(tensor);
     }
 
     TensorDiff diff_tensors(const Tensor& expected, const Tensor& actual, float tolerance) {

@@ -2,14 +2,16 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/logger.hpp"
+#include "core/tensor/backend/kernel_contracts.hpp"
 #include "internal/tensor_impl.hpp"
-#include "internal/tensor_ops.hpp"
 #include <atomic>
+#if LFS_TENSOR_CUDA
 #include <curand.h>
-#include <curand_kernel.h>
+#endif
 #include <mutex>
 #include <random>
 
+#if LFS_TENSOR_CUDA
 #define CHECK_CURAND(call)                                                   \
     do {                                                                     \
         const curandStatus_t error = (call);                                 \
@@ -17,6 +19,8 @@
                        std::string("CURAND operation failed with status ") + \
                            std::to_string(static_cast<int>(error)));         \
     } while (0)
+
+#endif
 
 namespace lfs::core {
 
@@ -34,19 +38,34 @@ namespace lfs::core {
 
         RandomGeneratorImpl() : seed_(42),
                                 cpu_generator_(seed_) {
-            // Initialize CUDA random generator with Philox (same as PyTorch - much faster!)
-            curandGenerator_t* gen = new curandGenerator_t;
-            CHECK_CURAND(curandCreateGenerator(gen, CURAND_RNG_PSEUDO_PHILOX4_32_10));
-            CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(*gen, seed_));
-            cuda_generator_ = gen;
+
         }
 
+#if LFS_TENSOR_CUDA
+        // Caller holds cuda_mutex_; CPU and Vulkan draws never initialize cuRAND.
+        curandGenerator_t* ensure_cuda_generator() {
+            if (!cuda_generator_) {
+                auto gen = std::make_unique<curandGenerator_t>();
+                CHECK_CURAND(curandCreateGenerator(gen.get(), CURAND_RNG_PSEUDO_PHILOX4_32_10));
+                const auto status = curandSetPseudoRandomGeneratorSeed(*gen, seed_);
+                if (status != CURAND_STATUS_SUCCESS) {
+                    curandDestroyGenerator(*gen);
+                    CHECK_CURAND(status);
+                }
+                cuda_generator_ = gen.release();
+            }
+            return static_cast<curandGenerator_t*>(cuda_generator_);
+        }
+#endif
+
         ~RandomGeneratorImpl() {
+#if LFS_TENSOR_CUDA
             if (cuda_generator_) {
                 curandGenerator_t* gen = static_cast<curandGenerator_t*>(cuda_generator_);
                 curandDestroyGenerator(*gen);
                 delete gen;
             }
+#endif
         }
     };
 
@@ -78,12 +97,14 @@ namespace lfs::core {
         impl->call_counter_.store(0);
         impl->cuda_offset_ = 0;
 
+#if LFS_TENSOR_CUDA
         if (impl->cuda_generator_) {
             curandGenerator_t* gen = static_cast<curandGenerator_t*>(impl->cuda_generator_);
             CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(*gen, seed));
             // IMPORTANT: Reset the offset to ensure reproducibility
             CHECK_CURAND(curandSetGeneratorOffset(*gen, 0));
         }
+#endif
     }
 
     uint64_t RandomGenerator::get_next_cuda_seed() {
@@ -96,6 +117,7 @@ namespace lfs::core {
     void RandomGenerator::generate_cuda_normal(float* output, const size_t count,
                                                const float mean, const float std,
                                                const cudaStream_t stream) {
+#if LFS_TENSOR_CUDA
         LFS_ASSERT_MSG(output != nullptr,
                        "CUDA normal generation requires a valid output pointer");
         LFS_ASSERT_MSG(count > 0 && count % 2 == 0,
@@ -105,10 +127,13 @@ namespace lfs::core {
         LFS_ASSERT_MSG(count <= std::numeric_limits<uint64_t>::max() - impl->cuda_offset_,
                        "CUDA random generator offset overflow");
 
-        curandGenerator_t* gen = static_cast<curandGenerator_t*>(impl->cuda_generator_);
+        auto* gen = impl->ensure_cuda_generator();
         impl->cuda_offset_ += count;
         CHECK_CURAND(curandSetStream(*gen, stream));
         CHECK_CURAND(curandGenerateNormal(*gen, output, count, mean, std));
+#else
+        throw std::runtime_error("CUDA random generation was not compiled");
+#endif
     }
 
     void* RandomGenerator::get_generator(Device device) {
@@ -116,7 +141,12 @@ namespace lfs::core {
         LFS_ASSERT_MSG(device == Device::CPU || device == Device::CUDA,
                        "random generator received an invalid device");
         if (device == Device::CUDA) {
-            return impl->cuda_generator_;
+#if LFS_TENSOR_CUDA
+            std::lock_guard lock(impl->cuda_mutex_);
+            return impl->ensure_cuda_generator();
+#else
+            throw std::runtime_error("CUDA random generation was not compiled");
+#endif
         } else {
             return &impl->cpu_generator_;
         }
@@ -124,7 +154,9 @@ namespace lfs::core {
 
     // ============= In-place Random Operations =============
 
-    Tensor& Tensor::uniform_(float low, float high) {
+    Tensor& Tensor::uniform_(float low, float high, std::optional<uint64_t> explicit_seed) {
+
+        preserve_lazy_snapshots_before_write();
         LFS_ASSERT_MSG(is_valid(),
                        "uniform_ requires a valid tensor");
         LFS_ASSERT_MSG(dtype_ == DataType::Float32,
@@ -138,7 +170,7 @@ namespace lfs::core {
         if (!is_contiguous()) {
             return mutate_logical_view(
                 [&](Tensor& materialized) {
-                    materialized.uniform_(low, high);
+                    materialized.uniform_(low, high, explicit_seed);
                 });
         }
 
@@ -146,18 +178,28 @@ namespace lfs::core {
 
         if (device_ == Device::CUDA) {
             // Use kernel-based generation with advancing seed
-            uint64_t seed = RandomGenerator::instance().get_next_cuda_seed();
-            tensor_ops::launch_uniform(ptr<float>(), n, low, high, seed, stream());
+            uint64_t seed = explicit_seed ? *explicit_seed : RandomGenerator::instance().get_next_cuda_seed();
+            internal::backend_ops_for(*this).uniform(
+                internal::storage_ref(*this),
+                internal::RandomProgram{
+                    .count = n,
+                    .first = low,
+                    .second = high,
+                    .seed = seed,
+                },
+                internal::ExecContext{stream()});
             // No sync - in-place operation returns *this
         } else {
             // CPU uses stateful generator
             auto* impl = static_cast<RandomGeneratorImpl*>(
                 RandomGenerator::instance().get_impl());
+            std::mt19937_64 local_generator(explicit_seed.value_or(0));
+            auto& generator = explicit_seed ? local_generator : impl->cpu_generator_;
             std::uniform_real_distribution<float> dist(low, high);
 
             float* data = ptr<float>();
             for (size_t i = 0; i < n; ++i) {
-                data[i] = dist(impl->cpu_generator_);
+                data[i] = dist(generator);
             }
         }
 
@@ -165,6 +207,8 @@ namespace lfs::core {
     }
 
     Tensor& Tensor::normal_(float mean, float std) {
+
+        preserve_lazy_snapshots_before_write();
         LFS_ASSERT_MSG(is_valid(),
                        "normal_ requires a valid tensor");
         LFS_ASSERT_MSG(dtype_ == DataType::Float32,
@@ -189,19 +233,20 @@ namespace lfs::core {
         size_t n = numel();
 
         if (device_ == Device::CUDA) {
-            // curandGenerateNormal requires even number of elements
             if (n % 2 == 1) {
-                // Generate into an n+1 scratch allocation. Writing n+1 values into
-                // the n-element destination was a one-float buffer overflow.
-                auto scratch = Tensor::empty({n + 1}, Device::CUDA, DataType::Float32);
-                RandomGenerator::instance().generate_cuda_normal(
-                    scratch.ptr<float>(), n + 1, mean, std, stream());
-                LFS_CUDA_CHECK(cudaMemcpyAsync(ptr<float>(), scratch.ptr<float>(), n * sizeof(float),
-                                               cudaMemcpyDeviceToDevice, stream()));
-                LFS_CUDA_CHECK(cudaStreamSynchronize(stream()));
+                auto scratch = internal::allocate_like(
+                    *this, TensorShape{n + 1}, DataType::Float32);
+                internal::backend_ops_for(*this).normal(
+                    internal::storage_ref(*this), internal::storage_ref(scratch),
+                    internal::RandomProgram{.count = n, .first = mean, .second = std,
+                        .seed = RandomGenerator::instance().get_next_cuda_seed()},
+                    internal::ExecContext{stream()});
             } else {
-                RandomGenerator::instance().generate_cuda_normal(
-                    ptr<float>(), n, mean, std, stream());
+                internal::backend_ops_for(*this).normal(
+                    internal::storage_ref(*this), internal::storage_ref(*this),
+                    internal::RandomProgram{.count = n, .first = mean, .second = std,
+                        .seed = RandomGenerator::instance().get_next_cuda_seed()},
+                    internal::ExecContext{stream()});
             }
         } else {
             // CPU uses stateful generator

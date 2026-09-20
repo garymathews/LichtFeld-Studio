@@ -16,8 +16,9 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 
+#include "core/cuda_stream_fwd.hpp"
 #include <cstddef>
-#include <cuda_runtime.h>
+#include <functional>
 
 namespace lfs::training {
     class AdamOptimizer;
@@ -43,10 +44,9 @@ namespace lfs::training::morton {
         lfs::core::Tensor permutation; // Int64 [N], dest i <- src perm[i]
     };
 
-    /// Permute a row-indexed tensor. Dim 0 is the primitive axis unless the
-    /// tensor is [C, N] with C != N (densification_info). Tensors longer than
-    /// perm.n on dim 0 permute the live prefix and keep the tail.
-    void permute_row_tensor(lfs::core::Tensor& tensor, const lfs::core::Tensor& perm);
+    /// Permute the specified primitive axis (default 0; densification_info uses 1).
+    /// Tensors longer than perm.n on dim 0 preserve the unused tail.
+    void permute_row_tensor(lfs::core::Tensor& tensor, const lfs::core::Tensor& perm, int axis = 0);
 
     /// dest[i] <- src[perm[i]] for shN. q16 gather-decodes each dest 256-block
     /// in one launch (no full fp32 expansion). fp32 / IEEE-f16 keep the
@@ -62,6 +62,10 @@ namespace lfs::training::morton {
     [[nodiscard]] ReorderResult apply_morton_reorder(
         lfs::core::SplatData& splat,
         AdamOptimizer* optimizer = nullptr,
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream = nullptr
+#if !LFS_TENSOR_CUDA
+        , const std::function<void(const core::Tensor&)>& before_commit = {}
+#endif
+    );
 
 } // namespace lfs::training::morton

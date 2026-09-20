@@ -16,7 +16,38 @@ namespace lfs::core {
 
     enum class Device : uint8_t {
         CPU = 0,
-        CUDA = 1
+        GPU = 1,
+        CUDA = GPU
+    };
+
+    enum class ReduceOp : uint8_t {
+        Sum = 0,
+        Mean = 1,
+        Max = 2,
+        Min = 3,
+        Prod = 4,
+        Any = 5,
+        All = 6,
+        Std = 7,
+        Var = 8,
+        Argmax = 9,
+        Argmin = 10,
+        CountNonzero = 11,
+        Norm = 12
+    };
+
+    enum class BoundaryMode : uint8_t {
+        Assert = 0,
+        Clamp = 1,
+        Wrap = 2
+    };
+
+    enum class ScatterMode : uint8_t {
+        None = 0,
+        Add = 1,
+        Multiply = 2,
+        Max = 3,
+        Min = 4
     };
 
     enum class DataType : uint8_t {
@@ -62,7 +93,7 @@ namespace lfs::core {
     inline const char* device_name(Device device) {
         switch (device) {
         case Device::CPU: return "cpu";
-        case Device::CUDA: return "cuda";
+        case Device::GPU: return "gpu";
         default: return "unknown";
         }
     }

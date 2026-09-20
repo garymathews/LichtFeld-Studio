@@ -3,7 +3,8 @@
 
 #include "core/nn/weight_file.hpp"
 
-#include "core/cuda_error.hpp"
+#include "core/tensor_backend.hpp"
+#include "core/tensor/internal/tensor_impl.hpp"
 
 #include <cstring>
 #include <format>
@@ -184,21 +185,17 @@ namespace lfs::core::nn {
             }
             return cpu;
         }
-        if (dest_dtype == found->dtype) {
-            auto gpu = Tensor::empty(found->shape, Device::CUDA, dest_dtype);
-            if (found->length > 0) {
-                LFS_CUDA_CHECK(cudaMemcpyAsync(gpu.data_ptr(), src,
-                                               static_cast<std::size_t>(found->length),
-                                               cudaMemcpyHostToDevice, gpu.stream()));
-            }
-            return gpu;
-        }
-        auto tmp = Tensor::empty(found->shape, Device::CUDA, found->dtype);
+        auto tensor = Tensor::empty(found->shape, device, found->dtype);
         if (found->length > 0) {
-            LFS_CUDA_CHECK(cudaMemcpyAsync(tmp.data_ptr(), src, static_cast<std::size_t>(found->length),
-                                           cudaMemcpyHostToDevice, tmp.stream()));
+            internal::backend_ops_for(tensor).copy_host_to_device(internal::CopyRequest{
+                .src = internal::raw_storage_ref(const_cast<void*>(src), found->dtype),
+                .dst = internal::storage_ref(tensor),
+                .bytes = static_cast<std::size_t>(found->length),
+                .synchronous = false,
+                .context = internal::ExecContext{tensor.stream()},
+            });
         }
-        return tmp.to(dest_dtype);
+        return tensor.to(dest_dtype);
     }
 
     lfs::Result<std::unordered_map<std::string, Tensor>>
@@ -212,8 +209,8 @@ namespace lfs::core::nn {
             }
             out.emplace(name, std::move(*tensor));
         }
-        if (device == Device::CUDA) {
-            LFS_CUDA_CHECK(cudaDeviceSynchronize());
+        if (device == Device::CUDA && !out.empty()) {
+            internal::backend_ops_for(out.begin()->second).synchronize_device();
         }
         return out;
     }

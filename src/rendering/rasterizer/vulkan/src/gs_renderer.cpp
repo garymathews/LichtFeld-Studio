@@ -3,6 +3,7 @@
 #include "core/logger.hpp"
 #include "viewport_scratch_bucket.h"
 #include "visible_mask.h"
+#include "overlay_params.h"
 
 #include <algorithm>
 #include <cmath>
@@ -999,6 +1000,12 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
              supports_conditional_rendering_ ? "conditional rendering"
                                              : "VK_EXT_conditional_rendering unavailable");
 
+    if (const auto it = spirv_paths.find("projection_backward"); it != spirv_paths.end())
+        createComputePipeline(pipeline_projection_backward, it->second);
+    if (const auto it = spirv_paths.find("rasterize_backward"); it != spirv_paths.end())
+        createComputePipeline(pipeline_rasterize_backward, it->second);
+    if (const auto it = spirv_paths.find("rasterize_backward_mcmc"); it != spirv_paths.end())
+        createComputePipeline(pipeline_rasterize_backward_mcmc, it->second);
     createComputePipeline(pipeline_projection_forward, spirv_paths.at("projection_forward"));
     createComputePipeline(pipeline_projection_forward_3dgut, spirv_paths.at("projection_forward_3dgut"));
     createComputePipeline(pipeline_selection_mask, spirv_paths.at("selection_mask"));
@@ -1102,7 +1109,14 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
         supports_float16_storage_ =
             f12.shaderFloat16 == VK_TRUE && f11.storageBuffer16BitAccess == VK_TRUE;
     }
-    if (supports_float16_storage_) {
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(external_physical_device, &properties);
+    // The complete macro family includes overlay/fp32 variants requiring up to
+    // 45,200 bytes in the pinned shaders. Require the next portable 48 KiB tier;
+    // M1's 32 KiB limit must select legacy before any macro pipeline is queued.
+    supports_macro_raster_ = supports_float16_storage_ &&
+                             properties.limits.maxComputeSharedMemorySize >= 48u * 1024u;
+    if (supports_macro_raster_) {
         create_optional(pipeline_macro_coverage, "macro_coverage");
         create_optional(pipeline_generate_macro_keys_wave, "generate_macro_keys_wave");
         create_optional(pipeline_macro_batch_prepare, "macro_batch_prepare");
@@ -1269,6 +1283,8 @@ void VulkanGSRenderer::executeProjectionForward(
     const _VulkanBuffer& lod_weights,
     const _VulkanBuffer& lod_counts,
     bool write_overlay_flags) {
+    validateBufferRange(overlay_params, 0,
+                        lfs::rendering::vulkan::ParamCount * 4 * sizeof(float), "projection overlay parameters");
     PerfTimer::Timer<PerfTimer::ProjectionForward> timer(this);
     DEVICE_GUARD;
 
@@ -1394,6 +1410,215 @@ void VulkanGSRenderer::executeProjectionForward(
         &projection_uniforms, sizeof(projection_uniforms),
         pipeline,
         tagged);
+}
+
+VulkanGSRenderer::TileInstanceGate VulkanGSRenderer::executeTrainingForward(
+    VulkanGSRendererUniforms uniforms, VulkanGSPipelineBuffers& buffers,
+    const _VulkanBuffer& projection_visibility) {
+    using lfs::rendering::vulkan::BufferUse;
+    using lfs::rendering::vulkan::DeclaredAccess;
+    if (uniforms.num_splats == 0 || uniforms.image_width == 0 || uniforms.image_height == 0 ||
+        uniforms.lod_enabled != 0 || uniforms.camera_model != 0 || uniforms.depth_wave != 0 ||
+        uniforms.wave_base != 0 || uniforms.expected_far != 0 || buffers.quant_pool || buffers.attrs_f16 ||
+        buffers.shN_f16 || buffers.shN_q16) {
+        lfs::rendering::throw_renderer_contract("Training forward requires nonempty plain fp32 pinhole inputs", LFS_SOURCE_SITE_CURRENT());
+    }
+    validateBufferRange(projection_visibility, 0, size_t{uniforms.num_splats} * sizeof(int32_t), "training visibility snapshot");
+    // Projection reads overlay flags even when overlays are disabled. Reserve
+    // the shared float4 layout so no flag can come from unrelated GPU storage.
+    const auto& dummy = clearDeviceBuffer(buffers.scales_opacs,
+                                          lfs::rendering::vulkan::ParamCount * 4);
+    executeProjectionForward(uniforms, buffers, dummy, dummy, dummy, dummy, 0, false, {}, {}, {}, {}, {}, false);
+    {
+        PerfTimer::Timer<PerfTimer::TrainingVisibilityCopy> timer(this);
+        const DeclaredAccess copy_access[] = {
+            {.buffer = &buffers.tiles_touched.deviceBuffer, .use = BufferUse::TransferRead},
+            {.buffer = &projection_visibility, .use = BufferUse::TransferWrite}};
+        planTransfer(copy_access);
+        const VkBufferCopy copy{buffers.tiles_touched.deviceBuffer.offset, projection_visibility.offset,
+                                size_t{uniforms.num_splats} * sizeof(int32_t)};
+        vkCmdCopyBuffer(activeCommandBuffer(), buffers.tiles_touched.deviceBuffer.buffer, projection_visibility.buffer, 1, &copy);
+    }
+    uniforms.sort_capacity = HIGS_DEPTH_WAVE_INSTANCES;
+    executeSortPrimitivesByDepth(uniforms, buffers);
+    executeApplyDepthOrdering(uniforms, buffers);
+    executeCalculateIndexBufferOffset(uniforms, buffers);
+    TileInstanceGate gate{};
+    {
+        PerfTimer::Timer<PerfTimer::TrainingInstanceGate> timer(this);
+        gate = synchronizeTileInstanceGate(buffers);
+    }
+    if (gate.count_overflow || gate.raw_count > HIGS_DEPTH_WAVE_INSTANCES) {
+        return gate;
+    }
+    buffers.num_indices = gate.raw_count;
+    size_t tiles = size_t{uniforms.grid_width} * uniforms.grid_height;
+    int bits = 0;
+    for (size_t value = tiles; value; value >>= 1) ++bits;
+    {
+        PerfTimer::Timer<PerfTimer::TrainingWavePartition> timer(this);
+        executeWavePartition(uniforms, buffers, 1, false);
+    }
+    const bool previous_capture = std::exchange(depth_capture_, true);
+    try {
+        executeLegacyDepthWaves(uniforms, buffers, 1, std::max(bits, 1), dummy, dummy, dummy, dummy, dummy, dummy, dummy, false, false, false);
+    } catch (...) {
+        depth_capture_ = previous_capture;
+        throw;
+    }
+    depth_capture_ = previous_capture;
+    return gate;
+}
+
+void VulkanGSRenderer::executeProjectionBackward(
+    const VulkanGSRendererUniforms& uniforms,
+    const VulkanGSPipelineBuffers& parameters,
+    const _VulkanBuffer& projection_visibility,
+    VulkanGSPipelineBuffers& gradients) {
+    using lfs::rendering::vulkan::BufferUse;
+    if (uniforms.camera_model != 0 || uniforms.step != 0 ||
+        (uniforms.lod_enabled & ~kLodEnabledWriteOverlayFlags) != 0 ||
+        parameters.quant_pool || parameters.shN_f16 || parameters.shN_q16 || parameters.attrs_f16) {
+        lfs::rendering::throw_renderer_contract(
+            "Projection backward requires untransformed fp32 pinhole parameters without LOD",
+            LFS_SOURCE_SITE_CURRENT());
+    }
+    const size_t n = uniforms.num_splats;
+    if (n == 0)
+        return;
+    if (&parameters == &gradients || pipeline_projection_backward.pipeline == VK_NULL_HANDLE) {
+        lfs::rendering::throw_renderer_contract(
+            "Projection backward requires a compiled derivative and distinct parameter/gradient storage",
+            LFS_SOURCE_SITE_CURRENT());
+    }
+    if (uniforms.active_sh > 3 || uniforms.shN_layout_slots > 12 ||
+        (uniforms.active_sh != 0 && uniforms.shN_layout_slots <
+            (uniforms.active_sh == 1 ? 3u : uniforms.active_sh == 2 ? 6u : 12u))) {
+        lfs::rendering::throw_renderer_contract(
+            "Projection backward SH degree and slot capacity are inconsistent",
+            LFS_SOURCE_SITE_CURRENT());
+    }
+    const size_t sh_rest_floats = std::max<size_t>(1, (n + SUBGROUP_SIZE - 1) /
+        SUBGROUP_SIZE * SUBGROUP_SIZE * uniforms.shN_layout_slots * 4);
+    validateBufferRange(parameters.xyz_ws.deviceBuffer, 0, 3 * n * sizeof(float), "projection positions");
+    validateBufferRange(parameters.sh0.deviceBuffer, 0, 3 * n * sizeof(float), "projection SH DC");
+    validateBufferRange(parameters.shN.deviceBuffer, 0, sh_rest_floats * sizeof(float), "projection SH rest");
+    validateBufferRange(parameters.rotations.deviceBuffer, 0, 4 * n * sizeof(float), "projection rotations");
+    validateBufferRange(parameters.scaling_raw.deviceBuffer, 0, 3 * n * sizeof(float), "projection raw scales");
+    validateBufferRange(parameters.opacity_raw.deviceBuffer, 0, n * sizeof(float), "projection raw opacity");
+    // Do not silently read a short visibility mask or incomplete adjoints.
+    validateBufferRange(projection_visibility, 0, n * sizeof(int32_t), "projection visibility");
+    validateBufferRange(gradients.xy_vs.deviceBuffer, 0, 2 * n * sizeof(float), "projection xy adjoint");
+    validateBufferRange(gradients.inv_cov_vs_opacity.deviceBuffer, 0, 4 * n * sizeof(float), "projection covariance adjoint");
+    validateBufferRange(gradients.rgb.deviceBuffer, 0, 3 * n * sizeof(float), "projection color adjoint");
+    resizeDeviceBuffer(gradients.xyz_ws, 3 * n);
+    resizeDeviceBuffer(gradients.sh0, 3 * n);
+    resizeDeviceBuffer(gradients.shN, sh_rest_floats);
+    resizeDeviceBuffer(gradients.rotations, 4 * n);
+    resizeDeviceBuffer(gradients.scaling_raw, 3 * n);
+    resizeDeviceBuffer(gradients.opacity_raw, n);
+    gradients.num_splats = n;
+    const std::vector<TaggedBinding> bindings = {
+        {parameters.xyz_ws.deviceBuffer, BufferUse::ComputeRead},
+        {parameters.sh0.deviceBuffer, BufferUse::ComputeRead},
+        {parameters.shN.deviceBuffer, BufferUse::ComputeRead},
+        {parameters.rotations.deviceBuffer, BufferUse::ComputeRead},
+        {parameters.scaling_raw.deviceBuffer, BufferUse::ComputeRead},
+        {parameters.opacity_raw.deviceBuffer, BufferUse::ComputeRead},
+        {projection_visibility, BufferUse::ComputeRead},
+        {gradients.xy_vs.deviceBuffer, BufferUse::ComputeRead},
+        {gradients.inv_cov_vs_opacity.deviceBuffer, BufferUse::ComputeRead},
+        {gradients.rgb.deviceBuffer, BufferUse::ComputeRead},
+        {gradients.xyz_ws.deviceBuffer, BufferUse::ComputeWrite},
+        {gradients.sh0.deviceBuffer, BufferUse::ComputeWrite},
+        {gradients.shN.deviceBuffer, BufferUse::ComputeWrite},
+        {gradients.rotations.deviceBuffer, BufferUse::ComputeWrite},
+        {gradients.scaling_raw.deviceBuffer, BufferUse::ComputeWrite},
+        {gradients.opacity_raw.deviceBuffer, BufferUse::ComputeWrite}};
+    {
+        PerfTimer::Timer<PerfTimer::ProjectionBackward> timer(this);
+        executeCompute({{n, SUBGROUP_SIZE}}, &uniforms, sizeof(uniforms),
+                       pipeline_projection_backward, bindings);
+    }
+}
+
+void VulkanGSRenderer::executeRasterizationBackward(
+    const VulkanGSRendererUniforms& uniforms,
+    const VulkanGSPipelineBuffers& forward,
+    const size_t instance_count,
+    VulkanGSPipelineBuffers& gradients,
+    const _VulkanBuffer& error_map,
+    const _VulkanBuffer& densification_info) {
+    using lfs::rendering::vulkan::BufferUse;
+    const size_t n = uniforms.num_splats;
+    const size_t pixels = size_t{uniforms.image_width} * uniforms.image_height;
+    const size_t tiles = size_t{uniforms.grid_width} * uniforms.grid_height;
+    if (uniforms.depth_wave != 0 || uniforms.wave_base != 0 || uniforms.expected_far != 0 ||
+        instance_count > HIGS_DEPTH_WAVE_INSTANCES || forward.quant_pool || forward.attrs_f16 ||
+        forward.shN_f16 || forward.shN_q16) {
+        lfs::rendering::throw_renderer_contract(
+            "Raster backward requires one complete plain fp32 depth wave without depth clipping",
+            LFS_SOURCE_SITE_CURRENT());
+    }
+    if (uniforms.grid_width != (size_t{uniforms.image_width} + TILE_WIDTH - 1) / TILE_WIDTH ||
+        uniforms.grid_height != (size_t{uniforms.image_height} + TILE_HEIGHT - 1) / TILE_HEIGHT ||
+        pixels > std::numeric_limits<uint32_t>::max()) {
+        lfs::rendering::throw_renderer_contract(
+            "Raster backward image dimensions and tile grid are inconsistent",
+            LFS_SOURCE_SITE_CURRENT());
+    }
+    if (n == 0 || pixels == 0)
+        return;
+    const bool densify = error_map.buffer != VK_NULL_HANDLE;
+    if (densify != (densification_info.buffer != VK_NULL_HANDLE))
+        throw std::invalid_argument("Raster backward requires both error map and densification output");
+    auto& pipeline = densify ? pipeline_rasterize_backward_mcmc : pipeline_rasterize_backward;
+    if (densify) {
+        validateBufferRange(error_map, 0, pixels * sizeof(float), "densification pixel errors");
+        validateBufferRange(densification_info, 0, 2 * n * sizeof(float), "densification statistics");
+    }
+    if (&forward == &gradients || pipeline.pipeline == VK_NULL_HANDLE) {
+        lfs::rendering::throw_renderer_contract(
+            "Raster backward requires a compiled derivative and distinct forward/gradient storage",
+            LFS_SOURCE_SITE_CURRENT());
+    }
+    validateBufferRange(forward.sorted_gauss_idx().deviceBuffer, 0,
+                        std::max<size_t>(instance_count, 1) * sizeof(int32_t), "raster sorted IDs");
+    validateBufferRange(forward.tile_ranges.deviceBuffer, 0, (tiles + 1) * sizeof(int32_t), "raster tile ranges");
+    validateBufferRange(forward.xy_vs.deviceBuffer, 0, 2 * n * sizeof(float), "raster projected positions");
+    validateBufferRange(forward.inv_cov_vs_opacity.deviceBuffer, 0, 4 * n * sizeof(float), "raster conics");
+    validateBufferRange(forward.rgb.deviceBuffer, 0, 3 * n * sizeof(float), "raster colors");
+    validateBufferRange(forward.pixel_state.deviceBuffer, 0, 4 * pixels * sizeof(float), "raster final pixel state");
+    validateBufferRange(forward.n_contributors.deviceBuffer, 0, pixels * sizeof(int32_t), "raster contributors");
+    validateBufferRange(gradients.pixel_state.deviceBuffer, 0, 4 * pixels * sizeof(float), "raster pixel adjoint");
+    // Each adjoint value is two scaled int32 words, so the clear covers twice the value count.
+    {
+        PerfTimer::Timer<PerfTimer::BackwardAdjointClear> timer(this);
+        clearDeviceBuffer(gradients.xy_vs, 4 * n);
+        clearDeviceBuffer(gradients.inv_cov_vs_opacity, 8 * n);
+        clearDeviceBuffer(gradients.rgb, 6 * n);
+    }
+    std::vector<TaggedBinding> bindings{
+            {forward.sorted_gauss_idx().deviceBuffer, BufferUse::ComputeRead},
+            {forward.tile_ranges.deviceBuffer, BufferUse::ComputeRead},
+            {forward.xy_vs.deviceBuffer, BufferUse::ComputeRead},
+            {forward.inv_cov_vs_opacity.deviceBuffer, BufferUse::ComputeRead},
+            {forward.rgb.deviceBuffer, BufferUse::ComputeRead},
+            {forward.pixel_state.deviceBuffer, BufferUse::ComputeRead},
+            {forward.n_contributors.deviceBuffer, BufferUse::ComputeRead},
+            {gradients.pixel_state.deviceBuffer, BufferUse::ComputeRead},
+            {gradients.xy_vs.deviceBuffer, BufferUse::ComputeReadWrite},
+            {gradients.inv_cov_vs_opacity.deviceBuffer, BufferUse::ComputeReadWrite},
+            {gradients.rgb.deviceBuffer, BufferUse::ComputeReadWrite}};
+    if (densify) {
+        bindings.push_back({error_map, BufferUse::ComputeRead});
+        bindings.push_back({densification_info, BufferUse::ComputeReadWrite});
+    }
+    {
+        PerfTimer::Timer<PerfTimer::RasterizeBackward> timer(this);
+        executeCompute({{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
+            &uniforms, sizeof(uniforms), pipeline, bindings);
+    }
 }
 
 void VulkanGSRenderer::executeLegacyDepthWaves(

@@ -11,19 +11,6 @@
 
 namespace lfs::core {
 
-    static thread_local cudaStream_t tl_current_stream = nullptr;
-
-    cudaStream_t getCurrentCUDAStream() {
-        return tl_current_stream;
-    }
-
-    void setCurrentCUDAStream(cudaStream_t stream) {
-        if (stream) {
-            unretire_stream(stream);
-        }
-        tl_current_stream = stream;
-    }
-
     void waitForCUDAStream(cudaStream_t execution_stream, cudaStream_t dependency_stream) {
         unretire_stream(execution_stream);
         unretire_stream(dependency_stream);
@@ -80,33 +67,6 @@ namespace lfs::core {
             bridgeStreams(nullptr, stream);
         }
         return status;
-    }
-
-    cudaStream_t prepare_inputs_for_stream(
-        const std::initializer_list<const Tensor*> inputs,
-        const std::optional<cudaStream_t> requested_stream) {
-        cudaStream_t execution_stream = requested_stream.has_value()
-                                            ? *requested_stream
-                                            : getCurrentCUDAStream();
-        if (!requested_stream.has_value() && execution_stream == nullptr) {
-            for (const Tensor* input : inputs) {
-                LFS_ASSERT_MSG(input != nullptr && input->is_valid(),
-                               "stream preparation requires valid tensor inputs");
-                if (input->device() == Device::CUDA) {
-                    execution_stream = input->stream();
-                    break;
-                }
-            }
-        }
-
-        for (const Tensor* input : inputs) {
-            LFS_ASSERT_MSG(input != nullptr && input->is_valid(),
-                           "stream preparation requires valid tensor inputs");
-            if (input->device() == Device::CUDA) {
-                input->sync_to_stream(execution_stream);
-            }
-        }
-        return execution_stream;
     }
 
 } // namespace lfs::core

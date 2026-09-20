@@ -1,5 +1,7 @@
 .vscode
 .claude
+.DS_Store
+{{pkgetc}}
 CLAUDE.md
 build/
 cmake-build-debug/
@@ -30,6 +32,8 @@ tests/data/nn/*
 *.pt
 *.py
 !scripts/lichtfeld_mcp_bridge.py
+!scripts/benchmark_vulkan_training.py
+!scripts/check_reproducibility.py
 !scripts/verify_video_orientation.py
 !tools/gdb/lfs_pretty_printers.py
 !src/python/_lfs_panel_contract.py
@@ -38,6 +42,7 @@ tests/data/nn/*
 !src/python/scripts/manage_stubs.py
 !tests/real_bicycle_sh_degree_training.py
 !tests/python/**/*.py
+!tests/test_macos_support.py
 !docs/plugins/examples/**/*.py
 !tools/*.py
 !tools/nn_export/export_lpips_weights.py

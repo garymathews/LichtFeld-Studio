@@ -5,10 +5,14 @@
 
 #include "core/alloc_counter.hpp"
 #include "core/logger.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/pinned_memory_allocator.hpp"
+#endif
 #include "diagnostics/vram_ledger_model.hpp"
 
+#if LFS_TENSOR_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -17,9 +21,13 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#if !LFS_TENSOR_CUDA
+#include <nlohmann/json.hpp>
+#endif
 
 namespace lfs::training {
     namespace {
@@ -47,12 +55,17 @@ namespace lfs::training {
         }
 
         void sample_cuda_used(std::size_t& used, std::size_t& total) {
+#if LFS_TENSOR_CUDA
             std::size_t free_b = 0;
             std::size_t total_b = 0;
             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b >= free_b) {
                 used = total_b - free_b;
                 total = total_b;
             }
+#else
+            (void)used; (void)total;
+#endif
+
         }
 
         void sample_pool_hwm(std::size_t& used_high, std::size_t& reserved_high,
@@ -190,6 +203,9 @@ namespace lfs::training {
     }
 
     PerfBenchCollector::~PerfBenchCollector() {
+#if !LFS_TENSOR_CUDA
+        lfs::core::vulkan_host_wait_set_enabled(false);
+#endif
         destroy_phase_event_pool();
     }
 
@@ -198,17 +214,21 @@ namespace lfs::training {
     }
 
     void PerfBenchCollector::destroy_phase_event_pool() {
+#if LFS_TENSOR_CUDA
         for (auto& ev : phase_events_) {
             if (ev) {
                 (void)cudaEventDestroy(ev);
                 ev = nullptr;
             }
         }
+
+#endif
         phase_events_.clear();
         phase_pool_ready_ = false;
     }
 
     bool PerfBenchCollector::ensure_phase_event_pool() {
+#if LFS_TENSOR_CUDA
         if (phase_pool_ready_) {
             return true;
         }
@@ -227,6 +247,12 @@ namespace lfs::training {
         }
         phase_pool_ready_ = true;
         return true;
+#else
+        phase_samples_.assign(static_cast<std::size_t>(kPhaseSampleCap), PhaseSample{});
+        phase_pool_ready_ = true;
+        return true;
+#endif
+
     }
 
     void PerfBenchCollector::reset_phase_session() {
@@ -234,31 +260,75 @@ namespace lfs::training {
         phase_sample_count_ = 0;
         phase_current_index_ = -1;
         phase_last_primary_iter_ = 0;
+        phase_scratch_ = PhaseSample{};
+#if !LFS_TENSOR_CUDA
+        lfs::core::vulkan_host_wait_set_enabled(true);
+#endif
+        for (auto& bucket : phase_sum_ms_) {
+            std::fill(std::begin(bucket), std::end(bucket), 0.0);
+        }
+        for (auto& bucket : phase_wait_ms_) {
+            std::fill(std::begin(bucket), std::end(bucket), 0.0);
+        }
+        std::fill(std::begin(phase_sum_steps_), std::end(phase_sum_steps_), std::uint64_t{0});
     }
 
     void PerfBenchCollector::record_phase_mark(const PhaseBoundary b) {
-        if (phase_current_index_ < 0 || !phase_pool_ready_ ||
-            phase_current_index_ >= phase_sample_count_) {
-            return;
-        }
         const int bi = static_cast<int>(b);
-        if (bi < 0 || bi >= kPhaseBoundaryCount) {
+        if (!phase_pool_ready_ || bi < 0 || bi >= kPhaseBoundaryCount) {
             return;
         }
-        auto& sample = phase_samples_[static_cast<std::size_t>(phase_current_index_)];
-        sample.host_ns[bi] = now_ns();
-        const std::size_t ev_idx =
-            static_cast<std::size_t>(phase_current_index_) *
-                static_cast<std::size_t>(kPhaseBoundaryCount) +
-            static_cast<std::size_t>(bi);
-        if (cudaEventRecord(phase_events_[ev_idx], timing_stream_) != cudaSuccess) {
-            (void)cudaGetLastError();
-            return;
+        const std::int64_t stamp = now_ns();
+#if !LFS_TENSOR_CUDA
+        // How much of the phase's host interval was blocked on the device rather than recording
+        // commands. The counter is monotonic, so consecutive marks split each phase (plan §81).
+        const std::uint64_t wait_total = lfs::core::vulkan_host_wait_total_ns();
+#else
+        const std::uint64_t wait_total = 0;
+#endif
+        const bool detail = phase_current_index_ >= 0 && phase_current_index_ < phase_sample_count_;
+        if (detail) {
+            auto& sample = phase_samples_[static_cast<std::size_t>(phase_current_index_)];
+            sample.host_ns[bi] = stamp;
+            sample.host_wait_total_ns[bi] = wait_total;
+            sample.seen_mask |= (1u << bi);
         }
-        sample.seen_mask |= (1u << bi);
+#if !LFS_TENSOR_CUDA
+        // Every steady iteration feeds the window totals, sampled or not.
+        phase_scratch_.host_ns[bi] = stamp;
+        phase_scratch_.host_wait_total_ns[bi] = wait_total;
+        if (bi == static_cast<int>(PhaseBoundary::StepEnd)) {
+            const auto bucket = static_cast<std::size_t>(phase_scratch_.refining ? 1 : 0);
+            ++phase_sum_steps_[bucket];
+            for (int p = 0; p + 1 < kPhaseBoundaryCount; ++p) {
+                phase_sum_ms_[bucket][static_cast<std::size_t>(p)] +=
+                    static_cast<double>(phase_scratch_.host_ns[p + 1] - phase_scratch_.host_ns[p]) / 1.0e6;
+                phase_wait_ms_[bucket][static_cast<std::size_t>(p)] +=
+                    static_cast<double>(phase_scratch_.host_wait_total_ns[p + 1] -
+                                        phase_scratch_.host_wait_total_ns[p]) / 1.0e6;
+            }
+        }
+#else
+        if (detail) {
+            const std::size_t ev_idx =
+                static_cast<std::size_t>(phase_current_index_) *
+                    static_cast<std::size_t>(kPhaseBoundaryCount) +
+                static_cast<std::size_t>(bi);
+            if (cudaEventRecord(phase_events_[ev_idx], timing_stream_) != cudaSuccess) {
+                (void)cudaGetLastError();
+                // Leave the sample incomplete so its events are never read.
+                phase_samples_[static_cast<std::size_t>(phase_current_index_)].seen_mask &= ~(1u << bi);
+            }
+        }
+#endif
     }
 
     void PerfBenchCollector::configure(const bool enable, const int warmup) {
+        if (!enable) {
+#if !LFS_TENSOR_CUDA
+            lfs::core::vulkan_phase_timing_end();
+#endif
+        }
         g_perf_bench_enabled.store(enable, std::memory_order_relaxed);
         if (!enable) {
             phase_active_iter_ = 0;
@@ -306,6 +376,7 @@ namespace lfs::training {
         steady_steps_ = 0;
         warmup_ms_sum_ = 0.0;
         steady_ms_sum_ = 0.0;
+        step_ms_.clear();
         peak_cuda_used_ = 0;
         peak_cuda_total_ = 0;
         // configure was skipped, fall back to the value already stored (0).
@@ -358,14 +429,21 @@ namespace lfs::training {
         // Allocate the event pool before any sampled step so creation cost is
         // not charged to the first phase sample.
         (void)ensure_phase_event_pool();
+#if !LFS_TENSOR_CUDA
+        // Enough timestamps for every steady iteration of a normal run: six primary
+        // boundaries plus the optimizer sub-mark, so seven each.
+        lfs::core::vulkan_phase_timing_begin(7u * 20000u);
+#endif
 
         // Ensure the VRAM profiler is on so the ledger is published each step.
+#if LFS_TENSOR_CUDA
         lfs::diagnostics::VramProfiler::instance().setEnabled(true);
+#endif
         LOG_INFO("PerfBench: enabled (warmup={} iters, total={}, phase stride={} cap={})",
                  warmup_, total_iters_, kPhaseSampleStride, kPhaseSampleCap);
     }
 
-    void PerfBenchCollector::on_step_begin(const int iter) {
+    void PerfBenchCollector::on_step_begin(const int iter, const bool refining) {
         if (!started_) {
             return;
         }
@@ -374,8 +452,7 @@ namespace lfs::training {
 
         phase_active_iter_ = 0;
         phase_current_index_ = -1;
-        if (iter <= warmup_ || !phase_pool_ready_ ||
-            phase_sample_count_ >= kPhaseSampleCap) {
+        if (iter <= warmup_ || !phase_pool_ready_) {
             return;
         }
         const int offset = iter - warmup_;
@@ -385,19 +462,34 @@ namespace lfs::training {
         const int rem = offset % kPhaseSampleStride;
         const bool primary = rem == 0;
         const bool pair = rem == 1 && phase_last_primary_iter_ == iter - 1;
-        if (!primary && !pair) {
+#if !LFS_TENSOR_CUDA
+        const bool detail = (primary || pair) && phase_sample_count_ < kPhaseSampleCap;
+#else
+        if (phase_sample_count_ >= kPhaseSampleCap) {
             return;
         }
-
-        auto& sample = phase_samples_[static_cast<std::size_t>(phase_sample_count_)];
-        sample = PhaseSample{};
-        sample.iter = iter;
-        phase_current_index_ = phase_sample_count_;
-        ++phase_sample_count_;
-        if (primary) {
-            phase_last_primary_iter_ = iter;
+        const bool detail = primary || pair;
+#endif
+        if (detail) {
+            auto& sample = phase_samples_[static_cast<std::size_t>(phase_sample_count_)];
+            sample = PhaseSample{};
+            sample.iter = iter;
+            sample.refining = refining;
+            phase_current_index_ = phase_sample_count_;
+            ++phase_sample_count_;
+            if (primary) {
+                phase_last_primary_iter_ = iter;
+            }
         }
+#if !LFS_TENSOR_CUDA
+        // Every steady iteration is accounted in the window totals, whether or
+        // not it also produced a detail row.
+        phase_scratch_ = PhaseSample{};
+        phase_scratch_.iter = iter;
+        phase_scratch_.refining = refining;
+#endif
         phase_active_iter_ = iter;
+        phase_refining_ = refining;
     }
 
     void PerfBenchCollector::capture_peak_snapshot(const int iter,
@@ -494,6 +586,9 @@ namespace lfs::training {
         const double ms =
             static_cast<double>(step_end - step_start_ns_) / 1.0e6;
         const auto allocs = lfs::core::alloc_counter::delta_since(step_alloc_snap_);
+#if !LFS_TENSOR_CUDA
+        step_ms_.push_back(ms);
+#endif
 
         std::size_t used = 0;
         std::size_t total = 0;
@@ -524,10 +619,12 @@ namespace lfs::training {
             warmup_ms_sum_ += ms;
             ++warmup_steps_;
         } else {
+#if LFS_TENSOR_CUDA
             const auto pinned_stats = lfs::core::PinnedMemoryAllocator::instance().get_stats();
             peak_steady_pinned_host_bytes_ = std::max(
                 peak_steady_pinned_host_bytes_,
                 pinned_stats.allocated_bytes + pinned_stats.cached_bytes);
+#endif
             steady_allocs_ += allocs;
             steady_ms_sum_ += ms;
             ++steady_steps_;
@@ -707,6 +804,136 @@ namespace lfs::training {
         }
         train_end_ns_ = now_ns();
 
+#if !LFS_TENSOR_CUDA
+        // Host intervals include submission and any waits already required by
+        // training. They are not GPU durations and must not imply GPU bubbles.
+        constexpr std::array names{"pre_fwd", "forward", "loss", "backward", "optimizer_and_refinement"};
+        // GPU-side phase durations, differenced from the device timestamps by iteration.
+        const auto stamps = lfs::core::vulkan_phase_timestamps();
+        lfs::core::vulkan_phase_timing_end();
+        lfs::core::vulkan_host_wait_set_enabled(false);
+        std::map<std::uint32_t, std::array<double, kTagBoundarySlots>> gpu_by_iter;
+        std::map<std::uint32_t, bool> gpu_refining;
+        for (const auto& stamp : stamps) {
+            const auto iter = stamp.tag >> kTagIterShift;
+            const auto boundary = (stamp.tag >> kTagBoundaryShift) & kTagBoundaryMask;
+            gpu_by_iter[iter][boundary] = stamp.gpu_ms;
+            gpu_refining[iter] = (stamp.tag & 1u) != 0u;
+        }
+        // Recorded-command totals at the same boundaries. A phase duration cannot say whether a
+        // phase was long because the device was busy or because the host was still submitting;
+        // differencing the command counts attributes the recorded work per phase.
+        std::map<std::uint32_t, std::array<std::uint64_t, kTagBoundarySlots>> commands_by_iter;
+        for (const auto& stamp : lfs::core::vulkan_phase_command_stamps()) {
+            const auto iter = stamp.tag >> kTagIterShift;
+            const auto boundary = (stamp.tag >> kTagBoundaryShift) & kTagBoundaryMask;
+            commands_by_iter[iter][boundary] = stamp.commands;
+        }
+        nlohmann::json phase_commands = nlohmann::json::object();
+        std::uint64_t command_sum[kPhaseBuckets][kGpuPhaseCount]{};
+        nlohmann::json gpu_profile = nlohmann::json::object();
+        nlohmann::json gpu_split = nlohmann::json::object();
+        double gpu_sum[kPhaseBuckets][kGpuPhaseCount]{};
+        std::uint64_t gpu_steps[kPhaseBuckets]{};
+        double refine_sum[kPhaseBuckets]{}, opt_sum[kPhaseBuckets]{};
+        for (const auto& [iter, boundaries] : gpu_by_iter) {
+            const auto bucket = static_cast<std::size_t>(gpu_refining[iter] ? 1 : 0);
+            ++gpu_steps[bucket];
+            for (std::size_t p = 0; p < kGpuPhaseCount; ++p) {
+                const double duration = boundaries[p + 1] - boundaries[p];
+                if (duration >= 0.0)
+                    gpu_sum[bucket][p] += duration;
+            }
+            // Sub-boundary kSubPhaseBoundary splits the optimizer window into refinement
+            // (OptBegin->sub) and the Adam step (sub->StepEnd); it is absent when the trainer
+            // did not emit the sub-mark.
+            const auto opt_begin = static_cast<std::size_t>(PhaseBoundary::OptBegin);
+            const auto step_end = static_cast<std::size_t>(PhaseBoundary::StepEnd);
+            if (boundaries[kSubPhaseBoundary] >= boundaries[opt_begin] &&
+                boundaries[step_end] >= boundaries[kSubPhaseBoundary]) {
+                refine_sum[bucket] += boundaries[kSubPhaseBoundary] - boundaries[opt_begin];
+                opt_sum[bucket] += boundaries[step_end] - boundaries[kSubPhaseBoundary];
+            }
+            if (const auto found = commands_by_iter.find(iter); found != commands_by_iter.end()) {
+                for (std::size_t p = 0; p < kGpuPhaseCount; ++p) {
+                    if (found->second[p + 1] >= found->second[p])
+                        command_sum[bucket][p] += found->second[p + 1] - found->second[p];
+                }
+            }
+        }
+        for (const auto bucket : {0, 1}) {
+            if (gpu_steps[bucket] == 0)
+                continue;
+            nlohmann::json row{{"steps", gpu_steps[bucket]}};
+            for (std::size_t p = 0; p < names.size(); ++p)
+                row[names[p]] = gpu_sum[bucket][p] / static_cast<double>(gpu_steps[bucket]);
+            nlohmann::json command_row{{"steps", gpu_steps[bucket]}};
+            for (std::size_t p = 0; p < names.size(); ++p)
+                command_row[names[p]] =
+                    static_cast<double>(command_sum[bucket][p]) / static_cast<double>(gpu_steps[bucket]);
+            phase_commands[bucket == 0 ? "ordinary" : "refining"] = std::move(command_row);
+            gpu_profile[bucket == 0 ? "ordinary" : "refining"] = std::move(row);
+            nlohmann::json split_row{{"steps", gpu_steps[bucket]},
+                                     {"refinement", refine_sum[bucket] / static_cast<double>(gpu_steps[bucket])},
+                                     {"optimizer", opt_sum[bucket] / static_cast<double>(gpu_steps[bucket])}};
+            gpu_split[bucket == 0 ? "ordinary" : "refining"] = std::move(split_row);
+        }
+        nlohmann::json report{
+            {"backend", "vulkan"},
+            {"timing", "host; each step ends after recordParamsReady drains GPU work"},
+            {"gpu_phase_ms", gpu_profile},
+            {"gpu_phase_commands", phase_commands},
+            {"gpu_optimizer_split", gpu_split},
+            {"device_memory_bytes", nullptr},
+            {"warmup_steps", warmup_steps_},
+            {"steady_steps", steady_steps_},
+            {"wall_s", static_cast<double>(train_end_ns_ - train_start_ns_) / 1.0e9},
+            {"steady_ms_per_iter", steady_steps_ ? steady_ms_sum_ / steady_steps_ : 0.0},
+            {"dataloader_wait_ms", dataloader_wait_ms_sum_},
+            {"steady_dataloader_wait_ms", steady_dataloader_wait_ms_sum_},
+            {"last_loss", last_loss_},
+            {"last_live_splats", last_live_splats_},
+            {"step_ms", step_ms_},
+            {"phase_profile", nlohmann::json::object()},
+            {"phase_wait_profile", nlohmann::json::object()},
+            {"samples", nlohmann::json::array()}};
+        for (const auto bucket : {0, 1}) {
+            if (phase_sum_steps_[bucket] == 0)
+                continue;
+            nlohmann::json row{{"steps", phase_sum_steps_[bucket]}};
+            nlohmann::json wait_row{{"steps", phase_sum_steps_[bucket]}};
+            for (std::size_t p = 0; p < names.size(); ++p) {
+                row[names[p]] = phase_sum_ms_[bucket][p] / static_cast<double>(phase_sum_steps_[bucket]);
+                wait_row[names[p]] =
+                    phase_wait_ms_[bucket][p] / static_cast<double>(phase_sum_steps_[bucket]);
+            }
+            report["phase_profile"][bucket == 0 ? "ordinary" : "refining"] = std::move(row);
+            report["phase_wait_profile"][bucket == 0 ? "ordinary" : "refining"] = std::move(wait_row);
+        }
+        for (int i = 0; i < phase_sample_count_; ++i) {
+            const auto& sample = phase_samples_[i];
+            if (sample.seen_mask != (1u << kPhaseBoundaryCount) - 1u)
+                continue;
+            nlohmann::json row{{"iteration", sample.iter}, {"refining", sample.refining}};
+            for (std::size_t p = 0; p < names.size(); ++p) {
+                row[names[p]] = static_cast<double>(sample.host_ns[p + 1] - sample.host_ns[p]) / 1.0e6;
+                row[std::string(names[p]) + "_wait"] =
+                    static_cast<double>(sample.host_wait_total_ns[p + 1] -
+                                        sample.host_wait_total_ns[p]) / 1.0e6;
+            }
+            report["samples"].push_back(std::move(row));
+        }
+        phase_active_iter_ = 0;
+        phase_current_index_ = -1;
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream out(path);
+        out << report.dump(2) << '\n';
+        if (!out)
+            throw std::runtime_error("Failed to write Vulkan performance report: " + path.string());
+        LOG_INFO("PerfBench: wrote {} (steady {:.2f} ms/iter; GPU phase timing {})",
+                 path.string(), steady_steps_ ? steady_ms_sum_ / steady_steps_ : 0.0,
+                 gpu_profile.empty() ? "unavailable" : "recorded");
+#else
         // Prefer the last published profiler ledger if ours is empty.
         if (ledger_.total_bytes == 0) {
             ledger_ = diagnostics::VramProfiler::instance().trainingStateLedger();
@@ -756,6 +983,7 @@ namespace lfs::training {
         std::array<std::vector<double>, kDerivedPhaseCount> phase_gpu{};
         int phase_valid = 0;
 
+#if LFS_TENSOR_CUDA
         if (phase_pool_ready_ && phase_sample_count_ > 0) {
             // Bench-end only: the training loop has finished; make events readable.
             if (timing_stream_ != nullptr) {
@@ -832,6 +1060,8 @@ namespace lfs::training {
             }
         }
 
+
+#endif
         std::array<PhaseStats, kDerivedPhaseCount> phase_stats{};
         for (int p = 0; p < kDerivedPhaseCount; ++p) {
             phase_stats[static_cast<std::size_t>(p)] =
@@ -1129,6 +1359,7 @@ namespace lfs::training {
             }
         }
         LOG_INFO("{}", phase_line.str());
+#endif
     }
 
 } // namespace lfs::training

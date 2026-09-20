@@ -1,12 +1,11 @@
 #pragma once
 
-#include "gs_pipeline.h"
-
 #include <chrono>
 #include <cstddef>
-#include <map>
-#include <mutex>
+#include <utility>
 #include <vector>
+
+class VulkanGSPipeline;
 
 namespace PerfTimer {
 
@@ -25,7 +24,13 @@ namespace PerfTimer {
     _(ApplyDepthOrdering)         \
     _(PrepareTileSort)            \
     _(CullSplats)                 \
-    _(ProjectionSurvivors)
+    _(ProjectionSurvivors)        \
+    _(TrainingVisibilityCopy)     \
+    _(TrainingInstanceGate)       \
+    _(TrainingWavePartition)      \
+    _(BackwardAdjointClear)       \
+    _(RasterizeBackward)          \
+    _(ProjectionBackward)
 
 #define _(name) name,
     enum TrainStage {
@@ -34,13 +39,21 @@ namespace PerfTimer {
     };
 #undef _
 
-    void hostTic();
-    void hostToc();
+    using Marker = std::pair<int, int>;
+    struct State {
+        std::vector<Marker> marks;
+        std::vector<TrainStage> pushedMarks;
+        bool hostHold = false;
+        std::chrono::time_point<std::chrono::high_resolution_clock> hostStartTime;
+        double hostTimeDelta = -1.0;
+    };
+
+    void hostTic(VulkanGSPipeline* module);
+    void hostToc(VulkanGSPipeline* module);
 
     template <TrainStage stage>
     struct Timer {
         VulkanGSPipeline* module;
-        std::chrono::time_point<std::chrono::high_resolution_clock> then;
 
         Timer(VulkanGSPipeline* module);
         ~Timer();
@@ -49,10 +62,8 @@ namespace PerfTimer {
     void pushMarker(VulkanGSPipeline* module);
     void popMarkers(VulkanGSPipeline* module);
 
-    using Marker = std::pair<int, int>;
-
-    std::vector<Marker> takeMarkers();
-    void discardMarkers() noexcept;
+    std::vector<Marker> takeMarkers(VulkanGSPipeline* module);
+    void discardMarkers(VulkanGSPipeline* module) noexcept;
     std::vector<std::pair<size_t, double>> update(std::vector<double> times,
                                                   const std::vector<Marker>& batch_marks);
 

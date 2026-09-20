@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+if(LFS_TENSOR_CUDA)
 # CUDA library for IO-specific kernels (morton encoding, k-means)
 add_library(lfs_io_cuda STATIC
         cuda/morton_encoding.hpp
@@ -88,6 +89,8 @@ target_compile_options(lfs_io_rad_quant_cuda PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --fmad=false>
 )
 
+endif()
+
 # SPZ library (Niantic compressed format) - MIT licensed
 add_library(spz_lib STATIC
         ${CMAKE_SOURCE_DIR}/external/spz/load-spz.cc
@@ -111,13 +114,32 @@ set_target_properties(spz_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL
         libavcodec
         libavformat
         libswscale
         libavutil
 )
-pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
+# Keep each framework flag and its argument together when CMake deduplicates
+# transitive linker options (FFmpeg repeats these across its static libraries).
+if(APPLE)
+    get_target_property(_ffmpeg_link_options PkgConfig::FFMPEG INTERFACE_LINK_OPTIONS)
+    set(_ffmpeg_grouped_options)
+    while(_ffmpeg_link_options)
+        list(POP_FRONT _ffmpeg_link_options _ffmpeg_option)
+        if(_ffmpeg_option STREQUAL "-framework")
+            list(POP_FRONT _ffmpeg_link_options _ffmpeg_framework)
+            list(APPEND _ffmpeg_grouped_options "SHELL:-framework ${_ffmpeg_framework}")
+        else()
+            list(APPEND _ffmpeg_grouped_options "${_ffmpeg_option}")
+        endif()
+    endwhile()
+    set_property(TARGET PkgConfig::FFMPEG PROPERTY INTERFACE_LINK_OPTIONS "${_ffmpeg_grouped_options}")
+endif()
+option(LFS_WITH_LIBPLACEBO "Enable libplacebo HDR tone mapping" ${LFS_TENSOR_CUDA})
+if(LFS_WITH_LIBPLACEBO)
+    pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
+endif()
 
 add_library(lfs_video STATIC
         include/io/video/video_encoder_interface.hpp
@@ -126,14 +148,14 @@ add_library(lfs_video STATIC
         video/video_encoder.hpp
         video/video_encoder.cpp
         video/color_convert.cuh
-        video/color_convert.cu
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:video/color_convert.cu>
         video_frame_extractor.hpp
         video_frame_extractor.cpp
         hdr_tonemap.hpp
         hdr_tonemap.cpp
         hdr_libplacebo.hpp
         hdr_libplacebo.cpp
-        hdr_libplacebo_av.c
+        $<$<BOOL:${LFS_WITH_LIBPLACEBO}>:hdr_libplacebo_av.c>
         video_player.hpp
         video_player.cpp
 )
@@ -153,14 +175,16 @@ target_include_directories(lfs_video SYSTEM PRIVATE
 
 target_link_libraries(lfs_video
         PRIVATE
+        lfs_io
         PkgConfig::FFMPEG
         spdlog::spdlog
-        CUDA::cudart
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::cudart>
 )
 
 # libplacebo's static pkg-config dependency chain includes shaderc and
 # SPIR-V Tools. GNU ld resolves static archives left-to-right, so rescan the
 # complete chain on ELF platforms.
+if(LFS_WITH_LIBPLACEBO)
 if(UNIX AND NOT APPLE)
     target_link_libraries(lfs_video PRIVATE
             "-Wl,--start-group"
@@ -171,6 +195,8 @@ else()
     target_link_libraries(lfs_video PRIVATE PkgConfig::LIBPLACEBO)
 endif()
 
+endif()
+target_compile_definitions(lfs_video PRIVATE LFS_WITH_LIBPLACEBO=$<BOOL:${LFS_WITH_LIBPLACEBO}>)
 target_compile_features(lfs_video PUBLIC cxx_std_23)
 
 set_target_properties(lfs_video PROPERTIES
@@ -304,7 +330,7 @@ add_library(lfs_io STATIC
         mesh/texture_loader.cpp
         cache_image_loader.cpp
         nvcodec_image_loader.hpp
-        nvcodec_image_loader.cpp
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:nvcodec_image_loader.cpp>
         pipelined_image_loader.cpp
         stb_image_impl.cpp
         tinyply.cpp
@@ -335,6 +361,7 @@ add_library(lfs_io STATIC
 
 # Set include directories
 target_include_directories(lfs_io
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
@@ -383,7 +410,9 @@ else()
 endif()
 
 # Ensure CUDA library is built first
-add_dependencies(lfs_io lfs_io_cuda)
+if(LFS_TENSOR_CUDA)
+    add_dependencies(lfs_io lfs_io_cuda)
+endif()
 
 # Link dependencies
 target_link_libraries(lfs_io
@@ -401,10 +430,10 @@ target_link_libraries(lfs_io
         $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
         zstd::libzstd          # .licht project container chunk compression
         xxHash::xxhash         # REFS fingerprints and embedded-payload provenance
-        CUDA::cudart           # CUDA runtime for nvImageCodec
-        lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
-        lfs_io_rad_quant_cuda  # RAD encode quantization (bit-exact, no fast math)
-        lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:CUDA::cudart>           # CUDA runtime for nvImageCodec
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:lfs_io_cuda>            # IO-specific CUDA kernels (morton, k-means)
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:lfs_io_rad_quant_cuda>  # RAD encode quantization (bit-exact, no fast math)
+        $<$<BOOL:${LFS_TENSOR_CUDA}>:lfs_core_cuda>          # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
         lfs_tinyusdz           # USDA parser for flat Gaussian ParticleField interchange
         OpenMeshCore

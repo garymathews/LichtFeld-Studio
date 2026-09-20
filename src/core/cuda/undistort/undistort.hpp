@@ -6,7 +6,7 @@
 
 #include "core/camera_types.h"
 #include "core/tensor.hpp"
-#include <cuda_runtime.h>
+#include "core/cuda_stream_fwd.hpp"
 
 namespace lfs::core {
 
@@ -21,17 +21,17 @@ namespace lfs::core {
         bool crop_solve_failed = false;
     };
 
-    UndistortParams compute_undistort_params(
+    LFS_CORE_API UndistortParams compute_undistort_params(
         float fx, float fy, float cx, float cy,
         int width, int height,
         const Tensor& radial, const Tensor& tangential,
         CameraModelType model, float blank_pixels = 0.0f);
 
-    UndistortParams scale_undistort_params(
+    LFS_CORE_API UndistortParams scale_undistort_params(
         const UndistortParams& params, const int actual_src_width, const int actual_src_height);
 
-    Tensor undistort_image(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
+    LFS_CORE_API Tensor undistort_image(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
 
-    Tensor undistort_mask(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
+    LFS_CORE_API Tensor undistort_mask(const Tensor& src, const UndistortParams& params, cudaStream_t stream);
 
 } // namespace lfs::core

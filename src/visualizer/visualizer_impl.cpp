@@ -5,7 +5,9 @@
 #include "visualizer_impl.hpp"
 #include "core/animatable_property.hpp"
 #include "core/crash_handler.hpp"
+#if LFS_TENSOR_CUDA
 #include "core/cuda_error.hpp"
+#endif
 #include "core/data_loading_service.hpp"
 #include "core/error.hpp"
 #include "core/error_bus.hpp"
@@ -18,6 +20,7 @@
 #include "core/memory_pressure.hpp"
 #include "core/path_utils.hpp"
 #include "core/services.hpp"
+#include "core/tensor_backend.hpp"
 #include "gui/error_event_bridge.hpp"
 #include "gui/native_panels.hpp"
 #include "gui/panel_registry.hpp"
@@ -1071,9 +1074,13 @@ namespace lfs::vis {
         try {
             std::rethrow_exception(eptr);
         } catch (const lfs::core::MemoryAllocationError& e) {
+
+#if LFS_TENSOR_CUDA
             if (lfs::core::cuda_is_unavailable()) {
                 return;
             }
+#endif
+
             const auto fx = frame_state_.on_fault(FrameFault::OomPressure);
             if (fx.run_reclaim_episode) {
                 // GPU memory shortage reached the frame loop. Reclaim render-safe
@@ -1232,12 +1239,39 @@ namespace lfs::vis {
         actions.push_back(lfs::ErrorAction{.kind = lfs::ErrorActionKind::Dismiss});
         lfs::ErrorBus::instance().publish(makeFrameNotification(
             code, lfs::ErrorDomain::Vulkan, lfs::Severity::Fatal, lfs::ErrorSurface::Modal,
-            LOC(body_key), std::move(detail), std::move(actions), LFS_SOURCE_SITE_CURRENT()));
+            LOC(body_key), detail, std::move(actions), LFS_SOURCE_SITE_CURRENT()));
 
-        if (auto* window = window_manager_ ? window_manager_->getWindow() : nullptr)
-            SDL_SetWindowTitle(window, LOC(device_lost ? ErrModalKeys::RENDERER_DEVICE_LOST
-                                                       : ErrModalKeys::RENDERER_STALLED));
+        const auto title = LOC(device_lost ? ErrModalKeys::RENDERER_DEVICE_LOST : ErrModalKeys::RENDERER_STALLED);
+        auto* window = window_manager_ ? window_manager_->getWindow() : nullptr;
+        if (window)
+            SDL_SetWindowTitle(window, title);
+        auto error = lfs::make_error(lfs::ErrorInit{
+            .code = code,
+            .domain = lfs::ErrorDomain::Vulkan,
+            .user_message = "GPU stopped responding. Restart and restore the last checkpoint.",
+            .detail = detail,
+            .detection = LFS_SOURCE_SITE_CURRENT(),
+        });
+        lfs::core::invalidate_vulkan_backend(error);
+        std::string recovery = std::format("{}\n\nRestart LichtFeld Studio and reopen your project to restore its last saved training checkpoint. Changes since that checkpoint are lost.", LOC(body_key));
+        if (auto* trainer = getTrainer()) {
+            trainer->request_stop(std::move(error));
+            recovery += std::format("\n\nTraining iteration: {}", trainer->get_current_iteration());
+            const auto snapshot = trainer->get_project_snapshot_metrics();
+            if (snapshot.last_checkpoint_iteration >= 0)
+                recovery += std::format("\n\nSaved iteration: {}\nProject: {}", snapshot.last_checkpoint_iteration,
+                                        lfs::core::path_to_utf8(snapshot.last_path));
+            else
+                recovery += "\n\nNo checkpoint has been saved during this training session.";
+            if (snapshot.writer_in_flight)
+                recovery += "\nA captured checkpoint is still being written. Allow it to finish before quitting.";
+        }
+        recovery += std::format("\n\nLog: {}", lfs::core::Logger::default_log_file_path());
+        LOG_ERROR("{}", recovery);
         lfs::core::flush_diagnostics_noexcept();
+        // This dialog is rendered by the OS even when the Vulkan frame is frozen.
+        if (window_manager_)
+            window_manager_->showErrorDialog(title, recovery.c_str());
     }
 
     void VisualizerImpl::onFrameCompleted() noexcept {
@@ -2030,6 +2064,17 @@ namespace lfs::vis {
             }
         }
         fully_initialized_ = true;
+#ifdef __APPLE__
+        window_manager_->setLiveResizeCallback([this]() noexcept {
+            try {
+                update();
+                render();
+                onFrameCompleted();
+            } catch (...) {
+                handleFrameException(std::current_exception());
+            }
+        });
+#endif
         if (!startup_project_open_attempted_) {
             startup_project_open_attempted_ = true;
             if (project_lifecycle_) {
@@ -2400,8 +2445,13 @@ namespace lfs::vis {
 
     void VisualizerImpl::render() {
 
-        if (auto* const ctx = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
+        if (auto* const ctx = window_manager_ ? window_manager_->getVulkanContext() : nullptr) {
+            if (ctx->rendererTerminalState() == RendererTerminalState::Running && lfs::core::vulkan_backend_adopted()) {
+                if (auto health = lfs::core::vulkan_backend_status(); !health)
+                    ctx->noteFailure(lfs::Exception(health.error()));
+            }
             applyFrameStateEffects(frame_state_.on_renderer_terminal(ctx->rendererTerminalState()));
+        }
         if (frame_state_.state() == FrameStateMachine::State::RendererDead) {
             // Keep the CPU event and MCP queues responsive without issuing another GPU frame.
             processRenderWorkQueue();
@@ -2667,6 +2717,10 @@ namespace lfs::vis {
                 std::launch::async, [] { preloadVkSplatSpirvFiles(); });
         }
         update_work_processed_ = false;
+
+        // Cocoa's live-resize timer supplies pacing; never pump events recursively.
+        if (window_manager_->isLiveResizeRendering())
+            return;
 
         // Render-on-demand: VSync handles frame pacing, waitEvents saves CPU when idle
         // The demand walk is the expensive part of the frame loop (notably the
@@ -2936,6 +2990,7 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::shutdown() {
+        window_manager_->setLiveResizeCallback({});
         if (trainer_manager_ &&
             (trainer_manager_->isTrainingActive() || trainer_manager_->isCompletionPending())) {
             LOG_CRITICAL("Shutdown reached before the training worker was reaped");

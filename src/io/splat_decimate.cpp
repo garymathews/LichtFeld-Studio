@@ -1,9 +1,10 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
+#include "core/tensor/internal/tensor_impl.hpp"
+#include "core/tensor_backend.hpp"
 #include "cuda/splat_decimate_math.hpp"
 #include <algorithm>
 #include <array>
-#include <cuda_runtime.h>
 #include <io/splat_decimate.hpp>
 #include <limits>
 #include <numeric>
@@ -213,22 +214,25 @@ namespace lfs::io {
             size_t n = source->size();
             if (n > size_t(std::numeric_limits<int>::max()) || n * candidates_k > std::numeric_limits<uint32_t>::max())
                 return make_error(ErrorCode::INVALID_DATASET, "decimation input exceeds index capacity");
-            Device device = o.use_gpu ? Device::CUDA : Device::CPU;
+            const bool use_cuda = o.use_gpu && core::gpu_backend_of(source->means()) == core::GpuBackend::CUDA;
+            Device device = use_cuda ? Device::GPU : Device::CPU;
             auto materialize = [&](const core::Tensor& t) { return t.device() == device ? t.contiguous() : t.to(device).contiguous(); };
             Data data{materialize(source->means()), materialize(source->rotation_raw()), materialize(source->scaling_raw()),
                       materialize(source->opacity_raw()), materialize(source->sh0()), materialize(source->shN_canonical()), n, int(source->max_sh_coeffs_rest())};
             // Establish ordering with caller-owned streams before default-stream kernels.
-            if (o.use_gpu) {
-                auto err = cudaDeviceSynchronize();
-                if (err != cudaSuccess)
-                    throw std::runtime_error(cudaGetErrorString(err));
-            }
+            if (use_cuda)
+                core::internal::backend_ops_for(source->means()).synchronize_device();
+
             size_t initial = n;
             int generation = 0;
             while (data.n > o.target_count) {
                 float p = float(initial - data.n) / float(initial - o.target_count);
                 progress(p, "Decimation generation " + std::to_string(++generation) + ": neighbours and costs");
-                auto c = o.use_gpu ? gpu_candidates(data) : cpu_candidates(data);
+                auto c =
+#if LFS_TENSOR_CUDA
+                    use_cuda ? gpu_candidates(data) :
+#endif
+                             cpu_candidates(data);
                 progress(p, "Selecting merges");
                 size_t needed = data.n - std::max(o.target_count, data.n - data.n / 2);
                 auto s = select(c, data.n, candidates_k, needed);
@@ -238,7 +242,11 @@ namespace lfs::io {
                     throw std::runtime_error("decimation stalled: fewer than 5% of splats merged");
                 c = {};
                 progress(p, "Merging splats");
-                data = o.use_gpu ? gpu_merge(data, s) : cpu_merge(data, s);
+                data =
+#if LFS_TENSOR_CUDA
+                    use_cuda ? gpu_merge(data, s) :
+#endif
+                             cpu_merge(data, s);
             }
             // Clone unchanged inputs too: the API promises independently owned output.
             auto output = [&](core::Tensor& t) { return t.device() == Device::CUDA ? (generation ? t : t.clone()) : t.to(Device::CUDA); };

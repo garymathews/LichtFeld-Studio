@@ -103,7 +103,7 @@ namespace lfs::vis {
 
     private:
         bool loaded_ = false;
-        std::string active_strategy_ = std::string(lfs::core::param::kStrategyMRNF);
+        std::string active_strategy_ = std::string(lfs::core::param::kDefaultTrainingStrategy);
 
         // Session defaults
         lfs::core::param::OptimizationParameters mcmc_session_;
